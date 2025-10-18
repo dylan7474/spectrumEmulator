@@ -36,7 +36,9 @@ uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 volatile int beeper_state = 0; // 0 = off, 1 = on
 const int AUDIO_AMPLITUDE = 2000;
 volatile double beeper_frequency = 440.0; // The frequency the Z80 is *trying* to play
-volatile double audio_sample_index = 0.0; // Tracks our position in the generated wave
+volatile double audio_sample_index = 0.0; // Tracks the fractional position in the generated wave
+int audio_sample_rate = 44100;
+int audio_available = 0;
 
 // --- Timing Globals ---
 uint64_t total_t_states = 0; // A global clock for the entire CPU
@@ -114,17 +116,31 @@ void io_write(uint16_t port, uint8_t value) {
         border_color_idx = value & 0x07;
         
         int new_beeper_state = (value >> 4) & 0x01;
-        
-        // Check if the beeper bit has *toggled*
+
         if (new_beeper_state != beeper_state) {
             uint32_t half_period_t_states = total_t_states - last_beeper_toggle_t_states;
-            
+            double new_frequency = beeper_frequency;
+
             if (half_period_t_states > 20) { // Avoid division by zero
                 uint32_t full_period_t_states = half_period_t_states * 2;
-                beeper_frequency = 3500000.0 / full_period_t_states;
+                new_frequency = 3500000.0 / (double)full_period_t_states;
+            } else {
+                new_frequency = 0.0;
             }
+
             last_beeper_toggle_t_states = total_t_states;
+
+            if (audio_available) {
+                SDL_LockAudio();
+            }
             beeper_state = new_beeper_state;
+            beeper_frequency = new_frequency;
+            if (!beeper_state) {
+                audio_sample_index = 0.0;
+            }
+            if (audio_available) {
+                SDL_UnlockAudio();
+            }
         }
     }
     (void)port; (void)value;
@@ -478,13 +494,35 @@ int init_sdl(void) {
     if (SDL_OpenAudio(&wanted_spec, &have_spec) < 0) {
         fprintf(stderr, "Failed to open audio: %s\n", SDL_GetError());
     } else {
-        SDL_PauseAudio(0); // Start playing sound
+        if (have_spec.format != AUDIO_S16SYS || have_spec.channels != 1) {
+            fprintf(stderr, "Unexpected audio format (format=%d, channels=%d). Audio disabled.\n", have_spec.format, have_spec.channels);
+            SDL_CloseAudio();
+        } else {
+            audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
+            audio_available = 1;
+            SDL_PauseAudio(0); // Start playing sound
+        }
     }
     return 1;
 }
 
 // --- SDL Cleanup ---
-void cleanup_sdl(void) { SDL_CloseAudio(); if(texture)SDL_DestroyTexture(texture); if(renderer)SDL_DestroyRenderer(renderer); if(window)SDL_DestroyWindow(window); SDL_Quit(); }
+void cleanup_sdl(void) {
+    if (audio_available) {
+        SDL_CloseAudio();
+        audio_available = 0;
+    }
+    if (texture) {
+        SDL_DestroyTexture(texture);
+    }
+    if (renderer) {
+        SDL_DestroyRenderer(renderer);
+    }
+    if (window) {
+        SDL_DestroyWindow(window);
+    }
+    SDL_Quit();
+}
 
 // --- Render ZX Spectrum Screen ---
 void render_screen(void) {
@@ -521,17 +559,35 @@ int map_sdl_key_to_spectrum(SDL_Keycode k, int* r, uint8_t* m) {
 // --- Audio Callback ---
 void audio_callback(void* userdata, Uint8* stream, int len) {
     Sint16* buffer = (Sint16*)stream;
-    int num_samples = len / 2;
-    double sample_step = beeper_frequency / 44100.0; // 44100 is sample rate
+    int num_samples = len / (int)sizeof(Sint16);
+    int current_state = beeper_state;
+    double frequency = beeper_frequency;
+    double step = (audio_sample_rate > 0) ? frequency / (double)audio_sample_rate : 0.0;
+    double phase = audio_sample_index;
+
+    if (phase >= 1.0 || phase < 0.0) {
+        phase = fmod(phase, 1.0);
+        if (phase < 0.0) {
+            phase += 1.0;
+        }
+    }
 
     for (int i = 0; i < num_samples; ++i) {
-        if (beeper_state == 0) {
-            buffer[i] = 0; // Silent
+        if (current_state == 0 || step <= 0.0) {
+            buffer[i] = 0;
         } else {
-            // Generate a square wave
-            buffer[i] = (fmod(audio_sample_index, 1.0) < 0.5) ? AUDIO_AMPLITUDE : -AUDIO_AMPLITUDE;
+            buffer[i] = (phase < 0.5) ? AUDIO_AMPLITUDE : -AUDIO_AMPLITUDE;
+            phase += step;
+            if (phase >= 1.0) {
+                phase -= 1.0;
+            }
         }
-        audio_sample_index += sample_step;
+    }
+
+    if (current_state == 0 || step <= 0.0) {
+        audio_sample_index = 0.0;
+    } else {
+        audio_sample_index = phase;
     }
     (void)userdata;
 }
