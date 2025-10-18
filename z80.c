@@ -26,6 +26,8 @@ uint8_t memory[0x10000]; // 65536 bytes
 #define ATTR_START 0x5800
 #define T_STATES_PER_FRAME 69888 // 3.5MHz / 50Hz (Spectrum CPU speed)
 
+const double CPU_CLOCK_HZ = 3500000.0;
+
 // --- SDL Globals ---
 SDL_Window* window = NULL;
 SDL_Renderer* renderer = NULL;
@@ -42,7 +44,7 @@ int audio_available = 0;
 
 // --- Timing Globals ---
 uint64_t total_t_states = 0; // A global clock for the entire CPU
-uint32_t last_beeper_toggle_t_states = 0; // T-state time of the last beeper toggle
+uint64_t last_beeper_toggle_t_states = 0; // T-state time of the last beeper toggle
 
 // --- ZX Spectrum Colours ---
 const uint32_t spectrum_colors[8] = {0x000000FF,0x0000CDFF,0xCD0000FF,0xCD00CDFF,0x00CD00FF,0x00CDCDFF,0xCDCD00FF,0xCFCFCFFF};
@@ -118,11 +120,11 @@ void io_write(uint16_t port, uint8_t value) {
         int new_beeper_state = (value >> 4) & 0x01;
 
         if (new_beeper_state != beeper_state) {
-            uint32_t half_period_t_states = total_t_states - last_beeper_toggle_t_states;
+            uint64_t half_period_t_states = total_t_states - last_beeper_toggle_t_states;
             double new_frequency = beeper_frequency;
 
             if (half_period_t_states > 20) { // Avoid division by zero
-                uint32_t full_period_t_states = half_period_t_states * 2;
+                uint64_t full_period_t_states = half_period_t_states * 2;
                 new_frequency = 3500000.0 / (double)full_period_t_states;
             } else {
                 new_frequency = 0.0;
@@ -607,64 +609,90 @@ int main(int argc, char *argv[]) {
 
     printf("Starting Z80 emulation...\n");
 
-    int quit=0; SDL_Event e;
-    const int FRAME_DURATION_MS = 20; // 1000ms / 50Hz
-    int t_states_elapsed_in_frame = 0;
+    int quit = 0;
+    SDL_Event e;
+    uint64_t performance_frequency = SDL_GetPerformanceFrequency();
+    uint64_t previous_counter = SDL_GetPerformanceCounter();
+    double cycle_accumulator = 0.0;
+    int frame_t_state_accumulator = 0;
 
-    while(!quit){
-        uint32_t frame_start_time = SDL_GetTicks();
-        t_states_elapsed_in_frame = 0;
-
-        while (t_states_elapsed_in_frame < T_STATES_PER_FRAME) {
-            if (cpu.ei_delay) {
-                cpu.iff1 = cpu.iff2 = 1;
-                cpu.ei_delay = 0;
-            }
-            
-            int t_states = 0;
-            if (cpu.halted) {
-                t_states = 4; // HALT burns 4 T-states per cycle
-            } else {
-                t_states = cpu_step(&cpu); // Execute one instruction
-            }
-            t_states_elapsed_in_frame += t_states;
-            total_t_states += t_states;
-        }
-
-        // Trigger Maskable Interrupt (IM 1)
-        if (cpu.iff1) {
-            t_states_elapsed_in_frame += cpu_interrupt(&cpu, 0x0038);
-            total_t_states += 13; // Add interrupt T-states
-        }
-
-        // Handle SDL Events
-        while(SDL_PollEvent(&e)!=0){
-            if(e.type==SDL_QUIT){quit=1;}
-            else if(e.type==SDL_KEYDOWN||e.type==SDL_KEYUP){
-                int row=-1; uint8_t mask=0;
-                int mapped=map_sdl_key_to_spectrum(e.key.keysym.sym,&row,&mask);
-                if(mapped){
-                    if(e.type==SDL_KEYDOWN){
-                        keyboard_matrix[row]&=~mask;
-                        // printf("Key Down: SDLKey=0x%X -> SpecRow=%d, Mask=0x%02X -> Matrix[%d]=0x%02X\n", e.key.keysym.sym, row, mask, row, keyboard_matrix[row]); // DEBUG
-                        if(e.key.keysym.sym==SDLK_BACKSPACE) keyboard_matrix[0]&=~0x01; // Press Shift
+    while (!quit) {
+        while (SDL_PollEvent(&e) != 0) {
+            if (e.type == SDL_QUIT) {
+                quit = 1;
+            } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
+                int row = -1;
+                uint8_t mask = 0;
+                int mapped = map_sdl_key_to_spectrum(e.key.keysym.sym, &row, &mask);
+                if (mapped) {
+                    if (e.type == SDL_KEYDOWN) {
+                        keyboard_matrix[row] &= ~mask;
+                        if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                            keyboard_matrix[0] &= ~0x01; // Press Shift
+                        }
                     } else {
-                        keyboard_matrix[row]|=mask;
-                        // printf("Key Up:   SDLKey=0x%X -> SpecRow=%d, Mask=0x%02X -> Matrix[%d]=0x%02X\n", e.key.keysym.sym, row, mask, row, keyboard_matrix[row]); // DEBUG
-                        if(e.key.keysym.sym==SDLK_BACKSPACE) keyboard_matrix[0]|=0x01; // Release Shift
+                        keyboard_matrix[row] |= mask;
+                        if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                            keyboard_matrix[0] |= 0x01; // Release Shift
+                        }
                     }
                 }
             }
         }
 
-        // Render
-        render_screen();
+        if (quit) {
+            break;
+        }
 
-        // Synchronize to 50Hz
-        uint32_t frame_end_time = SDL_GetTicks();
-        int frame_delta = frame_end_time - frame_start_time;
-        if (frame_delta < FRAME_DURATION_MS) {
-            SDL_Delay(FRAME_DURATION_MS - frame_delta);
+        uint64_t current_counter = SDL_GetPerformanceCounter();
+        double elapsed_seconds = (double)(current_counter - previous_counter) / (double)performance_frequency;
+        previous_counter = current_counter;
+
+        if (elapsed_seconds < 0.0) {
+            elapsed_seconds = 0.0;
+        }
+
+        cycle_accumulator += elapsed_seconds * CPU_CLOCK_HZ;
+        if (cycle_accumulator > CPU_CLOCK_HZ * 0.25) {
+            cycle_accumulator = CPU_CLOCK_HZ * 0.25;
+        }
+
+        if (cycle_accumulator < 1.0) {
+            SDL_Delay(1);
+            continue;
+        }
+
+        int cycles_to_execute = (int)cycle_accumulator;
+
+        while (cycles_to_execute > 0) {
+            if (cpu.ei_delay) {
+                cpu.iff1 = cpu.iff2 = 1;
+                cpu.ei_delay = 0;
+            }
+
+            int t_states = cpu.halted ? 4 : cpu_step(&cpu);
+            if (t_states <= 0) {
+                t_states = 4;
+            }
+
+            cycles_to_execute -= t_states;
+            cycle_accumulator -= t_states;
+            if (cycle_accumulator < 0.0) {
+                cycle_accumulator = 0.0;
+            }
+
+            frame_t_state_accumulator += t_states;
+            total_t_states += t_states;
+
+            while (frame_t_state_accumulator >= T_STATES_PER_FRAME) {
+                if (cpu.iff1) {
+                    int interrupt_t_states = cpu_interrupt(&cpu, 0x0038);
+                    total_t_states += interrupt_t_states;
+                    frame_t_state_accumulator += interrupt_t_states;
+                }
+                render_screen();
+                frame_t_state_accumulator -= T_STATES_PER_FRAME;
+            }
         }
     }
 
