@@ -21,6 +21,17 @@ The provided `./configure` helper script can verify these dependencies and sugge
 2. Build the emulator with `make`.
 3. The resulting executable (`spectrum`) will be placed in the project root.
 
+If you are working from the Codex environment used by the automation tooling in
+this repository, you can bootstrap the required dependencies and export sane
+defaults by running:
+
+```bash
+source scripts/codex_env.sh --install-deps --configure
+```
+
+Sourcing the script without arguments simply exports the recommended compiler
+flags while allowing you to manage dependencies manually.
+
 ### Windows
 1. Ensure a POSIX-compatible shell environment such as MSYS2 or Cygwin with SDL2 development packages installed.
 2. Use `./configure` (optional on Windows) or confirm that `gcc`, `pkg-config`, and SDL2 are available in your environment.
