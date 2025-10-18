@@ -2,7 +2,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 `sdl2-config --cflags`
 LDFLAGS = `sdl2-config --libs` -lm  # <-- ADD -lm HERE
-TARGET = z80_emu
+TARGET = z80
 SRCS = z80.c
 
 all: $(TARGET)
