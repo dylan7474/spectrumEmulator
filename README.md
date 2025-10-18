@@ -1,7 +1,7 @@
 # Spectrum Emulator
 
 ## Overview
-This project is a homebrew ZX Spectrum emulator written in C with SDL2 for video, audio, and input. It focuses on accurately modelling the original hardware's Z80 CPU, display timing, and keyboard matrix while remaining small enough to hack on for learning and experimentation.
+This project is a homebrew ZX Spectrum emulator written in C with SDL2 for video, audio, and input. It focuses on accurately modelling the original hardware's Z80 CPU, display timing, and keyboard matrix while remaining small enough to hack on for learning and experimentation. The build defaults to the Z80 architecture so the generated binary name and compilation flags clearly communicate the CPU target.
 
 ## Prerequisites
 Before building, make sure the following tools and development headers are available:
@@ -18,20 +18,31 @@ The provided `./configure` helper script can verify these dependencies and sugge
 
 ### Linux
 1. Run `./configure` to verify that the compiler and SDL2 development files are available.
-2. Build the emulator with `make`.
-3. The resulting executable (`spectrum`) will be placed in the project root.
+2. Build the emulator with `make` (or `make ARCH=z80` explicitly).
+3. The resulting executable (`spectrum_z80`) will be placed in the project root, indicating that the build targeted the Z80 CPU.
 
 ### Windows
 1. Ensure a POSIX-compatible shell environment such as MSYS2 or Cygwin with SDL2 development packages installed.
 2. Use `./configure` (optional on Windows) or confirm that `gcc`, `pkg-config`, and SDL2 are available in your environment.
-3. Build with `make -f Makefile.win` to produce the Windows binary.
+3. Build with `make ARCH=z80` to produce the Windows binary named `spectrum_z80.exe` so the architecture is explicit.
 
 ## Running
 Launch the compiled executable from the command line with a 16 KB Spectrum ROM image:
 
 ```bash
-./spectrum path/to/48k.rom
+./spectrum_z80 path/to/48k.rom
 ```
+
+### Codex environment helper
+
+To streamline working in automated environments, the repository ships with `codex_env.sh`. Source the script before building so the relevant environment variables and aliases are in place:
+
+```bash
+. ./codex_env.sh
+make
+```
+
+The script sets the `ARCH` variable to `z80` by default, exports helpful build flags, and defines a `make_z80` alias that always invokes `make ARCH=z80`.
 
 The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
 

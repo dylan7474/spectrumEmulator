@@ -1,9 +1,18 @@
 # --- Makefile for Z80 Emulator ---
+# The build is parameterised by the CPU architecture we are emulating.
+# By default we build the ZX Spectrum Z80 variant.
+ARCH ?= z80
+
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 `sdl2-config --cflags`
 LDFLAGS = `sdl2-config --libs` -lm  # <-- ADD -lm HERE
-TARGET = z80_emu
 SRCS = z80.c
+
+TARGET = spectrum_$(ARCH)
+
+ifeq ($(ARCH),z80)
+CFLAGS += -DTARGET_CPU_Z80
+endif
 
 all: $(TARGET)
 
