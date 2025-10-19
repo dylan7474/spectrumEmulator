@@ -44,6 +44,7 @@ int audio_available = 0;
 static double beeper_max_latency_samples = 256.0;
 static double beeper_latency_throttle_samples = 320.0;
 static double beeper_latency_release_samples = 256.0;
+static double beeper_latency_trim_samples = 512.0;
 static const double BEEPER_HP_ALPHA = 0.995;
 
 static const char* audio_dump_path = NULL;
@@ -284,6 +285,12 @@ static void beeper_set_latency_limit(double sample_limit) {
         release = beeper_max_latency_samples;
     }
     beeper_latency_release_samples = release;
+
+    double trim_margin = headroom;
+    if (trim_margin < beeper_max_latency_samples) {
+        trim_margin = beeper_max_latency_samples;
+    }
+    beeper_latency_trim_samples = beeper_latency_throttle_samples + trim_margin;
 }
 
 static void audio_dump_write_uint16(uint8_t* dst, uint16_t value) {
@@ -506,41 +513,46 @@ static void beeper_push_event(uint64_t t_state, int level) {
                 double throttle_cycles = beeper_cycles_per_sample * beeper_latency_throttle_samples;
 
                 if (throttle_cycles > 0.0 && latency_cycles > throttle_cycles) {
-                    double catch_up_position = (double)t_state - throttle_cycles;
-                    if (catch_up_position < 0.0) {
-                        catch_up_position = 0.0;
-                    }
+                    double trim_cycles = beeper_cycles_per_sample * beeper_latency_trim_samples;
+                    int should_trim = trim_cycles > throttle_cycles && latency_cycles > trim_cycles;
 
-                    double playback_snapshot = beeper_playback_position;
-                    size_t pending_before = beeper_pending_event_count();
-                    size_t consumed = beeper_catch_up_to(catch_up_position, playback_snapshot);
-                    double new_latency_cycles = (double)t_state - beeper_playback_position;
-                    double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
-                    double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
-                    size_t pending_after = beeper_pending_event_count();
-                    double catch_up_error_samples = 0.0;
-                    if (beeper_cycles_per_sample > 0.0) {
-                        catch_up_error_samples = (catch_up_position - beeper_playback_position) /
-                                                 beeper_cycles_per_sample;
-                    }
+                    if (should_trim) {
+                        double catch_up_position = (double)t_state - throttle_cycles;
+                        if (catch_up_position < 0.0) {
+                            catch_up_position = 0.0;
+                        }
 
-                    if (consumed > 0 || queued_samples_after < queued_samples_before) {
-                        fprintf(stderr,
-                                "[BEEPER] trimmed backlog %.2f -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
-                                queued_samples_before,
-                                queued_samples_after,
-                                consumed,
-                                pending_before,
-                                pending_after,
-                                catch_up_error_samples);
-                    }
+                        double playback_snapshot = beeper_playback_position;
+                        size_t pending_before = beeper_pending_event_count();
+                        size_t consumed = beeper_catch_up_to(catch_up_position, playback_snapshot);
+                        double new_latency_cycles = (double)t_state - beeper_playback_position;
+                        double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
+                        double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
+                        size_t pending_after = beeper_pending_event_count();
+                        double catch_up_error_samples = 0.0;
+                        if (beeper_cycles_per_sample > 0.0) {
+                            catch_up_error_samples = (catch_up_position - beeper_playback_position) /
+                                                     beeper_cycles_per_sample;
+                        }
 
-                    uint64_t catch_up_cycles = (uint64_t)catch_up_position;
-                    if (catch_up_cycles > beeper_last_event_t_state) {
-                        beeper_last_event_t_state = catch_up_cycles;
-                    }
+                        if (consumed > 0 || queued_samples_after < queued_samples_before) {
+                            fprintf(stderr,
+                                    "[BEEPER] trimmed backlog %.2f -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
+                                    queued_samples_before,
+                                    queued_samples_after,
+                                    consumed,
+                                    pending_before,
+                                    pending_after,
+                                    catch_up_error_samples);
+                        }
 
-                    latency_cycles = new_latency_cycles;
+                        uint64_t catch_up_cycles = (uint64_t)catch_up_position;
+                        if (catch_up_cycles > beeper_last_event_t_state) {
+                            beeper_last_event_t_state = catch_up_cycles;
+                        }
+
+                        latency_cycles = new_latency_cycles;
+                    }
                 }
             }
         } else if (audio_available && beeper_latency_warning_active) {
@@ -945,10 +957,11 @@ int init_sdl(void) {
             }
             beeper_set_latency_limit(latency_limit);
             fprintf(stderr,
-                    "[BEEPER] latency clamp set to %.0f samples (audio buffer %u, throttle %.0f)\n",
+                    "[BEEPER] latency clamp set to %.0f samples (audio buffer %u, throttle %.0f, trim %.0f)\n",
                     beeper_max_latency_samples,
                     have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples,
-                    beeper_latency_threshold());
+                    beeper_latency_threshold(),
+                    beeper_latency_trim_samples);
             beeper_reset_audio_state(total_t_states, beeper_state);
             if (audio_dump_path && !audio_dump_file) {
                 if (!audio_dump_start(audio_dump_path, (uint32_t)audio_sample_rate)) {
