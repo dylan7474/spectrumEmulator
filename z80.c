@@ -1126,6 +1126,13 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
                 if (beeper_writer_cursor < new_position) {
                     beeper_writer_cursor = new_position;
                 }
+                if (new_position > (double)beeper_last_event_t_state) {
+                    uint64_t idle_sync_state = (uint64_t)llround(new_position);
+                    if (idle_sync_state < beeper_last_event_t_state) {
+                        idle_sync_state = beeper_last_event_t_state;
+                    }
+                    beeper_last_event_t_state = idle_sync_state;
+                }
                 beeper_hp_last_input = last_input;
                 beeper_hp_last_output = last_output;
                 (void)userdata;
