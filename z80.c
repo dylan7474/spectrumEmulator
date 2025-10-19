@@ -792,7 +792,31 @@ int cpu_ed_step(Z80* cpu) {
         case 0x44:{uint8_t a=cpu->reg_A;cpu->reg_A=0;cpu_sub(cpu,a,1);return 0;} case 0x47:cpu->reg_I=cpu->reg_A;return 1; case 0x4F:cpu->reg_R=cpu->reg_A;return 1;
         case 0x57:cpu->reg_A=cpu->reg_I;set_flag(cpu,FLAG_S,cpu->reg_A&0x80);set_flag(cpu,FLAG_Z,cpu->reg_A==0);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_PV,cpu->iff2);set_flag(cpu,FLAG_N,0);return 1;
         case 0x5F:cpu->reg_A=cpu->reg_R;set_flag(cpu,FLAG_S,cpu->reg_A&0x80);set_flag(cpu,FLAG_Z,cpu->reg_A==0);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_PV,cpu->iff2);set_flag(cpu,FLAG_N,0);return 1;
-        case 0x67:/*RRD*/return 10; case 0x6F:/*RLD*/return 10; case 0x46:cpu->interruptMode=0;return 0; case 0x56:cpu->interruptMode=1;return 0; case 0x5E:cpu->interruptMode=2;return 0;
+        case 0x67: {
+            uint16_t hl_addr = get_HL(cpu);
+            uint8_t value = readByte(hl_addr);
+            uint8_t new_mem = (uint8_t)(((cpu->reg_A & 0x0F) << 4) | (value >> 4));
+            uint8_t new_a = (cpu->reg_A & 0xF0) | (value & 0x0F);
+            writeByte(hl_addr, new_mem);
+            cpu->reg_A = new_a;
+            set_flags_szp(cpu, cpu->reg_A);
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            return 10;
+        }
+        case 0x6F: {
+            uint16_t hl_addr = get_HL(cpu);
+            uint8_t value = readByte(hl_addr);
+            uint8_t new_mem = (uint8_t)(((value << 4) & 0xF0) | (cpu->reg_A & 0x0F));
+            uint8_t new_a = (cpu->reg_A & 0xF0) | ((value >> 4) & 0x0F);
+            writeByte(hl_addr, new_mem);
+            cpu->reg_A = new_a;
+            set_flags_szp(cpu, cpu->reg_A);
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            return 10;
+        }
+        case 0x46:cpu->interruptMode=0;return 0; case 0x56:cpu->interruptMode=1;return 0; case 0x5E:cpu->interruptMode=2;return 0;
         case 0x45:cpu->reg_PC=cpu_pop(cpu);cpu->iff1=cpu->iff2;return 6; case 0x4D:cpu->reg_PC=cpu_pop(cpu);cpu->iff1=cpu->iff2;return 6;
         case 0x40:cpu->reg_B=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_B);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4; case 0x48:cpu->reg_C=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_C);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4;
         case 0x50:cpu->reg_D=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_D);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4; case 0x58:cpu->reg_E=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_E);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4;
