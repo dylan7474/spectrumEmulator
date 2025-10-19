@@ -42,6 +42,7 @@ int audio_sample_rate = 44100;
 int audio_available = 0;
 
 static double beeper_max_latency_samples = 256.0;
+static double beeper_latency_throttle_samples = 320.0;
 static const double BEEPER_HP_ALPHA = 0.995;
 
 static const char* audio_dump_path = NULL;
@@ -128,6 +129,7 @@ static void beeper_set_latency_limit(double sample_limit);
 static void beeper_push_event(uint64_t t_state, int level);
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
 static double beeper_current_latency_samples(void);
+static double beeper_latency_threshold(void);
 static int audio_dump_start(const char* path, uint32_t sample_rate);
 static void audio_dump_write_samples(const Sint16* samples, size_t count);
 static void audio_dump_finish(void);
@@ -172,6 +174,14 @@ static size_t beeper_pending_event_count(void) {
     return (size_t)BEEPER_EVENT_CAPACITY - head + tail;
 }
 
+static double beeper_latency_threshold(void) {
+    double threshold = beeper_latency_throttle_samples;
+    if (threshold < beeper_max_latency_samples) {
+        threshold = beeper_max_latency_samples;
+    }
+    return threshold;
+}
+
 static double beeper_current_latency_samples(void) {
     if (!audio_available || beeper_cycles_per_sample <= 0.0) {
         beeper_latency_warning_active = 0;
@@ -199,15 +209,17 @@ static double beeper_current_latency_samples(void) {
         latency_samples = 0.0;
     }
 
-    if (latency_samples >= beeper_max_latency_samples) {
+    double throttle_threshold = beeper_latency_threshold();
+    if (latency_samples >= throttle_threshold) {
         if (!beeper_latency_warning_active) {
             fprintf(stderr,
-                    "[BEEPER] latency %.2f samples exceeds clamp %.2f; throttling CPU until audio catches up\n",
+                    "[BEEPER] latency %.2f samples exceeds throttle %.2f (clamp %.2f); throttling CPU until audio catches up\n",
                     latency_samples,
+                    throttle_threshold,
                     beeper_max_latency_samples);
             beeper_latency_warning_active = 1;
         }
-    } else if (latency_samples < beeper_max_latency_samples * 0.75 && beeper_latency_warning_active) {
+    } else if (latency_samples < throttle_threshold * 0.75 && beeper_latency_warning_active) {
         beeper_latency_warning_active = 0;
     }
 
@@ -219,6 +231,15 @@ static void beeper_set_latency_limit(double sample_limit) {
         sample_limit = 64.0;
     }
     beeper_max_latency_samples = sample_limit;
+
+    double headroom = sample_limit * 0.25;
+    if (headroom < 64.0) {
+        headroom = 64.0;
+    } else if (headroom > 1024.0) {
+        headroom = 1024.0;
+    }
+
+    beeper_latency_throttle_samples = beeper_max_latency_samples + headroom;
 }
 
 static void audio_dump_write_uint16(uint8_t* dst, uint16_t value) {
@@ -836,9 +857,10 @@ int init_sdl(void) {
             }
             beeper_set_latency_limit(latency_limit);
             fprintf(stderr,
-                    "[BEEPER] latency clamp set to %.0f samples (audio buffer %u)\n",
+                    "[BEEPER] latency clamp set to %.0f samples (audio buffer %u, throttle %.0f)\n",
                     beeper_max_latency_samples,
-                    have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples);
+                    have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples,
+                    beeper_latency_threshold());
             beeper_reset_audio_state(total_t_states, beeper_state);
             if (audio_dump_path && !audio_dump_file) {
                 if (!audio_dump_start(audio_dump_path, (uint32_t)audio_sample_rate)) {
@@ -1058,7 +1080,7 @@ int main(int argc, char *argv[]) {
 
         if (audio_available && beeper_cycles_per_sample > 0.0) {
             double latency_samples = beeper_current_latency_samples();
-            if (latency_samples >= beeper_max_latency_samples) {
+            if (latency_samples >= beeper_latency_threshold()) {
                 SDL_Delay(1);
                 continue;
             }
@@ -1106,7 +1128,7 @@ int main(int argc, char *argv[]) {
                 if (latency_poll_cycles >= latency_poll_threshold) {
                     latency_poll_cycles = 0;
                     double latency_samples = beeper_current_latency_samples();
-                    if (latency_samples >= beeper_max_latency_samples) {
+                    if (latency_samples >= beeper_latency_threshold()) {
                         throttled_audio = 1;
                         break;
                     }
