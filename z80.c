@@ -1009,9 +1009,23 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
 
     size_t index = 0;
     size_t pilot_count = 0;
-    while (index < count && tape_duration_matches(pulses[index].duration, TAPE_PILOT_PULSE_TSTATES)) {
-        ++pilot_count;
-        ++index;
+    size_t search_index = 0;
+    while (search_index < count) {
+        if (!tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES)) {
+            ++search_index;
+            continue;
+        }
+
+        size_t run_start = search_index;
+        while (search_index < count && tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES)) {
+            ++search_index;
+        }
+
+        pilot_count = search_index - run_start;
+        if (pilot_count >= 100) {
+            index = search_index;
+            break;
+        }
     }
 
     if (pilot_count < 100) {
@@ -1103,18 +1117,22 @@ static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flu
         }
     }
 
-    TapeBlock block = {0};
-    if (!tape_decode_pulses_to_block(tape_recorder.pulses, tape_recorder.pulse_count, pause_ms, &block)) {
-        fprintf(stderr, "Warning: failed to decode saved tape block (%zu pulses)\n", tape_recorder.pulse_count);
-    } else {
-        if (!tape_image_add_block(&tape_recorder.recorded, block.data, block.length, block.pause_ms)) {
-            fprintf(stderr, "Warning: failed to store recorded tape block\n");
+    size_t pulse_count = tape_recorder.pulse_count;
+    if (pulse_count >= 100) {
+        TapeBlock block = {0};
+        if (!tape_decode_pulses_to_block(tape_recorder.pulses, pulse_count, pause_ms, &block)) {
+            fprintf(stderr, "Warning: failed to decode saved tape block (%zu pulses)\n", pulse_count);
+        } else {
+            if (!tape_image_add_block(&tape_recorder.recorded, block.data, block.length, block.pause_ms)) {
+                fprintf(stderr, "Warning: failed to store recorded tape block\n");
+            }
+            free(block.data);
         }
-        free(block.data);
     }
 
     tape_recorder.block_active = 0;
     tape_recorder.pulse_count = 0;
+    tape_recorder.last_transition_tstate = current_t_state;
 }
 
 static void tape_recorder_handle_mic(uint64_t t_state, int level) {
