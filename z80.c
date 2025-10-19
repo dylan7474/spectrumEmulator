@@ -171,6 +171,8 @@ static int* ula_instruction_progress_ptr = NULL;
 static TapeFormat tape_input_format = TAPE_FORMAT_NONE;
 static const char* tape_input_path = NULL;
 
+static int string_ends_with_case_insensitive(const char* str, const char* suffix);
+static TapeFormat tape_format_from_extension(const char* path);
 static int tape_load_image(const char* path, TapeFormat format, TapeImage* image);
 static void tape_free_image(TapeImage* image);
 static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t length, uint32_t pause_ms);
@@ -1063,6 +1065,53 @@ static int tape_load_wav(const char* path, TapePlaybackState* state) {
 
     free(data_buffer);
     return 1;
+}
+
+static int string_ends_with_case_insensitive(const char* str, const char* suffix) {
+    if (!str || !suffix) {
+        return 0;
+    }
+
+    size_t str_len = strlen(str);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len == 0 || suffix_len > str_len) {
+        return 0;
+    }
+
+    const char* str_tail = str + (str_len - suffix_len);
+    for (size_t i = 0; i < suffix_len; ++i) {
+        char a = str_tail[i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static TapeFormat tape_format_from_extension(const char* path) {
+    if (!path) {
+        return TAPE_FORMAT_NONE;
+    }
+
+    if (string_ends_with_case_insensitive(path, ".tap")) {
+        return TAPE_FORMAT_TAP;
+    }
+    if (string_ends_with_case_insensitive(path, ".tzx")) {
+        return TAPE_FORMAT_TZX;
+    }
+    if (string_ends_with_case_insensitive(path, ".wav")) {
+        return TAPE_FORMAT_WAV;
+    }
+
+    return TAPE_FORMAT_NONE;
 }
 
 static int tape_load_image(const char* path, TapeFormat format, TapeImage* image) {
@@ -2983,13 +3032,19 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             tape_recorder_enable(argv[++i], TAPE_OUTPUT_WAV);
-        } else if (!rom_filename) {
-            rom_filename = argv[i];
-            rom_provided = 1;
         } else {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
-            return 1;
+            TapeFormat inferred_format = tape_format_from_extension(argv[i]);
+            if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
+                tape_input_format = inferred_format;
+                tape_input_path = argv[i];
+            } else if (!rom_filename) {
+                rom_filename = argv[i];
+                rom_provided = 1;
+            } else {
+                fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
         }
     }
 
