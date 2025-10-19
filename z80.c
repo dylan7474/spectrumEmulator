@@ -43,6 +43,7 @@ int audio_available = 0;
 
 static double beeper_max_latency_samples = 256.0;
 static double beeper_latency_throttle_samples = 320.0;
+static double beeper_latency_release_samples = 256.0;
 static const double BEEPER_HP_ALPHA = 0.995;
 
 static const char* audio_dump_path = NULL;
@@ -130,6 +131,7 @@ static void beeper_push_event(uint64_t t_state, int level);
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
 static double beeper_current_latency_samples(void);
 static double beeper_latency_threshold(void);
+static Uint32 beeper_recommended_throttle_delay(double latency_samples);
 static int audio_dump_start(const char* path, uint32_t sample_rate);
 static void audio_dump_write_samples(const Sint16* samples, size_t count);
 static void audio_dump_finish(void);
@@ -182,6 +184,36 @@ static double beeper_latency_threshold(void) {
     return threshold;
 }
 
+static Uint32 beeper_recommended_throttle_delay(double latency_samples) {
+    double threshold = beeper_latency_threshold();
+    if (latency_samples <= threshold || audio_sample_rate <= 0) {
+        return 0;
+    }
+
+    double over = latency_samples - threshold;
+    double limit = beeper_max_latency_samples;
+    if (limit <= 0.0) {
+        limit = 256.0;
+    }
+
+    if (over <= limit * 0.1) {
+        return 0;
+    }
+
+    if (over <= limit * 0.5) {
+        return 1;
+    }
+
+    double estimated_ms = ceil((over * 1000.0) / (double)audio_sample_rate);
+    if (estimated_ms < 2.0) {
+        estimated_ms = 2.0;
+    } else if (estimated_ms > 8.0) {
+        estimated_ms = 8.0;
+    }
+
+    return (Uint32)estimated_ms;
+}
+
 static double beeper_current_latency_samples(void) {
     if (!audio_available || beeper_cycles_per_sample <= 0.0) {
         beeper_latency_warning_active = 0;
@@ -219,8 +251,14 @@ static double beeper_current_latency_samples(void) {
                     beeper_max_latency_samples);
             beeper_latency_warning_active = 1;
         }
-    } else if (latency_samples < throttle_threshold * 0.75 && beeper_latency_warning_active) {
-        beeper_latency_warning_active = 0;
+    } else {
+        double release_threshold = beeper_latency_release_samples;
+        if (release_threshold < beeper_max_latency_samples) {
+            release_threshold = beeper_max_latency_samples;
+        }
+        if (latency_samples < release_threshold && beeper_latency_warning_active) {
+            beeper_latency_warning_active = 0;
+        }
     }
 
     return latency_samples;
@@ -232,14 +270,20 @@ static void beeper_set_latency_limit(double sample_limit) {
     }
     beeper_max_latency_samples = sample_limit;
 
-    double headroom = sample_limit * 0.25;
-    if (headroom < 64.0) {
-        headroom = 64.0;
-    } else if (headroom > 1024.0) {
-        headroom = 1024.0;
+    double headroom = sample_limit * 0.5;
+    if (headroom < 128.0) {
+        headroom = 128.0;
+    } else if (headroom > 2048.0) {
+        headroom = 2048.0;
     }
 
     beeper_latency_throttle_samples = beeper_max_latency_samples + headroom;
+
+    double release = beeper_latency_throttle_samples - headroom * 0.5;
+    if (release < beeper_max_latency_samples) {
+        release = beeper_max_latency_samples;
+    }
+    beeper_latency_release_samples = release;
 }
 
 static void audio_dump_write_uint16(uint8_t* dst, uint16_t value) {
@@ -1080,8 +1124,10 @@ int main(int argc, char *argv[]) {
 
         if (audio_available && beeper_cycles_per_sample > 0.0) {
             double latency_samples = beeper_current_latency_samples();
-            if (latency_samples >= beeper_latency_threshold()) {
-                SDL_Delay(1);
+            double threshold = beeper_latency_threshold();
+            if (latency_samples >= threshold) {
+                Uint32 delay_ms = beeper_recommended_throttle_delay(latency_samples);
+                SDL_Delay(delay_ms);
                 continue;
             }
         }
@@ -1095,6 +1141,7 @@ int main(int argc, char *argv[]) {
         int latency_poll_cycles = 0;
         int latency_poll_threshold = 0;
         int throttled_audio = 0;
+        double throttled_latency_samples = 0.0;
 
         if (audio_available && beeper_cycles_per_sample > 0.0) {
             latency_poll_threshold = (int)(beeper_cycles_per_sample * 32.0);
@@ -1130,6 +1177,7 @@ int main(int argc, char *argv[]) {
                     double latency_samples = beeper_current_latency_samples();
                     if (latency_samples >= beeper_latency_threshold()) {
                         throttled_audio = 1;
+                        throttled_latency_samples = latency_samples;
                         break;
                     }
                 }
@@ -1147,7 +1195,8 @@ int main(int argc, char *argv[]) {
         }
 
         if (throttled_audio) {
-            SDL_Delay(1);
+            Uint32 delay_ms = beeper_recommended_throttle_delay(throttled_latency_samples);
+            SDL_Delay(delay_ms);
             continue;
         }
     }
