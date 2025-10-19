@@ -63,7 +63,6 @@ static const int TAPE_BIT1_PULSE_TSTATES = 1710;
 static const int TAPE_HEADER_PILOT_COUNT = 8063;
 static const int TAPE_DATA_PILOT_COUNT = 3223;
 static const uint64_t TAPE_SILENCE_THRESHOLD_TSTATES = 350000ULL; // 0.1 second
-static const int TAPE_DURATION_TOLERANCE = 200;
 
 typedef struct {
     uint8_t* data;
@@ -816,12 +815,20 @@ static void tape_start_playback(TapePlaybackState* state, uint64_t start_time) {
     (void)tape_begin_block(state, 0u, start_time);
 }
 
-static int tape_duration_matches(uint32_t duration, int reference) {
+static int tape_duration_tolerance(int reference) {
+    int tolerance = reference / 4;
+    if (tolerance < 200) {
+        tolerance = 200;
+    }
+    return tolerance;
+}
+
+static int tape_duration_matches(uint32_t duration, int reference, int tolerance) {
     int diff = (int)duration - reference;
     if (diff < 0) {
         diff = -diff;
     }
-    return diff <= TAPE_DURATION_TOLERANCE;
+    return diff <= tolerance;
 }
 
 static void tape_finish_block_playback(TapePlaybackState* state) {
@@ -1010,14 +1017,15 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
     size_t index = 0;
     size_t pilot_count = 0;
     size_t search_index = 0;
+    const int pilot_tolerance = tape_duration_tolerance(TAPE_PILOT_PULSE_TSTATES);
     while (search_index < count) {
-        if (!tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES)) {
+        if (!tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES, pilot_tolerance)) {
             ++search_index;
             continue;
         }
 
         size_t run_start = search_index;
-        while (search_index < count && tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES)) {
+        while (search_index < count && tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES, pilot_tolerance)) {
             ++search_index;
         }
 
@@ -1036,45 +1044,69 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
         return 0;
     }
 
-    if (!tape_duration_matches(pulses[index].duration, TAPE_SYNC_FIRST_PULSE_TSTATES) ||
-        !tape_duration_matches(pulses[index + 1].duration, TAPE_SYNC_SECOND_PULSE_TSTATES)) {
+    const int sync1_tolerance = tape_duration_tolerance(TAPE_SYNC_FIRST_PULSE_TSTATES);
+    const int sync2_tolerance = tape_duration_tolerance(TAPE_SYNC_SECOND_PULSE_TSTATES);
+    if (!tape_duration_matches(pulses[index].duration, TAPE_SYNC_FIRST_PULSE_TSTATES, sync1_tolerance) ||
+        !tape_duration_matches(pulses[index + 1].duration, TAPE_SYNC_SECOND_PULSE_TSTATES, sync2_tolerance)) {
         return 0;
     }
 
     index += 2;
 
-    size_t remaining = count - index;
-    if ((remaining % 2u) != 0u) {
+    size_t data_limit = count;
+    while (data_limit > index && ((data_limit - index) % 2u) != 0u) {
+        --data_limit;
+    }
+
+    if (data_limit <= index) {
         return 0;
     }
 
-    size_t bit_count = remaining / 2u;
-    if ((bit_count % 8u) != 0u) {
+    size_t bit_pairs = (data_limit - index) / 2u;
+    while (bit_pairs > 0 && (bit_pairs % 8u) != 0u) {
+        data_limit -= 2u;
+        bit_pairs = (data_limit - index) / 2u;
+    }
+
+    if (bit_pairs == 0 || (bit_pairs % 8u) != 0u) {
         return 0;
     }
 
-    size_t byte_count = bit_count / 8u;
+    size_t byte_count = bit_pairs / 8u;
     uint8_t* data = (uint8_t*)malloc(byte_count ? byte_count : 1u);
     if (!data) {
         return 0;
     }
     memset(data, 0, byte_count ? byte_count : 1u);
 
+    const int bit0_tolerance = tape_duration_tolerance(TAPE_BIT0_PULSE_TSTATES);
+    const int bit1_tolerance = tape_duration_tolerance(TAPE_BIT1_PULSE_TSTATES);
+
     for (size_t byte_index = 0; byte_index < byte_count; ++byte_index) {
         uint8_t value = 0;
         for (int bit = 7; bit >= 0; --bit) {
-            if (index >= count) {
+            if (index >= data_limit) {
                 free(data);
                 return 0;
             }
             uint32_t d1 = pulses[index].duration;
             uint32_t d2 = pulses[index + 1].duration;
             index += 2;
-            int is_one = tape_duration_matches(d1, TAPE_BIT1_PULSE_TSTATES) && tape_duration_matches(d2, TAPE_BIT1_PULSE_TSTATES);
-            int is_zero = tape_duration_matches(d1, TAPE_BIT0_PULSE_TSTATES) && tape_duration_matches(d2, TAPE_BIT0_PULSE_TSTATES);
+            int is_one = tape_duration_matches(d1, TAPE_BIT1_PULSE_TSTATES, bit1_tolerance) &&
+                         tape_duration_matches(d2, TAPE_BIT1_PULSE_TSTATES, bit1_tolerance);
+            int is_zero = tape_duration_matches(d1, TAPE_BIT0_PULSE_TSTATES, bit0_tolerance) &&
+                          tape_duration_matches(d2, TAPE_BIT0_PULSE_TSTATES, bit0_tolerance);
             if (!is_one && !is_zero) {
-                free(data);
-                return 0;
+                int score_one = abs((int)d1 - TAPE_BIT1_PULSE_TSTATES) + abs((int)d2 - TAPE_BIT1_PULSE_TSTATES);
+                int score_zero = abs((int)d1 - TAPE_BIT0_PULSE_TSTATES) + abs((int)d2 - TAPE_BIT0_PULSE_TSTATES);
+                if (score_one < score_zero && score_one <= bit1_tolerance * 4) {
+                    is_one = 1;
+                } else if (score_zero < score_one && score_zero <= bit0_tolerance * 4) {
+                    is_zero = 1;
+                } else {
+                    free(data);
+                    return 0;
+                }
             }
             if (is_one) {
                 value |= (uint8_t)(1u << bit);
