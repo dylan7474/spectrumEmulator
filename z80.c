@@ -42,6 +42,7 @@ int audio_sample_rate = 44100;
 int audio_available = 0;
 
 static const double BEEPER_MAX_LATENCY_SAMPLES = 256.0;
+static const double BEEPER_HP_ALPHA = 0.995;
 
 #define BEEPER_EVENT_CAPACITY 8192
 
@@ -156,22 +157,67 @@ static void beeper_push_event(uint64_t t_state, int level) {
             if (catch_up_position < 0.0) {
                 catch_up_position = 0.0;
             }
+            size_t head = beeper_event_head;
+            double playback_position = playback_position_snapshot;
+            double last_input = beeper_hp_last_input;
+            double last_output = beeper_hp_last_output;
+            int playback_level = beeper_playback_level;
+            double current_raw = (playback_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
 
-            uint64_t catch_up_cycles = (uint64_t)catch_up_position;
-            while (beeper_event_head != beeper_event_tail &&
-                   beeper_events[beeper_event_head].t_state <= catch_up_cycles) {
-                beeper_playback_level = beeper_events[beeper_event_head].level ? 1 : 0;
-                beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
+            if (playback_position > catch_up_position) {
+                playback_position = catch_up_position;
             }
 
-            beeper_playback_position = catch_up_position;
+            while (head != beeper_event_tail &&
+                   beeper_events[head].t_state <= (uint64_t)catch_up_position) {
+                uint64_t event_t_state = beeper_events[head].t_state;
+                double event_position = (double)event_t_state;
+
+                if (event_position < playback_position) {
+                    event_position = playback_position;
+                }
+
+                double delta_cycles = event_position - playback_position;
+                if (delta_cycles > 0.0) {
+                    double sample_delta = delta_cycles / beeper_cycles_per_sample;
+                    double decay = pow(BEEPER_HP_ALPHA, sample_delta);
+                    last_output *= decay;
+                    last_input = current_raw;
+                    playback_position = event_position;
+                }
+
+                int new_level = beeper_events[head].level ? 1 : 0;
+                double new_raw = (new_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+                double filtered = new_raw - last_input + BEEPER_HP_ALPHA * last_output;
+
+                last_input = new_raw;
+                last_output = filtered;
+                playback_level = new_level;
+                current_raw = new_raw;
+                playback_position = event_position;
+
+                head = (head + 1) % BEEPER_EVENT_CAPACITY;
+            }
+
+            double remaining_cycles = catch_up_position - playback_position;
+            if (remaining_cycles > 0.0) {
+                double sample_delta = remaining_cycles / beeper_cycles_per_sample;
+                double decay = pow(BEEPER_HP_ALPHA, sample_delta);
+                last_output *= decay;
+                last_input = current_raw;
+                playback_position = catch_up_position;
+            }
+
+            beeper_event_head = head;
+            beeper_playback_position = playback_position;
+            beeper_playback_level = playback_level;
+            beeper_hp_last_input = last_input;
+            beeper_hp_last_output = last_output;
+
+            uint64_t catch_up_cycles = (uint64_t)catch_up_position;
             if (catch_up_cycles > beeper_last_event_t_state) {
                 beeper_last_event_t_state = catch_up_cycles;
             }
-
-            double current_raw_sample = (beeper_playback_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
-            beeper_hp_last_input = current_raw_sample;
-            beeper_hp_last_output = current_raw_sample;
         }
     }
 
@@ -649,7 +695,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
         }
 
         double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
-        double filtered_sample = raw_sample - last_input + 0.995 * last_output;
+        double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
         last_input = raw_sample;
         last_output = filtered_sample;
 
