@@ -46,6 +46,14 @@ Launch the compiled executable from the command line with a 16 KB Spectrum ROM i
 
 The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
 
+For audio debugging you can mirror the generated beeper samples to a WAV file with the optional dump flag:
+
+```bash
+./spectrum --audio-dump beeper.wav path/to/48k.rom
+```
+
+The WAV stream is captured directly from the audio callback, allowing offline analysis with tools such as Audacity.
+
 ## Controls
 The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary host-to-Spectrum key mapping is:
 

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <math.h>
 #include <SDL.h>
 
 // --- Z80 Flag Register Bits ---
@@ -42,6 +43,11 @@ int audio_available = 0;
 
 static double beeper_max_latency_samples = 256.0;
 static const double BEEPER_HP_ALPHA = 0.995;
+
+static const char* audio_dump_path = NULL;
+
+static FILE* audio_dump_file = NULL;
+static uint32_t audio_dump_data_bytes = 0;
 
 #define BEEPER_EVENT_CAPACITY 8192
 
@@ -120,6 +126,10 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
 static void beeper_set_latency_limit(double sample_limit);
 static void beeper_push_event(uint64_t t_state, int level);
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
+static int audio_dump_start(const char* path, uint32_t sample_rate);
+static void audio_dump_write_samples(const Sint16* samples, size_t count);
+static void audio_dump_finish(void);
+static void audio_dump_abort(void);
 
 
 // --- Memory Access Helpers ---
@@ -165,6 +175,109 @@ static void beeper_set_latency_limit(double sample_limit) {
         sample_limit = 64.0;
     }
     beeper_max_latency_samples = sample_limit;
+}
+
+static void audio_dump_write_uint16(uint8_t* dst, uint16_t value) {
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+static void audio_dump_write_uint32(uint8_t* dst, uint32_t value) {
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFu);
+    dst[2] = (uint8_t)((value >> 16) & 0xFFu);
+    dst[3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
+static int audio_dump_start(const char* path, uint32_t sample_rate) {
+    if (!path) {
+        return 0;
+    }
+
+    audio_dump_file = fopen(path, "wb");
+    if (!audio_dump_file) {
+        fprintf(stderr, "[BEEPER] failed to open audio dump '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    audio_dump_data_bytes = 0;
+
+    uint8_t header[44];
+    memset(header, 0, sizeof(header));
+
+    memcpy(header, "RIFF", 4);
+    audio_dump_write_uint32(header + 4, 36u);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
+    audio_dump_write_uint32(header + 16, 16u); // PCM chunk size
+    audio_dump_write_uint16(header + 20, 1u);  // PCM format
+    audio_dump_write_uint16(header + 22, 1u);  // mono
+    audio_dump_write_uint32(header + 24, sample_rate);
+    uint32_t byte_rate = sample_rate * 2u; // mono, 16-bit
+    audio_dump_write_uint32(header + 28, byte_rate);
+    audio_dump_write_uint16(header + 32, 2u); // block align
+    audio_dump_write_uint16(header + 34, 16u); // bits per sample
+    memcpy(header + 36, "data", 4);
+    audio_dump_write_uint32(header + 40, 0u);
+
+    if (fwrite(header, sizeof(header), 1, audio_dump_file) != 1) {
+        fprintf(stderr, "[BEEPER] failed to write WAV header to '%s'\n", path);
+        audio_dump_abort();
+        return 0;
+    }
+
+    fprintf(stderr, "[BEEPER] dumping audio to %s\n", path);
+    return 1;
+}
+
+static void audio_dump_abort(void) {
+    if (audio_dump_file) {
+        fclose(audio_dump_file);
+        audio_dump_file = NULL;
+    }
+    audio_dump_data_bytes = 0;
+}
+
+static void audio_dump_write_samples(const Sint16* samples, size_t count) {
+    if (!audio_dump_file || !samples || count == 0) {
+        return;
+    }
+
+    size_t written = fwrite(samples, sizeof(Sint16), count, audio_dump_file);
+    if (written != count) {
+        fprintf(stderr,
+                "[BEEPER] audio dump write failed after %zu samples\n",
+                (size_t)(audio_dump_data_bytes / 2u));
+        audio_dump_abort();
+        return;
+    }
+
+    audio_dump_data_bytes += (uint32_t)(written * sizeof(Sint16));
+}
+
+static void audio_dump_finish(void) {
+    if (!audio_dump_file) {
+        return;
+    }
+
+    uint32_t riff_size = 36u + audio_dump_data_bytes;
+    uint32_t data_size = audio_dump_data_bytes;
+
+    if (fseek(audio_dump_file, 4L, SEEK_SET) == 0) {
+        uint8_t size_bytes[4];
+        audio_dump_write_uint32(size_bytes, riff_size);
+        fwrite(size_bytes, sizeof(size_bytes), 1, audio_dump_file);
+    }
+
+    if (fseek(audio_dump_file, 40L, SEEK_SET) == 0) {
+        uint8_t data_bytes_buf[4];
+        audio_dump_write_uint32(data_bytes_buf, data_size);
+        fwrite(data_bytes_buf, sizeof(data_bytes_buf), 1, audio_dump_file);
+    }
+
+    fclose(audio_dump_file);
+    audio_dump_file = NULL;
+    audio_dump_data_bytes = 0;
 }
 
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
@@ -679,6 +792,11 @@ int init_sdl(void) {
                     beeper_max_latency_samples,
                     have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples);
             beeper_reset_audio_state(total_t_states, beeper_state);
+            if (audio_dump_path && !audio_dump_file) {
+                if (!audio_dump_start(audio_dump_path, (uint32_t)audio_sample_rate)) {
+                    audio_dump_path = NULL;
+                }
+            }
             SDL_PauseAudio(0); // Start playing sound
         }
     }
@@ -692,6 +810,7 @@ void cleanup_sdl(void) {
         audio_available = 0;
         beeper_set_latency_limit(256.0);
     }
+    audio_dump_finish();
     if (texture) {
         SDL_DestroyTexture(texture);
     }
@@ -776,6 +895,8 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
         playback_position = target_position;
     }
 
+    audio_dump_write_samples(buffer, (size_t)num_samples);
+
     beeper_playback_level = level;
     beeper_playback_position = playback_position;
     beeper_hp_last_input = last_input;
@@ -786,10 +907,43 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
 // --- Main Program ---
 int main(int argc, char *argv[]) {
-    if(argc<2){fprintf(stderr,"Usage: %s <rom_file>\n",argv[0]);return 1;} const char* fn=argv[1];
-    FILE* rf=fopen(fn,"rb"); if(!rf){perror("ROM open error");fprintf(stderr,"File: %s\n",fn);return 1;}
-    size_t br=fread(memory,1,0x4000,rf); if(br!=0x4000){fprintf(stderr,"ROM read error(%zu)\n",br);fclose(rf);return 1;} fclose(rf);
-    printf("Loaded %zu bytes from %s\n",br,fn);
+    const char* rom_filename = NULL;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--audio-dump") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+                return 1;
+            }
+            audio_dump_path = argv[++i];
+        } else if (!rom_filename) {
+            rom_filename = argv[i];
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+            return 1;
+        }
+    }
+
+    if (!rom_filename) {
+        fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+        return 1;
+    }
+
+    FILE* rf = fopen(rom_filename, "rb");
+    if (!rf) {
+        perror("ROM open error");
+        fprintf(stderr, "File: %s\n", rom_filename);
+        return 1;
+    }
+    size_t br = fread(memory, 1, 0x4000, rf);
+    if (br != 0x4000) {
+        fprintf(stderr, "ROM read error(%zu)\n", br);
+        fclose(rf);
+        return 1;
+    }
+    fclose(rf);
+    printf("Loaded %zu bytes from %s\n", br, rom_filename);
     if(!init_sdl()){cleanup_sdl();return 1;}
 
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
