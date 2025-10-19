@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <SDL.h>
@@ -53,6 +54,8 @@ static double beeper_latency_trim_samples = 512.0;
 static const double BEEPER_HP_ALPHA = 0.995;
 
 static const char* audio_dump_path = NULL;
+
+static const int16_t TAPE_WAV_AMPLITUDE = 20000;
 
 // --- Tape Constants ---
 static const int TAPE_PILOT_PULSE_TSTATES = 2168;
@@ -104,6 +107,12 @@ typedef struct {
     uint32_t duration;
 } TapePulse;
 
+typedef enum {
+    TAPE_OUTPUT_NONE,
+    TAPE_OUTPUT_TAP,
+    TAPE_OUTPUT_WAV
+} TapeOutputFormat;
+
 typedef struct {
     TapeImage recorded;
     TapePulse* pulses;
@@ -114,6 +123,12 @@ typedef struct {
     int block_active;
     int enabled;
     const char* output_path;
+    int block_start_level;
+    uint32_t sample_rate;
+    int16_t* audio_samples;
+    size_t audio_sample_count;
+    size_t audio_sample_capacity;
+    TapeOutputFormat output_format;
 } TapeRecorder;
 
 static TapePlaybackState tape_playback = {0};
@@ -148,10 +163,15 @@ static void tape_start_playback(TapePlaybackState* state, uint64_t start_time);
 static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64_t start_time);
 static void tape_update(uint64_t current_t_state);
 static int tape_current_block_pilot_count(const TapePlaybackState* state);
-static void tape_recorder_enable(const char* path);
+static void tape_recorder_enable(const char* path, TapeOutputFormat format);
 static void tape_recorder_handle_mic(uint64_t t_state, int level);
 static void tape_recorder_update(uint64_t current_t_state, int force_flush);
 static int tape_recorder_write_output(void);
+static void tape_recorder_reset_audio(void);
+static size_t tape_recorder_samples_from_tstates(uint64_t duration);
+static int tape_recorder_append_audio_samples(int level, size_t sample_count);
+static void tape_recorder_append_block_audio(uint64_t idle_cycles);
+static int tape_recorder_write_wav(void);
 static void tape_shutdown(void);
 static void ula_queue_port_value(uint8_t value);
 static void ula_process_port_events(uint64_t current_t_state);
@@ -990,14 +1010,27 @@ static void tape_recorder_reset_pulses(void) {
     tape_recorder.pulse_capacity = 0;
 }
 
-static void tape_recorder_enable(const char* path) {
+static void tape_recorder_reset_audio(void) {
+    if (tape_recorder.audio_samples) {
+        free(tape_recorder.audio_samples);
+        tape_recorder.audio_samples = NULL;
+    }
+    tape_recorder.audio_sample_count = 0;
+    tape_recorder.audio_sample_capacity = 0;
+}
+
+static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
     tape_recorder.output_path = path;
     tape_recorder.enabled = path ? 1 : 0;
+    tape_recorder.output_format = format;
     tape_recorder.block_active = 0;
     tape_recorder.last_transition_tstate = 0;
     tape_recorder.last_level = -1;
+    tape_recorder.block_start_level = 0;
+    tape_recorder.sample_rate = (audio_sample_rate > 0) ? (uint32_t)audio_sample_rate : 44100u;
     tape_recorder_reset_pulses();
     tape_free_image(&tape_recorder.recorded);
+    tape_recorder_reset_audio();
 }
 
 static int tape_recorder_append_pulse(uint64_t duration) {
@@ -1018,6 +1051,159 @@ static int tape_recorder_append_pulse(uint64_t duration) {
     }
     tape_recorder.pulses[tape_recorder.pulse_count].duration = (uint32_t)duration;
     tape_recorder.pulse_count++;
+    return 1;
+}
+
+static size_t tape_recorder_samples_from_tstates(uint64_t duration) {
+    if (duration == 0 || tape_recorder.sample_rate == 0) {
+        return 0;
+    }
+    double seconds = (double)duration / CPU_CLOCK_HZ;
+    double samples = seconds * (double)tape_recorder.sample_rate;
+    size_t count = (size_t)(samples + 0.5);
+    if (count == 0 && duration > 0) {
+        count = 1;
+    }
+    return count;
+}
+
+static int tape_recorder_append_audio_samples(int level, size_t sample_count) {
+    if (sample_count == 0) {
+        return 1;
+    }
+    if (tape_recorder.audio_sample_count > SIZE_MAX - sample_count) {
+        return 0;
+    }
+    size_t required = tape_recorder.audio_sample_count + sample_count;
+    if (required > tape_recorder.audio_sample_capacity) {
+        size_t new_capacity = tape_recorder.audio_sample_capacity ? tape_recorder.audio_sample_capacity : 4096;
+        while (new_capacity < required) {
+            new_capacity *= 2;
+        }
+        int16_t* new_samples = (int16_t*)realloc(tape_recorder.audio_samples, new_capacity * sizeof(int16_t));
+        if (!new_samples) {
+            return 0;
+        }
+        tape_recorder.audio_samples = new_samples;
+        tape_recorder.audio_sample_capacity = new_capacity;
+    }
+
+    int16_t value = level ? TAPE_WAV_AMPLITUDE : (int16_t)(-TAPE_WAV_AMPLITUDE);
+    int16_t* dest = tape_recorder.audio_samples + tape_recorder.audio_sample_count;
+    for (size_t i = 0; i < sample_count; ++i) {
+        dest[i] = value;
+    }
+    tape_recorder.audio_sample_count += sample_count;
+    return 1;
+}
+
+static void tape_recorder_append_block_audio(uint64_t idle_cycles) {
+    if (tape_recorder.output_format != TAPE_OUTPUT_WAV) {
+        return;
+    }
+
+    if (tape_recorder.pulse_count == 0) {
+        if (idle_cycles > 0 && tape_recorder.last_level >= 0) {
+            size_t idle_samples = tape_recorder_samples_from_tstates(idle_cycles);
+            if (!tape_recorder_append_audio_samples(tape_recorder.last_level ? 1 : 0, idle_samples)) {
+                fprintf(stderr, "Warning: failed to store recorded tape audio\n");
+            }
+        }
+        return;
+    }
+
+    int level = tape_recorder.block_start_level ? 1 : 0;
+    for (size_t i = 0; i < tape_recorder.pulse_count; ++i) {
+        uint32_t duration = tape_recorder.pulses[i].duration;
+        size_t samples = tape_recorder_samples_from_tstates(duration);
+        if (!tape_recorder_append_audio_samples(level, samples)) {
+            fprintf(stderr, "Warning: failed to store recorded tape audio\n");
+            return;
+        }
+        level = level ? 0 : 1;
+    }
+
+    if (idle_cycles > 0 && tape_recorder.last_level >= 0) {
+        size_t idle_samples = tape_recorder_samples_from_tstates(idle_cycles);
+        if (!tape_recorder_append_audio_samples(tape_recorder.last_level ? 1 : 0, idle_samples)) {
+            fprintf(stderr, "Warning: failed to store recorded tape audio\n");
+        }
+    }
+}
+
+static int tape_recorder_write_wav(void) {
+    if (!tape_recorder.output_path) {
+        return 1;
+    }
+
+    uint32_t sample_rate = tape_recorder.sample_rate ? tape_recorder.sample_rate : 44100u;
+    size_t sample_count = tape_recorder.audio_sample_count;
+    uint64_t data_bytes_64 = sample_count * sizeof(int16_t);
+    if (data_bytes_64 > UINT32_MAX) {
+        fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
+        return 0;
+    }
+    uint32_t data_bytes = (uint32_t)data_bytes_64;
+    uint32_t chunk_size = 36u + data_bytes;
+    if (chunk_size < data_bytes) {
+        fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
+        return 0;
+    }
+
+    FILE* tf = fopen(tape_recorder.output_path, "wb");
+    if (!tf) {
+        fprintf(stderr, "Failed to open tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t header[44];
+    memset(header, 0, sizeof(header));
+    memcpy(header + 0, "RIFF", 4);
+    header[4] = (uint8_t)(chunk_size & 0xFFu);
+    header[5] = (uint8_t)((chunk_size >> 8) & 0xFFu);
+    header[6] = (uint8_t)((chunk_size >> 16) & 0xFFu);
+    header[7] = (uint8_t)((chunk_size >> 24) & 0xFFu);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
+    header[16] = 16;
+    header[20] = 1;
+    header[22] = 1;
+    header[24] = (uint8_t)(sample_rate & 0xFFu);
+    header[25] = (uint8_t)((sample_rate >> 8) & 0xFFu);
+    header[26] = (uint8_t)((sample_rate >> 16) & 0xFFu);
+    header[27] = (uint8_t)((sample_rate >> 24) & 0xFFu);
+    uint32_t byte_rate = sample_rate * 2u;
+    header[28] = (uint8_t)(byte_rate & 0xFFu);
+    header[29] = (uint8_t)((byte_rate >> 8) & 0xFFu);
+    header[30] = (uint8_t)((byte_rate >> 16) & 0xFFu);
+    header[31] = (uint8_t)((byte_rate >> 24) & 0xFFu);
+    header[32] = 2;
+    header[34] = 16;
+    memcpy(header + 36, "data", 4);
+    header[40] = (uint8_t)(data_bytes & 0xFFu);
+    header[41] = (uint8_t)((data_bytes >> 8) & 0xFFu);
+    header[42] = (uint8_t)((data_bytes >> 16) & 0xFFu);
+    header[43] = (uint8_t)((data_bytes >> 24) & 0xFFu);
+
+    if (fwrite(header, sizeof(header), 1, tf) != 1) {
+        fprintf(stderr, "Failed to write WAV header\n");
+        fclose(tf);
+        return 0;
+    }
+
+    if (sample_count > 0) {
+        if (fwrite(tape_recorder.audio_samples, sizeof(int16_t), sample_count, tf) != sample_count) {
+            fprintf(stderr, "Failed to write WAV data\n");
+            fclose(tf);
+            return 0;
+        }
+    }
+
+    if (fclose(tf) != 0) {
+        fprintf(stderr, "Failed to finalize tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
+        return 0;
+    }
+
     return 1;
 }
 
@@ -1219,7 +1405,7 @@ static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flu
     }
 
     size_t pulse_count = tape_recorder.pulse_count;
-    if (pulse_count >= 100) {
+    if (tape_recorder.output_format == TAPE_OUTPUT_TAP && pulse_count >= 100) {
         TapeBlock block = {0};
         if (!tape_decode_pulses_to_block(tape_recorder.pulses, pulse_count, pause_ms, &block)) {
             fprintf(stderr, "Warning: failed to decode saved tape block (%zu pulses)\n", pulse_count);
@@ -1230,6 +1416,8 @@ static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flu
             free(block.data);
         }
     }
+
+    tape_recorder_append_block_audio(idle_cycles);
 
     tape_recorder.block_active = 0;
     tape_recorder.pulse_count = 0;
@@ -1245,6 +1433,7 @@ static void tape_recorder_handle_mic(uint64_t t_state, int level) {
         tape_recorder.block_active = 1;
         tape_recorder.last_transition_tstate = t_state;
         tape_recorder.last_level = level;
+        tape_recorder.block_start_level = level ? 1 : 0;
         return;
     }
 
@@ -1273,6 +1462,10 @@ static void tape_recorder_update(uint64_t current_t_state, int force_flush) {
 static int tape_recorder_write_output(void) {
     if (!tape_recorder.enabled || !tape_recorder.output_path) {
         return 1;
+    }
+
+    if (tape_recorder.output_format == TAPE_OUTPUT_WAV) {
+        return tape_recorder_write_wav();
     }
 
     FILE* tf = fopen(tape_recorder.output_path, "wb");
@@ -1319,6 +1512,7 @@ static void tape_shutdown(void) {
     tape_free_image(&tape_playback.image);
     tape_free_image(&tape_recorder.recorded);
     tape_recorder_reset_pulses();
+    tape_recorder_reset_audio();
 }
 
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
@@ -2162,7 +2356,7 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file>] [rom_file]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
                 return 1;
             }
             audio_dump_path = argv[++i];
@@ -2170,7 +2364,7 @@ int main(int argc, char *argv[]) {
             beeper_logging_enabled = 1;
         } else if (strcmp(argv[i], "--tap") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file>] [rom_file]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
                 return 1;
             }
             if (tape_input_format != TAPE_FORMAT_NONE) {
@@ -2181,7 +2375,7 @@ int main(int argc, char *argv[]) {
             tape_input_path = argv[++i];
         } else if (strcmp(argv[i], "--tzx") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file>] [rom_file]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
                 return 1;
             }
             if (tape_input_format != TAPE_FORMAT_NONE) {
@@ -2192,16 +2386,30 @@ int main(int argc, char *argv[]) {
             tape_input_path = argv[++i];
         } else if (strcmp(argv[i], "--save-tap") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file>] [rom_file]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
                 return 1;
             }
-            tape_recorder_enable(argv[++i]);
+            if (tape_recorder.enabled) {
+                fprintf(stderr, "Only one tape recording output may be specified\n");
+                return 1;
+            }
+            tape_recorder_enable(argv[++i], TAPE_OUTPUT_TAP);
+        } else if (strcmp(argv[i], "--save-wav") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
+            if (tape_recorder.enabled) {
+                fprintf(stderr, "Only one tape recording output may be specified\n");
+                return 1;
+            }
+            tape_recorder_enable(argv[++i], TAPE_OUTPUT_WAV);
         } else if (!rom_filename) {
             rom_filename = argv[i];
             rom_provided = 1;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file>] [rom_file]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
             return 1;
         }
     }
