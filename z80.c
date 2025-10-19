@@ -123,10 +123,13 @@ static int tape_input_enabled = 0;
 
 typedef struct {
     uint8_t value;
+    uint64_t t_state;
 } UlaWriteEvent;
 
 static UlaWriteEvent ula_write_queue[64];
 static size_t ula_write_count = 0;
+static uint64_t ula_instruction_base_tstate = 0;
+static int* ula_instruction_progress_ptr = NULL;
 
 typedef enum {
     TAPE_FORMAT_NONE,
@@ -1674,11 +1677,14 @@ int cpu_interrupt(Z80* cpu, uint16_t vector_addr) {
 
 // --- The Main CPU Execution Step ---
 int cpu_step(Z80* cpu) { // Returns T-states
+    ula_instruction_progress_ptr = NULL;
     if (cpu->ei_delay) { cpu->iff1 = cpu->iff2 = 1; cpu->ei_delay = 0; }
     if (cpu->halted) { cpu->reg_R = (cpu->reg_R+1)|(cpu->reg_R&0x80); return 4; }
 
     int prefix=0;
     int t_states = 0;
+    ula_instruction_base_tstate = total_t_states;
+    ula_instruction_progress_ptr = &t_states;
     cpu->reg_R=(cpu->reg_R+1)|(cpu->reg_R&0x80);
     uint8_t opcode=readByte(cpu->reg_PC++);
     t_states += 4;
@@ -1867,6 +1873,7 @@ int cpu_step(Z80* cpu) { // Returns T-states
         case 0x76: cpu->halted=1; break;
         default: if(prefix)cpu->reg_PC--; printf("Error: Unknown opcode: 0x%s%02X at address 0x%04X\n",(prefix==1?"DD":(prefix==2?"FD":"")),opcode,cpu->reg_PC-1); exit(1);
     }
+    ula_instruction_progress_ptr = NULL;
     return t_states;
 }
 
@@ -2347,12 +2354,26 @@ int main(int argc, char *argv[]) {
     cleanup_sdl(); return 0;
 }
 static void ula_queue_port_value(uint8_t value) {
+    uint64_t event_t_state = total_t_states;
+    if (ula_instruction_progress_ptr) {
+        event_t_state = ula_instruction_base_tstate + (uint64_t)(*ula_instruction_progress_ptr);
+    }
+
+    if (ula_write_count > 0) {
+        uint64_t previous_t_state = ula_write_queue[ula_write_count - 1].t_state;
+        if (event_t_state < previous_t_state) {
+            event_t_state = previous_t_state;
+        }
+    }
+
     if (ula_write_count < (sizeof(ula_write_queue) / sizeof(ula_write_queue[0]))) {
         ula_write_queue[ula_write_count].value = value;
+        ula_write_queue[ula_write_count].t_state = event_t_state;
         ula_write_count++;
     } else {
         memmove(&ula_write_queue[0], &ula_write_queue[1], (ula_write_count - 1) * sizeof(UlaWriteEvent));
         ula_write_queue[ula_write_count - 1].value = value;
+        ula_write_queue[ula_write_count - 1].t_state = event_t_state;
     }
 }
 
@@ -2361,18 +2382,21 @@ static void ula_process_port_events(uint64_t current_t_state) {
         return;
     }
 
+    (void)current_t_state;
+
     for (size_t i = 0; i < ula_write_count; ++i) {
         uint8_t value = ula_write_queue[i].value;
+        uint64_t event_t_state = ula_write_queue[i].t_state;
         border_color_idx = value & 0x07;
 
         int new_beeper_state = (value >> 4) & 0x01;
         if (new_beeper_state != beeper_state) {
             beeper_state = new_beeper_state;
-            beeper_push_event(current_t_state, beeper_state);
+            beeper_push_event(event_t_state, beeper_state);
         }
 
         int mic_level = (value >> 3) & 0x01;
-        tape_recorder_handle_mic(current_t_state, mic_level);
+        tape_recorder_handle_mic(event_t_state, mic_level);
     }
 
     ula_write_count = 0;
