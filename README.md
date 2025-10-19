@@ -46,14 +46,6 @@ Launch the compiled executable from the command line with a 16 KB Spectrum ROM i
 
 If no ROM is specified the bundled `48.rom` image in the project root is used automatically. The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
 
-For quicker BASIC-centric experimentation you can queue a tokenised program from a text file using `--basic`:
-
-```bash
-./spectrum --basic samples/hello.bas
-```
-
-Each line in the script must begin with a line number followed by the usual ZX Spectrum BASIC source text. The loader tokenises the listing using the ROM keyword table and injects it into the BASIC workspace once the interpreter has finished initialising. The example above loads a short program that prints `HELLO WORLD!` in a loop; additional samples can be dropped into `samples/` for convenience.
-
 For audio debugging you can mirror the generated beeper samples to a WAV file with the optional dump flag:
 
 ```bash
