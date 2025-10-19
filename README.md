@@ -54,6 +54,13 @@ For audio debugging you can mirror the generated beeper samples to a WAV file wi
 
 The WAV stream is captured directly from the audio callback, allowing offline analysis with tools such as Audacity.
 
+If you need to troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the detailed latency logs that are now
+disabled by default:
+
+```bash
+./spectrum --beeper-log path/to/48k.rom
+```
+
 ## Controls
 The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary host-to-Spectrum key mapping is:
 
