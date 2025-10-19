@@ -1174,38 +1174,42 @@ static int tape_recorder_write_output(void) {
         return 1;
     }
 
-    if (tape_recorder.recorded.count == 0) {
-        return 1;
-    }
-
     FILE* tf = fopen(tape_recorder.output_path, "wb");
     if (!tf) {
         fprintf(stderr, "Failed to open tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
         return 0;
     }
 
-    for (size_t i = 0; i < tape_recorder.recorded.count; ++i) {
-        const TapeBlock* block = &tape_recorder.recorded.blocks[i];
-        uint16_t length = (uint16_t)block->length;
-        uint8_t length_bytes[2];
-        length_bytes[0] = (uint8_t)(length & 0xFFu);
-        length_bytes[1] = (uint8_t)((length >> 8) & 0xFFu);
-        if (fwrite(length_bytes, sizeof(length_bytes), 1, tf) != 1) {
-            fclose(tf);
-            fprintf(stderr, "Failed to write TAP block length\n");
-            return 0;
-        }
-        if (length > 0 && block->data) {
-            if (fwrite(block->data, length, 1, tf) != 1) {
-                fclose(tf);
-                fprintf(stderr, "Failed to write TAP block payload\n");
-                return 0;
+    int success = 1;
+
+    if (tape_recorder.recorded.count > 0) {
+        for (size_t i = 0; i < tape_recorder.recorded.count && success; ++i) {
+            const TapeBlock* block = &tape_recorder.recorded.blocks[i];
+            uint16_t length = (uint16_t)block->length;
+            uint8_t length_bytes[2];
+            length_bytes[0] = (uint8_t)(length & 0xFFu);
+            length_bytes[1] = (uint8_t)((length >> 8) & 0xFFu);
+            if (fwrite(length_bytes, sizeof(length_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Failed to write TAP block length\n");
+                success = 0;
+                break;
+            }
+            if (length > 0 && block->data) {
+                if (fwrite(block->data, length, 1, tf) != 1) {
+                    fprintf(stderr, "Failed to write TAP block payload\n");
+                    success = 0;
+                    break;
+                }
             }
         }
     }
 
-    fclose(tf);
-    return 1;
+    if (fclose(tf) != 0) {
+        fprintf(stderr, "Failed to finalize tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
+        success = 0;
+    }
+
+    return success;
 }
 
 static void tape_shutdown(void) {
