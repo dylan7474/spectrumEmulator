@@ -163,7 +163,7 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
     beeper_playback_level = current_level ? 1 : 0;
     double baseline = (current_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
     beeper_hp_last_input = baseline;
-    beeper_hp_last_output = baseline;
+    beeper_hp_last_output = 0.0;
     beeper_state = current_level ? 1 : 0;
 }
 
@@ -1057,7 +1057,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
                 double baseline = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
                 last_input = baseline;
-                last_output = baseline;
+                last_output = 0.0;
 
                 audio_dump_write_samples(buffer, (size_t)num_samples);
 
