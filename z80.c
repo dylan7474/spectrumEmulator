@@ -40,7 +40,7 @@ const int AUDIO_AMPLITUDE = 2000;
 int audio_sample_rate = 44100;
 int audio_available = 0;
 
-static const double BEEPER_MAX_LATENCY_SAMPLES = 256.0;
+static double beeper_max_latency_samples = 256.0;
 static const double BEEPER_HP_ALPHA = 0.995;
 
 #define BEEPER_EVENT_CAPACITY 8192
@@ -115,6 +115,7 @@ int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr
 int cpu_interrupt(Z80* cpu, uint16_t vector_addr);
 void audio_callback(void* userdata, Uint8* stream, int len);
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
+static void beeper_set_latency_limit(double sample_limit);
 static void beeper_push_event(uint64_t t_state, int level);
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
 
@@ -144,6 +145,13 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
     beeper_hp_last_input = baseline;
     beeper_hp_last_output = baseline;
     beeper_state = current_level ? 1 : 0;
+}
+
+static void beeper_set_latency_limit(double sample_limit) {
+    if (sample_limit < 64.0) {
+        sample_limit = 64.0;
+    }
+    beeper_max_latency_samples = sample_limit;
 }
 
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
@@ -219,7 +227,7 @@ static void beeper_push_event(uint64_t t_state, int level) {
     if (beeper_cycles_per_sample > 0.0) {
         double playback_position_snapshot = beeper_playback_position;
         double latency_cycles = (double)t_state - playback_position_snapshot;
-        double max_latency_cycles = beeper_cycles_per_sample * BEEPER_MAX_LATENCY_SAMPLES;
+        double max_latency_cycles = beeper_cycles_per_sample * beeper_max_latency_samples;
 
         if (latency_cycles > max_latency_cycles) {
             double catch_up_position = (double)t_state - max_latency_cycles;
@@ -622,20 +630,31 @@ int init_sdl(void) {
     wanted_spec.freq = 44100;
     wanted_spec.format = AUDIO_S16SYS;
     wanted_spec.channels = 1;
-    wanted_spec.samples = 1024;
+    wanted_spec.samples = 512;
     wanted_spec.callback = audio_callback;
     wanted_spec.userdata = NULL;
 
     if (SDL_OpenAudio(&wanted_spec, &have_spec) < 0) {
         fprintf(stderr, "Failed to open audio: %s\n", SDL_GetError());
+        beeper_set_latency_limit(256.0);
     } else {
         if (have_spec.format != AUDIO_S16SYS || have_spec.channels != 1) {
             fprintf(stderr, "Unexpected audio format (format=%d, channels=%d). Audio disabled.\n", have_spec.format, have_spec.channels);
             SDL_CloseAudio();
+            beeper_set_latency_limit(256.0);
         } else {
             audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
             audio_available = 1;
             beeper_cycles_per_sample = CPU_CLOCK_HZ / (double)audio_sample_rate;
+            double latency_limit = have_spec.samples > 0 ? (double)have_spec.samples : (double)wanted_spec.samples;
+            if (latency_limit < 256.0) {
+                latency_limit = 256.0;
+            }
+            beeper_set_latency_limit(latency_limit);
+            fprintf(stderr,
+                    "[BEEPER] latency clamp set to %.0f samples (audio buffer %u)\n",
+                    beeper_max_latency_samples,
+                    have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples);
             beeper_reset_audio_state(total_t_states, beeper_state);
             SDL_PauseAudio(0); // Start playing sound
         }
@@ -648,6 +667,7 @@ void cleanup_sdl(void) {
     if (audio_available) {
         SDL_CloseAudio();
         audio_available = 0;
+        beeper_set_latency_limit(256.0);
     }
     if (texture) {
         SDL_DestroyTexture(texture);
