@@ -1048,13 +1048,22 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
             double idle_samples = idle_cycles / cycles_per_sample;
             if (idle_samples >= BEEPER_IDLE_RESET_SAMPLES) {
                 memset(buffer, 0, (size_t)len);
-                playback_position += cycles_per_sample * (double)num_samples;
+
+                double new_position = playback_position + cycles_per_sample * (double)num_samples;
+                uint64_t new_t_state = (uint64_t)llround(new_position);
+                if (new_t_state < beeper_last_event_t_state) {
+                    new_t_state = beeper_last_event_t_state;
+                }
+
                 double baseline = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
                 last_input = baseline;
-                last_output = 0.0;
+                last_output = baseline;
+
                 audio_dump_write_samples(buffer, (size_t)num_samples);
+
+                beeper_last_event_t_state = new_t_state;
                 beeper_playback_level = level;
-                beeper_playback_position = playback_position;
+                beeper_playback_position = new_position;
                 beeper_hp_last_input = last_input;
                 beeper_hp_last_output = last_output;
                 (void)userdata;
