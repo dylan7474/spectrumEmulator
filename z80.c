@@ -66,6 +66,7 @@ static size_t beeper_event_tail = 0;
 static uint64_t beeper_last_event_t_state = 0;
 static double beeper_cycles_per_sample = 0.0;
 static double beeper_playback_position = 0.0;
+static double beeper_writer_cursor = 0.0;
 static double beeper_hp_last_input = 0.0;
 static double beeper_hp_last_output = 0.0;
 static int beeper_playback_level = 0;
@@ -162,6 +163,7 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
     beeper_event_tail = 0;
     beeper_last_event_t_state = current_t_state;
     beeper_playback_position = (double)current_t_state;
+    beeper_writer_cursor = (double)current_t_state;
     beeper_playback_level = current_level ? 1 : 0;
     double baseline = (current_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
     beeper_hp_last_input = baseline;
@@ -225,15 +227,15 @@ static double beeper_current_latency_samples(void) {
         return 0.0;
     }
 
-    uint64_t writer_cycles;
+    double writer_cursor;
     double playback_position;
 
     SDL_LockAudio();
-    writer_cycles = beeper_last_event_t_state;
+    writer_cursor = beeper_writer_cursor;
     playback_position = beeper_playback_position;
     SDL_UnlockAudio();
 
-    double latency_cycles = (double)writer_cycles - playback_position;
+    double latency_cycles = writer_cursor - playback_position;
     if (latency_cycles <= 0.0) {
         if (beeper_latency_warning_active) {
             beeper_latency_warning_active = 0;
@@ -465,6 +467,9 @@ static size_t beeper_catch_up_to(double catch_up_position, double playback_posit
     beeper_playback_level = level;
     beeper_hp_last_input = last_input;
     beeper_hp_last_output = last_output;
+    if (beeper_writer_cursor < playback_position) {
+        beeper_writer_cursor = playback_position;
+    }
 
     return consumed;
 }
@@ -584,6 +589,11 @@ static void beeper_push_event(uint64_t t_state, int level) {
         t_state = clamped_t_state;
     } else {
         beeper_last_event_t_state = t_state;
+    }
+
+    double event_cursor = (double)t_state;
+    if (event_cursor > beeper_writer_cursor) {
+        beeper_writer_cursor = event_cursor;
     }
 
     if (was_idle) {
@@ -1083,22 +1093,23 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
                 memset(buffer, 0, (size_t)len);
 
                 double new_position = playback_position + cycles_per_sample * (double)num_samples;
-                uint64_t writer_t_state = beeper_last_event_t_state;
+                double writer_cursor = beeper_writer_cursor;
                 double writer_lag_samples = 0.0;
                 if (cycles_per_sample > 0.0) {
-                    writer_lag_samples = (new_position - (double)writer_t_state) / cycles_per_sample;
+                    writer_lag_samples = (new_position - writer_cursor) / cycles_per_sample;
                 }
 
                 if (!beeper_idle_log_active) {
                     double idle_ms = (idle_cycles / CPU_CLOCK_HZ) * 1000.0;
                     fprintf(stderr,
-                            "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, lag %.2f samples)\n",
+                            "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, cursor %.0f, lag %.2f samples)\n",
                             (unsigned long long)(beeper_idle_reset_count + 1u),
                             idle_samples,
                             idle_ms,
                             playback_position,
                             new_position,
-                            (unsigned long long)writer_t_state,
+                            (unsigned long long)beeper_last_event_t_state,
+                            writer_cursor,
                             writer_lag_samples);
                     beeper_idle_log_active = 1;
                     ++beeper_idle_reset_count;
@@ -1112,6 +1123,9 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
                 beeper_playback_level = level;
                 beeper_playback_position = new_position;
+                if (beeper_writer_cursor < new_position) {
+                    beeper_writer_cursor = new_position;
+                }
                 beeper_hp_last_input = last_input;
                 beeper_hp_last_output = last_output;
                 (void)userdata;
@@ -1149,6 +1163,9 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
     beeper_playback_level = level;
     beeper_playback_position = playback_position;
+    if (beeper_writer_cursor < playback_position) {
+        beeper_writer_cursor = playback_position;
+    }
     beeper_hp_last_input = last_input;
     beeper_hp_last_output = last_output;
 
