@@ -694,7 +694,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
         double target_position = playback_position + cycles_per_sample;
 
         while (beeper_event_head != beeper_event_tail &&
-               beeper_events[beeper_event_head].t_state <= (uint64_t)target_position) {
+               (double)beeper_events[beeper_event_head].t_state <= target_position) {
             level = beeper_events[beeper_event_head].level ? 1 : 0;
             playback_position = (double)beeper_events[beeper_event_head].t_state;
             beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
