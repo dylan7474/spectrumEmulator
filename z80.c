@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 #include <SDL.h>
 
 // --- Z80 Flag Register Bits ---
@@ -89,6 +90,10 @@ const uint32_t spectrum_bright_colors[8] = {0x000000FF,0x0000FFFF,0xFF0000FF,0xF
 // --- Keyboard State ---
 uint8_t keyboard_matrix[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+// --- ROM Handling ---
+static const char *default_rom_filename = "48.rom";
+
+static char *build_executable_relative_path(const char *executable_path, const char *filename);
 // --- Z80 CPU State ---
 typedef struct Z80 {
     // 8-bit Main Registers
@@ -144,6 +149,35 @@ static int audio_dump_start(const char* path, uint32_t sample_rate);
 static void audio_dump_write_samples(const Sint16* samples, size_t count);
 static void audio_dump_finish(void);
 static void audio_dump_abort(void);
+
+
+// --- ROM Utilities ---
+static char *build_executable_relative_path(const char *executable_path, const char *filename) {
+    if (!executable_path || !filename) {
+        return NULL;
+    }
+
+    const char *last_sep = strrchr(executable_path, '/');
+#ifdef _WIN32
+    const char *last_backslash = strrchr(executable_path, '\\');
+    if (!last_sep || (last_backslash && last_backslash > last_sep)) {
+        last_sep = last_backslash;
+    }
+#endif
+    if (!last_sep) {
+        return NULL;
+    }
+
+    size_t dir_len = (size_t)(last_sep - executable_path + 1);
+    size_t name_len = strlen(filename);
+    char *joined = (char *)malloc(dir_len + name_len + 1);
+    if (!joined) {
+        return NULL;
+    }
+    memcpy(joined, executable_path, dir_len);
+    memcpy(joined + dir_len, filename, name_len + 1);
+    return joined;
+}
 
 
 // --- Memory Access Helpers ---
@@ -1221,42 +1255,58 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 // --- Main Program ---
 int main(int argc, char *argv[]) {
     const char* rom_filename = NULL;
+    int rom_provided = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [rom_file]\n", argv[0]);
                 return 1;
             }
             audio_dump_path = argv[++i];
         } else if (!rom_filename) {
             rom_filename = argv[i];
+            rom_provided = 1;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [rom_file]\n", argv[0]);
             return 1;
         }
     }
 
     if (!rom_filename) {
-        fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
-        return 1;
+        rom_filename = default_rom_filename;
     }
 
     FILE* rf = fopen(rom_filename, "rb");
+    char *rom_fallback_path = NULL;
+    const char *rom_log_path = rom_filename;
+    if (!rf && !rom_provided) {
+        rom_fallback_path = build_executable_relative_path(argv[0], rom_filename);
+        if (rom_fallback_path) {
+            rf = fopen(rom_fallback_path, "rb");
+            if (rf) {
+                rom_log_path = rom_fallback_path;
+            }
+        }
+    }
     if (!rf) {
         perror("ROM open error");
-        fprintf(stderr, "File: %s\n", rom_filename);
+        fprintf(stderr, "File: %s\n", rom_log_path);
+        free(rom_fallback_path);
         return 1;
     }
     size_t br = fread(memory, 1, 0x4000, rf);
     if (br != 0x4000) {
         fprintf(stderr, "ROM read error(%zu)\n", br);
         fclose(rf);
+        free(rom_fallback_path);
         return 1;
     }
     fclose(rf);
-    printf("Loaded %zu bytes from %s\n", br, rom_filename);
+    printf("Loaded %zu bytes from %s\n", br, rom_log_path);
+    free(rom_fallback_path);
+
     if(!init_sdl()){cleanup_sdl();return 1;}
 
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;

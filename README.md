@@ -44,7 +44,7 @@ Launch the compiled executable from the command line with a 16 KB Spectrum ROM i
 ./spectrum path/to/48k.rom
 ```
 
-The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
+If no ROM is specified the bundled `48.rom` image in the project root is used automatically. The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
 
 For audio debugging you can mirror the generated beeper samples to a WAV file with the optional dump flag:
 
