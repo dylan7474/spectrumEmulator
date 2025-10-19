@@ -41,6 +41,8 @@ const int AUDIO_AMPLITUDE = 2000;
 int audio_sample_rate = 44100;
 int audio_available = 0;
 
+static const double BEEPER_MAX_LATENCY_SAMPLES = 256.0;
+
 #define BEEPER_EVENT_CAPACITY 8192
 
 typedef struct {
@@ -112,7 +114,7 @@ int cpu_step(Z80* cpu); int init_sdl(void); void cleanup_sdl(void); void render_
 int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr);
 int cpu_interrupt(Z80* cpu, uint16_t vector_addr);
 void audio_callback(void* userdata, Uint8* stream, int len);
-static void beeper_reset_audio_state(void);
+static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
 static void beeper_push_event(uint64_t t_state, int level);
 
 
@@ -131,19 +133,48 @@ void writeWord(uint16_t addr, uint16_t val) { uint8_t lo=val&0xFF; uint8_t hi=(v
 // --- I/O Port Access Helpers ---
 uint8_t border_color_idx = 0;
 
-static void beeper_reset_audio_state(void) {
+static void beeper_reset_audio_state(uint64_t current_t_state, int current_level) {
     beeper_event_head = 0;
     beeper_event_tail = 0;
-    beeper_last_event_t_state = 0;
-    beeper_playback_position = 0.0;
-    beeper_playback_level = 0;
-    double baseline = -(double)AUDIO_AMPLITUDE;
+    beeper_last_event_t_state = current_t_state;
+    beeper_playback_position = (double)current_t_state;
+    beeper_playback_level = current_level ? 1 : 0;
+    double baseline = (current_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
     beeper_hp_last_input = baseline;
     beeper_hp_last_output = baseline;
-    beeper_state = 0;
+    beeper_state = current_level ? 1 : 0;
 }
 
 static void beeper_push_event(uint64_t t_state, int level) {
+    if (beeper_cycles_per_sample > 0.0) {
+        double playback_position_snapshot = beeper_playback_position;
+        double latency_cycles = (double)t_state - playback_position_snapshot;
+        double max_latency_cycles = beeper_cycles_per_sample * BEEPER_MAX_LATENCY_SAMPLES;
+
+        if (latency_cycles > max_latency_cycles) {
+            double catch_up_position = (double)t_state - max_latency_cycles;
+            if (catch_up_position < 0.0) {
+                catch_up_position = 0.0;
+            }
+
+            uint64_t catch_up_cycles = (uint64_t)catch_up_position;
+            while (beeper_event_head != beeper_event_tail &&
+                   beeper_events[beeper_event_head].t_state <= catch_up_cycles) {
+                beeper_playback_level = beeper_events[beeper_event_head].level ? 1 : 0;
+                beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
+            }
+
+            beeper_playback_position = catch_up_position;
+            if (catch_up_cycles > beeper_last_event_t_state) {
+                beeper_last_event_t_state = catch_up_cycles;
+            }
+
+            double current_raw_sample = (beeper_playback_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+            beeper_hp_last_input = current_raw_sample;
+            beeper_hp_last_output = current_raw_sample;
+        }
+    }
+
     if (t_state < beeper_last_event_t_state) {
         t_state = beeper_last_event_t_state;
     } else {
@@ -535,7 +566,7 @@ int init_sdl(void) {
             audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
             audio_available = 1;
             beeper_cycles_per_sample = CPU_CLOCK_HZ / (double)audio_sample_rate;
-            beeper_reset_audio_state();
+            beeper_reset_audio_state(total_t_states, beeper_state);
             SDL_PauseAudio(0); // Start playing sound
         }
     }
@@ -654,10 +685,10 @@ int main(int argc, char *argv[]) {
 
     if (audio_available) {
         SDL_LockAudio();
-        beeper_reset_audio_state();
+        beeper_reset_audio_state(total_t_states, beeper_state);
         SDL_UnlockAudio();
     } else {
-        beeper_reset_audio_state();
+        beeper_reset_audio_state(total_t_states, beeper_state);
     }
 
     printf("Starting Z80 emulation...\n");
