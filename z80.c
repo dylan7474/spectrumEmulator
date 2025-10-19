@@ -23,6 +23,7 @@ uint8_t memory[0x10000]; // 65536 bytes
 #define BORDER_SIZE 48
 #define TOTAL_WIDTH (SCREEN_WIDTH + BORDER_SIZE * 2)
 #define TOTAL_HEIGHT (SCREEN_HEIGHT + BORDER_SIZE * 2)
+#define DISPLAY_SCALE 3
 #define VRAM_START 0x4000
 #define ATTR_START 0x5800
 #define T_STATES_PER_FRAME 69888 // 3.5MHz / 50Hz (Spectrum CPU speed)
@@ -1004,7 +1005,7 @@ int init_sdl(void) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL could not initialize! SDL_Error: %s\n", SDL_GetError()); return 0;
     }
-    window = SDL_CreateWindow("ZX Spectrum Emulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, TOTAL_WIDTH*2, TOTAL_HEIGHT*2, SDL_WINDOW_SHOWN);
+    window = SDL_CreateWindow("ZX Spectrum Emulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, TOTAL_WIDTH * DISPLAY_SCALE, TOTAL_HEIGHT * DISPLAY_SCALE, SDL_WINDOW_SHOWN);
     if (!window) { fprintf(stderr, "Window Error: %s\n", SDL_GetError()); return 0; }
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) { fprintf(stderr, "Renderer Error: %s\n", SDL_GetError()); return 0; }
