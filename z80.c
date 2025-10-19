@@ -121,6 +121,13 @@ static TapeRecorder tape_recorder = {0};
 static int tape_ear_state = 1;
 static int tape_input_enabled = 0;
 
+typedef struct {
+    uint8_t value;
+} UlaWriteEvent;
+
+static UlaWriteEvent ula_write_queue[64];
+static size_t ula_write_count = 0;
+
 typedef enum {
     TAPE_FORMAT_NONE,
     TAPE_FORMAT_TAP,
@@ -143,6 +150,8 @@ static void tape_recorder_handle_mic(uint64_t t_state, int level);
 static void tape_recorder_update(uint64_t current_t_state, int force_flush);
 static int tape_recorder_write_output(void);
 static void tape_shutdown(void);
+static void ula_queue_port_value(uint8_t value);
+static void ula_process_port_events(uint64_t current_t_state);
 
 static FILE* audio_dump_file = NULL;
 static uint32_t audio_dump_data_bytes = 0;
@@ -1500,21 +1509,10 @@ static void beeper_push_event(uint64_t t_state, int level) {
 
 void io_write(uint16_t port, uint8_t value) {
     if ((port & 1) == 0) { // ULA Port FE
-        border_color_idx = value & 0x07;
-
-        int new_beeper_state = (value >> 4) & 0x01;
-
-        if (new_beeper_state != beeper_state) {
-            beeper_state = new_beeper_state;
-            beeper_push_event(total_t_states, beeper_state);
-        }
-
-        int mic_level = (value >> 3) & 0x01;
-        tape_recorder_handle_mic(total_t_states, mic_level);
-        tape_update(total_t_states);
-        tape_recorder_update(total_t_states, 0);
+        ula_queue_port_value(value);
     }
-    (void)port; (void)value;
+    (void)port;
+    (void)value;
 }
 uint8_t io_read(uint16_t port) {
     if ((port & 1) == 0) {
@@ -2309,6 +2307,7 @@ int main(int argc, char *argv[]) {
             frame_t_state_accumulator += t_states;
             total_t_states += t_states;
 
+            ula_process_port_events(total_t_states);
             tape_update(total_t_states);
             tape_recorder_update(total_t_states, 0);
 
@@ -2347,3 +2346,35 @@ int main(int argc, char *argv[]) {
     tape_shutdown();
     cleanup_sdl(); return 0;
 }
+static void ula_queue_port_value(uint8_t value) {
+    if (ula_write_count < (sizeof(ula_write_queue) / sizeof(ula_write_queue[0]))) {
+        ula_write_queue[ula_write_count].value = value;
+        ula_write_count++;
+    } else {
+        memmove(&ula_write_queue[0], &ula_write_queue[1], (ula_write_count - 1) * sizeof(UlaWriteEvent));
+        ula_write_queue[ula_write_count - 1].value = value;
+    }
+}
+
+static void ula_process_port_events(uint64_t current_t_state) {
+    if (ula_write_count == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < ula_write_count; ++i) {
+        uint8_t value = ula_write_queue[i].value;
+        border_color_idx = value & 0x07;
+
+        int new_beeper_state = (value >> 4) & 0x01;
+        if (new_beeper_state != beeper_state) {
+            beeper_state = new_beeper_state;
+            beeper_push_event(current_t_state, beeper_state);
+        }
+
+        int mic_level = (value >> 3) & 0x01;
+        tape_recorder_handle_mic(current_t_state, mic_level);
+    }
+
+    ula_write_count = 0;
+}
+
