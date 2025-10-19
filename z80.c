@@ -3,8 +3,8 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
-#include <SDL.h>
 #include <math.h>
+#include <SDL.h>
 
 // --- Z80 Flag Register Bits ---
 #define FLAG_C  (1 << 0) // Carry Flag
@@ -41,6 +41,17 @@ const int AUDIO_AMPLITUDE = 2000;
 int audio_sample_rate = 44100;
 int audio_available = 0;
 
+static double beeper_max_latency_samples = 256.0;
+static double beeper_latency_throttle_samples = 320.0;
+static double beeper_latency_release_samples = 256.0;
+static double beeper_latency_trim_samples = 512.0;
+static const double BEEPER_HP_ALPHA = 0.995;
+
+static const char* audio_dump_path = NULL;
+
+static FILE* audio_dump_file = NULL;
+static uint32_t audio_dump_data_bytes = 0;
+
 #define BEEPER_EVENT_CAPACITY 8192
 
 typedef struct {
@@ -57,6 +68,9 @@ static double beeper_playback_position = 0.0;
 static double beeper_hp_last_input = 0.0;
 static double beeper_hp_last_output = 0.0;
 static int beeper_playback_level = 0;
+static int beeper_latency_warning_active = 0;
+
+static size_t beeper_pending_event_count(void);
 
 // --- Timing Globals ---
 uint64_t total_t_states = 0; // A global clock for the entire CPU
@@ -112,8 +126,17 @@ int cpu_step(Z80* cpu); int init_sdl(void); void cleanup_sdl(void); void render_
 int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr);
 int cpu_interrupt(Z80* cpu, uint16_t vector_addr);
 void audio_callback(void* userdata, Uint8* stream, int len);
-static void beeper_reset_audio_state(void);
+static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
+static void beeper_set_latency_limit(double sample_limit);
 static void beeper_push_event(uint64_t t_state, int level);
+static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
+static double beeper_current_latency_samples(void);
+static double beeper_latency_threshold(void);
+static Uint32 beeper_recommended_throttle_delay(double latency_samples);
+static int audio_dump_start(const char* path, uint32_t sample_rate);
+static void audio_dump_write_samples(const Sint16* samples, size_t count);
+static void audio_dump_finish(void);
+static void audio_dump_abort(void);
 
 
 // --- Memory Access Helpers ---
@@ -131,19 +154,412 @@ void writeWord(uint16_t addr, uint16_t val) { uint8_t lo=val&0xFF; uint8_t hi=(v
 // --- I/O Port Access Helpers ---
 uint8_t border_color_idx = 0;
 
-static void beeper_reset_audio_state(void) {
+static void beeper_reset_audio_state(uint64_t current_t_state, int current_level) {
     beeper_event_head = 0;
     beeper_event_tail = 0;
-    beeper_last_event_t_state = 0;
-    beeper_playback_position = 0.0;
-    beeper_playback_level = 0;
-    double baseline = -(double)AUDIO_AMPLITUDE;
+    beeper_last_event_t_state = current_t_state;
+    beeper_playback_position = (double)current_t_state;
+    beeper_playback_level = current_level ? 1 : 0;
+    double baseline = (current_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
     beeper_hp_last_input = baseline;
     beeper_hp_last_output = baseline;
-    beeper_state = 0;
+    beeper_state = current_level ? 1 : 0;
+}
+
+static size_t beeper_pending_event_count(void) {
+    size_t head = beeper_event_head;
+    size_t tail = beeper_event_tail;
+
+    if (tail >= head) {
+        return tail - head;
+    }
+
+    return (size_t)BEEPER_EVENT_CAPACITY - head + tail;
+}
+
+static double beeper_latency_threshold(void) {
+    double threshold = beeper_latency_throttle_samples;
+    if (threshold < beeper_max_latency_samples) {
+        threshold = beeper_max_latency_samples;
+    }
+    return threshold;
+}
+
+static Uint32 beeper_recommended_throttle_delay(double latency_samples) {
+    double threshold = beeper_latency_threshold();
+    if (latency_samples <= threshold || audio_sample_rate <= 0) {
+        return 0;
+    }
+
+    double over = latency_samples - threshold;
+    double limit = beeper_max_latency_samples;
+    if (limit <= 0.0) {
+        limit = 256.0;
+    }
+
+    if (over <= limit * 0.1) {
+        return 0;
+    }
+
+    if (over <= limit * 0.5) {
+        return 1;
+    }
+
+    double estimated_ms = ceil((over * 1000.0) / (double)audio_sample_rate);
+    if (estimated_ms < 2.0) {
+        estimated_ms = 2.0;
+    } else if (estimated_ms > 8.0) {
+        estimated_ms = 8.0;
+    }
+
+    return (Uint32)estimated_ms;
+}
+
+static double beeper_current_latency_samples(void) {
+    if (!audio_available || beeper_cycles_per_sample <= 0.0) {
+        beeper_latency_warning_active = 0;
+        return 0.0;
+    }
+
+    uint64_t writer_cycles;
+    double playback_position;
+
+    SDL_LockAudio();
+    writer_cycles = beeper_last_event_t_state;
+    playback_position = beeper_playback_position;
+    SDL_UnlockAudio();
+
+    double latency_cycles = (double)writer_cycles - playback_position;
+    if (latency_cycles <= 0.0) {
+        if (beeper_latency_warning_active) {
+            beeper_latency_warning_active = 0;
+        }
+        return 0.0;
+    }
+
+    double latency_samples = latency_cycles / beeper_cycles_per_sample;
+    if (latency_samples < 0.0) {
+        latency_samples = 0.0;
+    }
+
+    double throttle_threshold = beeper_latency_threshold();
+    if (latency_samples >= throttle_threshold) {
+        if (!beeper_latency_warning_active) {
+            fprintf(stderr,
+                    "[BEEPER] latency %.2f samples exceeds throttle %.2f (clamp %.2f); throttling CPU until audio catches up\n",
+                    latency_samples,
+                    throttle_threshold,
+                    beeper_max_latency_samples);
+            beeper_latency_warning_active = 1;
+        }
+    } else {
+        double release_threshold = beeper_latency_release_samples;
+        if (release_threshold < beeper_max_latency_samples) {
+            release_threshold = beeper_max_latency_samples;
+        }
+        if (latency_samples < release_threshold && beeper_latency_warning_active) {
+            beeper_latency_warning_active = 0;
+        }
+    }
+
+    return latency_samples;
+}
+
+static void beeper_set_latency_limit(double sample_limit) {
+    if (sample_limit < 64.0) {
+        sample_limit = 64.0;
+    }
+    beeper_max_latency_samples = sample_limit;
+
+    double headroom = sample_limit * 0.5;
+    if (headroom < 128.0) {
+        headroom = 128.0;
+    } else if (headroom > 2048.0) {
+        headroom = 2048.0;
+    }
+
+    beeper_latency_throttle_samples = beeper_max_latency_samples + headroom;
+
+    double release = beeper_latency_throttle_samples - headroom * 0.5;
+    if (release < beeper_max_latency_samples) {
+        release = beeper_max_latency_samples;
+    }
+    beeper_latency_release_samples = release;
+
+    double trim_margin = headroom;
+    if (trim_margin < beeper_max_latency_samples) {
+        trim_margin = beeper_max_latency_samples;
+    }
+    beeper_latency_trim_samples = beeper_latency_throttle_samples + trim_margin;
+}
+
+static void audio_dump_write_uint16(uint8_t* dst, uint16_t value) {
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+static void audio_dump_write_uint32(uint8_t* dst, uint32_t value) {
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFu);
+    dst[2] = (uint8_t)((value >> 16) & 0xFFu);
+    dst[3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
+static int audio_dump_start(const char* path, uint32_t sample_rate) {
+    if (!path) {
+        return 0;
+    }
+
+    audio_dump_file = fopen(path, "wb");
+    if (!audio_dump_file) {
+        fprintf(stderr, "[BEEPER] failed to open audio dump '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    audio_dump_data_bytes = 0;
+
+    uint8_t header[44];
+    memset(header, 0, sizeof(header));
+
+    memcpy(header, "RIFF", 4);
+    audio_dump_write_uint32(header + 4, 36u);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
+    audio_dump_write_uint32(header + 16, 16u); // PCM chunk size
+    audio_dump_write_uint16(header + 20, 1u);  // PCM format
+    audio_dump_write_uint16(header + 22, 1u);  // mono
+    audio_dump_write_uint32(header + 24, sample_rate);
+    uint32_t byte_rate = sample_rate * 2u; // mono, 16-bit
+    audio_dump_write_uint32(header + 28, byte_rate);
+    audio_dump_write_uint16(header + 32, 2u); // block align
+    audio_dump_write_uint16(header + 34, 16u); // bits per sample
+    memcpy(header + 36, "data", 4);
+    audio_dump_write_uint32(header + 40, 0u);
+
+    if (fwrite(header, sizeof(header), 1, audio_dump_file) != 1) {
+        fprintf(stderr, "[BEEPER] failed to write WAV header to '%s'\n", path);
+        audio_dump_abort();
+        return 0;
+    }
+
+    fprintf(stderr, "[BEEPER] dumping audio to %s\n", path);
+    return 1;
+}
+
+static void audio_dump_abort(void) {
+    if (audio_dump_file) {
+        fclose(audio_dump_file);
+        audio_dump_file = NULL;
+    }
+    audio_dump_data_bytes = 0;
+}
+
+static void audio_dump_write_samples(const Sint16* samples, size_t count) {
+    if (!audio_dump_file || !samples || count == 0) {
+        return;
+    }
+
+    size_t written = fwrite(samples, sizeof(Sint16), count, audio_dump_file);
+    if (written != count) {
+        fprintf(stderr,
+                "[BEEPER] audio dump write failed after %zu samples\n",
+                (size_t)(audio_dump_data_bytes / 2u));
+        audio_dump_abort();
+        return;
+    }
+
+    audio_dump_data_bytes += (uint32_t)(written * sizeof(Sint16));
+}
+
+static void audio_dump_finish(void) {
+    if (!audio_dump_file) {
+        return;
+    }
+
+    uint32_t riff_size = 36u + audio_dump_data_bytes;
+    uint32_t data_size = audio_dump_data_bytes;
+
+    if (fseek(audio_dump_file, 4L, SEEK_SET) == 0) {
+        uint8_t size_bytes[4];
+        audio_dump_write_uint32(size_bytes, riff_size);
+        fwrite(size_bytes, sizeof(size_bytes), 1, audio_dump_file);
+    }
+
+    if (fseek(audio_dump_file, 40L, SEEK_SET) == 0) {
+        uint8_t data_bytes_buf[4];
+        audio_dump_write_uint32(data_bytes_buf, data_size);
+        fwrite(data_bytes_buf, sizeof(data_bytes_buf), 1, audio_dump_file);
+    }
+
+    fclose(audio_dump_file);
+    audio_dump_file = NULL;
+    audio_dump_data_bytes = 0;
+}
+
+static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
+    if (beeper_cycles_per_sample <= 0.0) {
+        return 0;
+    }
+
+    double playback_position = playback_position_snapshot;
+    if (catch_up_position <= playback_position) {
+        return 0;
+    }
+
+    double cycles_per_sample = beeper_cycles_per_sample;
+    double last_input = beeper_hp_last_input;
+    double last_output = beeper_hp_last_output;
+    int level = beeper_playback_level;
+    size_t head = beeper_event_head;
+    size_t consumed = 0;
+
+    while (playback_position + cycles_per_sample < catch_up_position) {
+        double target_position = playback_position + cycles_per_sample;
+
+        while (head != beeper_event_tail &&
+               (double)beeper_events[head].t_state <= target_position) {
+            level = beeper_events[head].level ? 1 : 0;
+            head = (head + 1) % BEEPER_EVENT_CAPACITY;
+            ++consumed;
+        }
+
+        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
+        last_input = raw_sample;
+        last_output = filtered_sample;
+
+        playback_position = target_position;
+    }
+
+    if (playback_position < catch_up_position) {
+        double target_position = playback_position + cycles_per_sample;
+
+        while (head != beeper_event_tail &&
+               (double)beeper_events[head].t_state <= target_position) {
+            level = beeper_events[head].level ? 1 : 0;
+            head = (head + 1) % BEEPER_EVENT_CAPACITY;
+            ++consumed;
+        }
+
+        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
+        last_input = raw_sample;
+        last_output = filtered_sample;
+
+        playback_position = target_position;
+    }
+
+    while (head != beeper_event_tail &&
+           (double)beeper_events[head].t_state <= catch_up_position) {
+        level = beeper_events[head].level ? 1 : 0;
+        head = (head + 1) % BEEPER_EVENT_CAPACITY;
+        ++consumed;
+    }
+
+    beeper_event_head = head;
+    beeper_playback_position = playback_position;
+    beeper_playback_level = level;
+    beeper_hp_last_input = last_input;
+    beeper_hp_last_output = last_output;
+
+    return consumed;
 }
 
 static void beeper_push_event(uint64_t t_state, int level) {
+    int locked_audio = 0;
+    if (audio_available) {
+        SDL_LockAudio();
+        locked_audio = 1;
+    }
+
+    if (beeper_cycles_per_sample > 0.0) {
+        double playback_position_snapshot = beeper_playback_position;
+        double latency_cycles = (double)t_state - playback_position_snapshot;
+        double max_latency_cycles = beeper_cycles_per_sample * beeper_max_latency_samples;
+
+        if (latency_cycles > max_latency_cycles) {
+            if (!audio_available) {
+                double catch_up_position = (double)t_state - max_latency_cycles;
+                if (catch_up_position < 0.0) {
+                    catch_up_position = 0.0;
+                }
+                size_t pending_before = beeper_pending_event_count();
+                size_t consumed = beeper_catch_up_to(catch_up_position, playback_position_snapshot);
+
+                double new_latency_cycles = (double)t_state - beeper_playback_position;
+                double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
+                double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
+                size_t pending_after = beeper_pending_event_count();
+                double catch_up_error_samples = 0.0;
+                if (beeper_cycles_per_sample > 0.0) {
+                    catch_up_error_samples = (catch_up_position - beeper_playback_position) /
+                                             beeper_cycles_per_sample;
+                }
+
+                fprintf(stderr,
+                        "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
+                        queued_samples_before,
+                        queued_samples_after,
+                        consumed,
+                        pending_before,
+                        pending_after,
+                        catch_up_error_samples);
+
+                uint64_t catch_up_cycles = (uint64_t)catch_up_position;
+                if (catch_up_cycles > beeper_last_event_t_state) {
+                    beeper_last_event_t_state = catch_up_cycles;
+                }
+            } else {
+                double throttle_cycles = beeper_cycles_per_sample * beeper_latency_throttle_samples;
+
+                if (throttle_cycles > 0.0 && latency_cycles > throttle_cycles) {
+                    double trim_cycles = beeper_cycles_per_sample * beeper_latency_trim_samples;
+                    int should_trim = trim_cycles > throttle_cycles && latency_cycles > trim_cycles;
+
+                    if (should_trim) {
+                        double catch_up_position = (double)t_state - throttle_cycles;
+                        if (catch_up_position < 0.0) {
+                            catch_up_position = 0.0;
+                        }
+
+                        double playback_snapshot = beeper_playback_position;
+                        size_t pending_before = beeper_pending_event_count();
+                        size_t consumed = beeper_catch_up_to(catch_up_position, playback_snapshot);
+                        double new_latency_cycles = (double)t_state - beeper_playback_position;
+                        double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
+                        double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
+                        size_t pending_after = beeper_pending_event_count();
+                        double catch_up_error_samples = 0.0;
+                        if (beeper_cycles_per_sample > 0.0) {
+                            catch_up_error_samples = (catch_up_position - beeper_playback_position) /
+                                                     beeper_cycles_per_sample;
+                        }
+
+                        if (consumed > 0 || queued_samples_after < queued_samples_before) {
+                            fprintf(stderr,
+                                    "[BEEPER] trimmed backlog %.2f -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
+                                    queued_samples_before,
+                                    queued_samples_after,
+                                    consumed,
+                                    pending_before,
+                                    pending_after,
+                                    catch_up_error_samples);
+                        }
+
+                        uint64_t catch_up_cycles = (uint64_t)catch_up_position;
+                        if (catch_up_cycles > beeper_last_event_t_state) {
+                            beeper_last_event_t_state = catch_up_cycles;
+                        }
+
+                        latency_cycles = new_latency_cycles;
+                    }
+                }
+            }
+        } else if (audio_available && beeper_latency_warning_active) {
+            beeper_latency_warning_active = 0;
+        }
+    }
+
     if (t_state < beeper_last_event_t_state) {
         t_state = beeper_last_event_t_state;
     } else {
@@ -158,6 +574,10 @@ static void beeper_push_event(uint64_t t_state, int level) {
     beeper_events[beeper_event_tail].t_state = t_state;
     beeper_events[beeper_event_tail].level = (uint8_t)(level ? 1 : 0);
     beeper_event_tail = next_tail;
+
+    if (locked_audio) {
+        SDL_UnlockAudio();
+    }
 }
 
 void io_write(uint16_t port, uint8_t value) {
@@ -167,14 +587,8 @@ void io_write(uint16_t port, uint8_t value) {
         int new_beeper_state = (value >> 4) & 0x01;
 
         if (new_beeper_state != beeper_state) {
-            if (audio_available) {
-                SDL_LockAudio();
-            }
             beeper_state = new_beeper_state;
             beeper_push_event(total_t_states, beeper_state);
-            if (audio_available) {
-                SDL_UnlockAudio();
-            }
         }
     }
     (void)port; (void)value;
@@ -521,21 +935,39 @@ int init_sdl(void) {
     wanted_spec.freq = 44100;
     wanted_spec.format = AUDIO_S16SYS;
     wanted_spec.channels = 1;
-    wanted_spec.samples = 1024;
+    wanted_spec.samples = 512;
     wanted_spec.callback = audio_callback;
     wanted_spec.userdata = NULL;
 
     if (SDL_OpenAudio(&wanted_spec, &have_spec) < 0) {
         fprintf(stderr, "Failed to open audio: %s\n", SDL_GetError());
+        beeper_set_latency_limit(256.0);
     } else {
         if (have_spec.format != AUDIO_S16SYS || have_spec.channels != 1) {
             fprintf(stderr, "Unexpected audio format (format=%d, channels=%d). Audio disabled.\n", have_spec.format, have_spec.channels);
             SDL_CloseAudio();
+            beeper_set_latency_limit(256.0);
         } else {
             audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
             audio_available = 1;
             beeper_cycles_per_sample = CPU_CLOCK_HZ / (double)audio_sample_rate;
-            beeper_reset_audio_state();
+            double latency_limit = have_spec.samples > 0 ? (double)have_spec.samples : (double)wanted_spec.samples;
+            if (latency_limit < 256.0) {
+                latency_limit = 256.0;
+            }
+            beeper_set_latency_limit(latency_limit);
+            fprintf(stderr,
+                    "[BEEPER] latency clamp set to %.0f samples (audio buffer %u, throttle %.0f, trim %.0f)\n",
+                    beeper_max_latency_samples,
+                    have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples,
+                    beeper_latency_threshold(),
+                    beeper_latency_trim_samples);
+            beeper_reset_audio_state(total_t_states, beeper_state);
+            if (audio_dump_path && !audio_dump_file) {
+                if (!audio_dump_start(audio_dump_path, (uint32_t)audio_sample_rate)) {
+                    audio_dump_path = NULL;
+                }
+            }
             SDL_PauseAudio(0); // Start playing sound
         }
     }
@@ -547,7 +979,9 @@ void cleanup_sdl(void) {
     if (audio_available) {
         SDL_CloseAudio();
         audio_available = 0;
+        beeper_set_latency_limit(256.0);
     }
+    audio_dump_finish();
     if (texture) {
         SDL_DestroyTexture(texture);
     }
@@ -611,14 +1045,14 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
         double target_position = playback_position + cycles_per_sample;
 
         while (beeper_event_head != beeper_event_tail &&
-               beeper_events[beeper_event_head].t_state <= (uint64_t)target_position) {
+               (double)beeper_events[beeper_event_head].t_state <= target_position) {
             level = beeper_events[beeper_event_head].level ? 1 : 0;
             playback_position = (double)beeper_events[beeper_event_head].t_state;
             beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
         }
 
         double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
-        double filtered_sample = raw_sample - last_input + 0.995 * last_output;
+        double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
         last_input = raw_sample;
         last_output = filtered_sample;
 
@@ -632,6 +1066,8 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
         playback_position = target_position;
     }
 
+    audio_dump_write_samples(buffer, (size_t)num_samples);
+
     beeper_playback_level = level;
     beeper_playback_position = playback_position;
     beeper_hp_last_input = last_input;
@@ -642,10 +1078,43 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
 // --- Main Program ---
 int main(int argc, char *argv[]) {
-    if(argc<2){fprintf(stderr,"Usage: %s <rom_file>\n",argv[0]);return 1;} const char* fn=argv[1];
-    FILE* rf=fopen(fn,"rb"); if(!rf){perror("ROM open error");fprintf(stderr,"File: %s\n",fn);return 1;}
-    size_t br=fread(memory,1,0x4000,rf); if(br!=0x4000){fprintf(stderr,"ROM read error(%zu)\n",br);fclose(rf);return 1;} fclose(rf);
-    printf("Loaded %zu bytes from %s\n",br,fn);
+    const char* rom_filename = NULL;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--audio-dump") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+                return 1;
+            }
+            audio_dump_path = argv[++i];
+        } else if (!rom_filename) {
+            rom_filename = argv[i];
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+            return 1;
+        }
+    }
+
+    if (!rom_filename) {
+        fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+        return 1;
+    }
+
+    FILE* rf = fopen(rom_filename, "rb");
+    if (!rf) {
+        perror("ROM open error");
+        fprintf(stderr, "File: %s\n", rom_filename);
+        return 1;
+    }
+    size_t br = fread(memory, 1, 0x4000, rf);
+    if (br != 0x4000) {
+        fprintf(stderr, "ROM read error(%zu)\n", br);
+        fclose(rf);
+        return 1;
+    }
+    fclose(rf);
+    printf("Loaded %zu bytes from %s\n", br, rom_filename);
     if(!init_sdl()){cleanup_sdl();return 1;}
 
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
@@ -654,10 +1123,10 @@ int main(int argc, char *argv[]) {
 
     if (audio_available) {
         SDL_LockAudio();
-        beeper_reset_audio_state();
+        beeper_reset_audio_state(total_t_states, beeper_state);
         SDL_UnlockAudio();
     } else {
-        beeper_reset_audio_state();
+        beeper_reset_audio_state(total_t_states, beeper_state);
     }
 
     printf("Starting Z80 emulation...\n");
@@ -710,12 +1179,33 @@ int main(int argc, char *argv[]) {
             cycle_accumulator = CPU_CLOCK_HZ * 0.25;
         }
 
+        if (audio_available && beeper_cycles_per_sample > 0.0) {
+            double latency_samples = beeper_current_latency_samples();
+            double threshold = beeper_latency_threshold();
+            if (latency_samples >= threshold) {
+                Uint32 delay_ms = beeper_recommended_throttle_delay(latency_samples);
+                SDL_Delay(delay_ms);
+                continue;
+            }
+        }
+
         if (cycle_accumulator < 1.0) {
             SDL_Delay(0);
             continue;
         }
 
         int cycles_to_execute = (int)cycle_accumulator;
+        int latency_poll_cycles = 0;
+        int latency_poll_threshold = 0;
+        int throttled_audio = 0;
+        double throttled_latency_samples = 0.0;
+
+        if (audio_available && beeper_cycles_per_sample > 0.0) {
+            latency_poll_threshold = (int)(beeper_cycles_per_sample * 32.0);
+            if (latency_poll_threshold < 128) {
+                latency_poll_threshold = 128;
+            }
+        }
 
         while (cycles_to_execute > 0) {
             if (cpu.ei_delay) {
@@ -737,6 +1227,19 @@ int main(int argc, char *argv[]) {
             frame_t_state_accumulator += t_states;
             total_t_states += t_states;
 
+            if (audio_available && latency_poll_threshold > 0) {
+                latency_poll_cycles += t_states;
+                if (latency_poll_cycles >= latency_poll_threshold) {
+                    latency_poll_cycles = 0;
+                    double latency_samples = beeper_current_latency_samples();
+                    if (latency_samples >= beeper_latency_threshold()) {
+                        throttled_audio = 1;
+                        throttled_latency_samples = latency_samples;
+                        break;
+                    }
+                }
+            }
+
             while (frame_t_state_accumulator >= T_STATES_PER_FRAME) {
                 if (cpu.iff1) {
                     int interrupt_t_states = cpu_interrupt(&cpu, 0x0038);
@@ -746,6 +1249,12 @@ int main(int argc, char *argv[]) {
                 render_screen();
                 frame_t_state_accumulator -= T_STATES_PER_FRAME;
             }
+        }
+
+        if (throttled_audio) {
+            Uint32 delay_ms = beeper_recommended_throttle_delay(throttled_latency_samples);
+            SDL_Delay(delay_ms);
+            continue;
         }
     }
 
