@@ -38,6 +38,7 @@ uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 // --- Audio Globals ---
 volatile int beeper_state = 0; // 0 = low, 1 = high
 const int AUDIO_AMPLITUDE = 2000;
+static const double BEEPER_IDLE_RESET_SAMPLES = 512.0;
 int audio_sample_rate = 44100;
 int audio_available = 0;
 
@@ -1039,6 +1040,27 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
     if (cycles_per_sample <= 0.0) {
         memset(buffer, 0, (size_t)len);
         return;
+    }
+
+    if (beeper_event_head == beeper_event_tail && cycles_per_sample > 0.0) {
+        double idle_cycles = playback_position - (double)beeper_last_event_t_state;
+        if (idle_cycles > 0.0) {
+            double idle_samples = idle_cycles / cycles_per_sample;
+            if (idle_samples >= BEEPER_IDLE_RESET_SAMPLES) {
+                memset(buffer, 0, (size_t)len);
+                playback_position += cycles_per_sample * (double)num_samples;
+                double baseline = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+                last_input = baseline;
+                last_output = 0.0;
+                audio_dump_write_samples(buffer, (size_t)num_samples);
+                beeper_playback_level = level;
+                beeper_playback_position = playback_position;
+                beeper_hp_last_input = last_input;
+                beeper_hp_last_output = last_output;
+                (void)userdata;
+                return;
+            }
+        }
     }
 
     for (int i = 0; i < num_samples; ++i) {
