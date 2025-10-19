@@ -4,7 +4,9 @@
 #include <errno.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <SDL.h>
 
 // --- Z80 Flag Register Bits ---
@@ -52,6 +54,142 @@ static double beeper_latency_trim_samples = 512.0;
 static const double BEEPER_HP_ALPHA = 0.995;
 
 static const char* audio_dump_path = NULL;
+
+static const int16_t TAPE_WAV_AMPLITUDE = 20000;
+
+// --- Tape Constants ---
+static const int TAPE_PILOT_PULSE_TSTATES = 2168;
+static const int TAPE_SYNC_FIRST_PULSE_TSTATES = 667;
+static const int TAPE_SYNC_SECOND_PULSE_TSTATES = 735;
+static const int TAPE_BIT0_PULSE_TSTATES = 855;
+static const int TAPE_BIT1_PULSE_TSTATES = 1710;
+static const int TAPE_HEADER_PILOT_COUNT = 8063;
+static const int TAPE_DATA_PILOT_COUNT = 3223;
+static const uint64_t TAPE_SILENCE_THRESHOLD_TSTATES = 350000ULL; // 0.1 second
+
+typedef struct {
+    uint8_t* data;
+    uint32_t length;
+    uint32_t pause_ms;
+} TapeBlock;
+
+typedef struct {
+    TapeBlock* blocks;
+    size_t count;
+    size_t capacity;
+} TapeImage;
+
+typedef struct {
+    uint32_t duration;
+} TapePulse;
+
+typedef struct {
+    TapePulse* pulses;
+    size_t count;
+    size_t capacity;
+    int initial_level;
+    uint32_t sample_rate;
+} TapeWaveform;
+
+typedef enum {
+    TAPE_FORMAT_NONE,
+    TAPE_FORMAT_TAP,
+    TAPE_FORMAT_TZX,
+    TAPE_FORMAT_WAV
+} TapeFormat;
+
+typedef enum {
+    TAPE_PHASE_IDLE,
+    TAPE_PHASE_PILOT,
+    TAPE_PHASE_SYNC1,
+    TAPE_PHASE_SYNC2,
+    TAPE_PHASE_DATA,
+    TAPE_PHASE_PAUSE,
+    TAPE_PHASE_DONE
+} TapePhase;
+
+typedef struct {
+    TapeImage image;
+    TapeWaveform waveform;
+    TapeFormat format;
+    size_t current_block;
+    TapePhase phase;
+    int pilot_pulses_remaining;
+    size_t data_byte_index;
+    uint8_t data_bit_mask;
+    int data_pulse_half;
+    uint64_t next_transition_tstate;
+    uint64_t pause_end_tstate;
+    int level;
+    int playing;
+    size_t waveform_index;
+} TapePlaybackState;
+
+typedef enum {
+    TAPE_OUTPUT_NONE,
+    TAPE_OUTPUT_TAP,
+    TAPE_OUTPUT_WAV
+} TapeOutputFormat;
+
+typedef struct {
+    TapeImage recorded;
+    TapePulse* pulses;
+    size_t pulse_count;
+    size_t pulse_capacity;
+    uint64_t last_transition_tstate;
+    int last_level;
+    int block_active;
+    int enabled;
+    const char* output_path;
+    int block_start_level;
+    uint32_t sample_rate;
+    int16_t* audio_samples;
+    size_t audio_sample_count;
+    size_t audio_sample_capacity;
+    TapeOutputFormat output_format;
+} TapeRecorder;
+
+static TapePlaybackState tape_playback = {0};
+static TapeRecorder tape_recorder = {0};
+static int tape_ear_state = 1;
+static int tape_input_enabled = 0;
+
+typedef struct {
+    uint8_t value;
+    uint64_t t_state;
+} UlaWriteEvent;
+
+static UlaWriteEvent ula_write_queue[64];
+static size_t ula_write_count = 0;
+static uint64_t ula_instruction_base_tstate = 0;
+static int* ula_instruction_progress_ptr = NULL;
+
+static TapeFormat tape_input_format = TAPE_FORMAT_NONE;
+static const char* tape_input_path = NULL;
+
+static int tape_load_image(const char* path, TapeFormat format, TapeImage* image);
+static void tape_free_image(TapeImage* image);
+static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t length, uint32_t pause_ms);
+static void tape_reset_playback(TapePlaybackState* state);
+static void tape_start_playback(TapePlaybackState* state, uint64_t start_time);
+static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64_t start_time);
+static void tape_update(uint64_t current_t_state);
+static int tape_current_block_pilot_count(const TapePlaybackState* state);
+static void tape_waveform_reset(TapeWaveform* waveform);
+static int tape_waveform_add_pulse(TapeWaveform* waveform, uint64_t duration);
+static int tape_load_wav(const char* path, TapePlaybackState* state);
+static void tape_recorder_enable(const char* path, TapeOutputFormat format);
+static void tape_recorder_handle_mic(uint64_t t_state, int level);
+static void tape_recorder_update(uint64_t current_t_state, int force_flush);
+static int tape_recorder_write_output(void);
+static void tape_recorder_reset_audio(void);
+static size_t tape_recorder_samples_from_tstates(uint64_t duration);
+static int tape_recorder_append_audio_samples(int level, size_t sample_count);
+static void tape_recorder_append_block_audio(uint64_t idle_cycles);
+static int tape_recorder_write_wav(void);
+static void tape_shutdown(void);
+static void ula_queue_port_value(uint8_t value);
+static void ula_process_port_events(uint64_t current_t_state);
 
 static FILE* audio_dump_file = NULL;
 static uint32_t audio_dump_data_bytes = 0;
@@ -459,6 +597,1234 @@ static void audio_dump_finish(void) {
     audio_dump_data_bytes = 0;
 }
 
+static uint64_t tape_pause_to_tstates(uint32_t pause_ms) {
+    if (pause_ms == 0) {
+        return 0;
+    }
+    double tstates = ((double)pause_ms / 1000.0) * CPU_CLOCK_HZ;
+    if (tstates <= 0.0) {
+        return 0;
+    }
+    return (uint64_t)(tstates + 0.5);
+}
+
+static void tape_free_image(TapeImage* image) {
+    if (!image) {
+        return;
+    }
+    if (image->blocks) {
+        for (size_t i = 0; i < image->count; ++i) {
+            free(image->blocks[i].data);
+            image->blocks[i].data = NULL;
+        }
+        free(image->blocks);
+    }
+    image->blocks = NULL;
+    image->count = 0;
+    image->capacity = 0;
+}
+
+static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t length, uint32_t pause_ms) {
+    if (!image) {
+        return 0;
+    }
+
+    if (image->count == image->capacity) {
+        size_t new_capacity = image->capacity ? image->capacity * 2 : 8;
+        TapeBlock* new_blocks = (TapeBlock*)realloc(image->blocks, new_capacity * sizeof(TapeBlock));
+        if (!new_blocks) {
+            return 0;
+        }
+        image->blocks = new_blocks;
+        image->capacity = new_capacity;
+    }
+
+    TapeBlock* block = &image->blocks[image->count];
+    block->length = length;
+    block->pause_ms = pause_ms;
+    block->data = NULL;
+
+    if (length > 0) {
+        block->data = (uint8_t*)malloc(length);
+        if (!block->data) {
+            return 0;
+        }
+        memcpy(block->data, data, length);
+    }
+
+    image->count++;
+    return 1;
+}
+
+static void tape_waveform_reset(TapeWaveform* waveform) {
+    if (!waveform) {
+        return;
+    }
+    if (waveform->pulses) {
+        free(waveform->pulses);
+        waveform->pulses = NULL;
+    }
+    waveform->count = 0;
+    waveform->capacity = 0;
+    waveform->initial_level = 1;
+    waveform->sample_rate = 0u;
+}
+
+static int tape_waveform_add_pulse(TapeWaveform* waveform, uint64_t duration) {
+    if (!waveform || duration == 0) {
+        return 1;
+    }
+    if (duration > UINT32_MAX) {
+        duration = UINT32_MAX;
+    }
+    if (waveform->count == waveform->capacity) {
+        size_t new_capacity = waveform->capacity ? waveform->capacity * 2 : 512;
+        TapePulse* new_pulses = (TapePulse*)realloc(waveform->pulses, new_capacity * sizeof(TapePulse));
+        if (!new_pulses) {
+            return 0;
+        }
+        waveform->pulses = new_pulses;
+        waveform->capacity = new_capacity;
+    }
+    waveform->pulses[waveform->count].duration = (uint32_t)duration;
+    waveform->count++;
+    return 1;
+}
+
+static int tape_load_tap(const char* path, TapeImage* image) {
+    FILE* tf = fopen(path, "rb");
+    if (!tf) {
+        fprintf(stderr, "Failed to open TAP file '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t length_bytes[2];
+    while (fread(length_bytes, sizeof(length_bytes), 1, tf) == 1) {
+        uint32_t block_length = (uint32_t)length_bytes[0] | ((uint32_t)length_bytes[1] << 8);
+        uint8_t* buffer = NULL;
+        if (block_length > 0) {
+            buffer = (uint8_t*)malloc(block_length);
+            if (!buffer) {
+                fprintf(stderr, "Out of memory while reading TAP block\n");
+                fclose(tf);
+                return 0;
+            }
+            if (fread(buffer, block_length, 1, tf) != 1) {
+                fprintf(stderr, "Failed to read TAP block payload\n");
+                free(buffer);
+                fclose(tf);
+                return 0;
+            }
+        }
+
+        uint32_t pause_ms = 1000u;
+        if (buffer) {
+            if (!tape_image_add_block(image, buffer, block_length, pause_ms)) {
+                fprintf(stderr, "Failed to store TAP block\n");
+                free(buffer);
+                fclose(tf);
+                return 0;
+            }
+            free(buffer);
+        } else {
+            uint8_t empty = 0;
+            if (!tape_image_add_block(image, &empty, 0u, pause_ms)) {
+                fprintf(stderr, "Failed to store empty TAP block\n");
+                fclose(tf);
+                return 0;
+            }
+        }
+    }
+
+    if (!feof(tf)) {
+        fprintf(stderr, "Failed to read TAP file '%s' completely\n", path);
+        fclose(tf);
+        return 0;
+    }
+
+    fclose(tf);
+    return 1;
+}
+
+static int tape_load_tzx(const char* path, TapeImage* image) {
+    FILE* tf = fopen(path, "rb");
+    if (!tf) {
+        fprintf(stderr, "Failed to open TZX file '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t header[10];
+    if (fread(header, sizeof(header), 1, tf) != 1) {
+        fprintf(stderr, "Failed to read TZX header from '%s'\n", path);
+        fclose(tf);
+        return 0;
+    }
+
+    if (memcmp(header, "ZXTape!\x1A", 8) != 0) {
+        fprintf(stderr, "File '%s' is not a valid TZX image\n", path);
+        fclose(tf);
+        return 0;
+    }
+
+    int block_id = 0;
+    while ((block_id = fgetc(tf)) != EOF) {
+        if (block_id == 0x10) {
+            uint8_t pause_bytes[2];
+            uint8_t length_bytes[2];
+            if (fread(pause_bytes, sizeof(pause_bytes), 1, tf) != 1 ||
+                fread(length_bytes, sizeof(length_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX block\n");
+                fclose(tf);
+                return 0;
+            }
+
+            uint32_t pause_ms = (uint32_t)pause_bytes[0] | ((uint32_t)pause_bytes[1] << 8);
+            uint32_t block_length = (uint32_t)length_bytes[0] | ((uint32_t)length_bytes[1] << 8);
+
+            uint8_t* buffer = NULL;
+            if (block_length > 0) {
+                buffer = (uint8_t*)malloc(block_length);
+                if (!buffer) {
+                    fprintf(stderr, "Out of memory while reading TZX block\n");
+                    fclose(tf);
+                    return 0;
+                }
+                if (fread(buffer, block_length, 1, tf) != 1) {
+                    fprintf(stderr, "Failed to read TZX block payload\n");
+                    free(buffer);
+                    fclose(tf);
+                    return 0;
+                }
+            }
+
+            if (buffer) {
+                if (!tape_image_add_block(image, buffer, block_length, pause_ms)) {
+                    fprintf(stderr, "Failed to store TZX block\n");
+                    free(buffer);
+                    fclose(tf);
+                    return 0;
+                }
+                free(buffer);
+            } else {
+                uint8_t empty = 0;
+                if (!tape_image_add_block(image, &empty, 0u, pause_ms)) {
+                    fprintf(stderr, "Failed to store empty TZX block\n");
+                    fclose(tf);
+                    return 0;
+                }
+            }
+        } else {
+            fprintf(stderr, "Unsupported TZX block type 0x%02X in '%s'\n", block_id, path);
+            fclose(tf);
+            return 0;
+        }
+    }
+
+    fclose(tf);
+    return 1;
+}
+
+static int tape_load_wav(const char* path, TapePlaybackState* state) {
+    if (!path || !state) {
+        return 0;
+    }
+
+    FILE* wf = fopen(path, "rb");
+    if (!wf) {
+        fprintf(stderr, "Failed to open WAV file '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t riff_header[12];
+    if (fread(riff_header, sizeof(riff_header), 1, wf) != 1) {
+        fprintf(stderr, "Failed to read WAV header from '%s'\n", path);
+        fclose(wf);
+        return 0;
+    }
+
+    if (memcmp(riff_header, "RIFF", 4) != 0 || memcmp(riff_header + 8, "WAVE", 4) != 0) {
+        fprintf(stderr, "File '%s' is not a valid WAV image\n", path);
+        fclose(wf);
+        return 0;
+    }
+
+    uint16_t audio_format = 0;
+    uint16_t num_channels = 0;
+    uint32_t sample_rate = 0;
+    uint16_t bits_per_sample = 0;
+    uint8_t* data_buffer = NULL;
+    uint32_t data_size = 0;
+    int have_fmt = 0;
+    int have_data = 0;
+
+    for (;;) {
+        uint8_t chunk_header[8];
+        if (fread(chunk_header, sizeof(chunk_header), 1, wf) != 1) {
+            break;
+        }
+
+        uint32_t chunk_size = (uint32_t)chunk_header[4] |
+                               ((uint32_t)chunk_header[5] << 8) |
+                               ((uint32_t)chunk_header[6] << 16) |
+                               ((uint32_t)chunk_header[7] << 24);
+
+        if (memcmp(chunk_header, "fmt ", 4) == 0) {
+            if (chunk_size < 16) {
+                fprintf(stderr, "Invalid WAV fmt chunk in '%s'\n", path);
+                fclose(wf);
+                free(data_buffer);
+                return 0;
+            }
+            uint8_t* fmt_data = (uint8_t*)malloc(chunk_size);
+            if (!fmt_data) {
+                fprintf(stderr, "Out of memory while reading WAV fmt chunk\n");
+                fclose(wf);
+                free(data_buffer);
+                return 0;
+            }
+            if (fread(fmt_data, chunk_size, 1, wf) != 1) {
+                fprintf(stderr, "Failed to read WAV fmt chunk\n");
+                free(fmt_data);
+                fclose(wf);
+                free(data_buffer);
+                return 0;
+            }
+            audio_format = (uint16_t)fmt_data[0] | ((uint16_t)fmt_data[1] << 8);
+            num_channels = (uint16_t)fmt_data[2] | ((uint16_t)fmt_data[3] << 8);
+            sample_rate = (uint32_t)fmt_data[4] |
+                          ((uint32_t)fmt_data[5] << 8) |
+                          ((uint32_t)fmt_data[6] << 16) |
+                          ((uint32_t)fmt_data[7] << 24);
+            bits_per_sample = (uint16_t)fmt_data[14] | ((uint16_t)fmt_data[15] << 8);
+            free(fmt_data);
+            have_fmt = 1;
+        } else if (memcmp(chunk_header, "data", 4) == 0) {
+            if (chunk_size == 0) {
+                free(data_buffer);
+                data_buffer = NULL;
+                data_size = 0;
+                have_data = 1;
+            } else {
+                uint8_t* buffer = (uint8_t*)malloc(chunk_size);
+                if (!buffer) {
+                    fprintf(stderr, "Out of memory while reading WAV data chunk\n");
+                    fclose(wf);
+                    free(data_buffer);
+                    return 0;
+                }
+                if (fread(buffer, chunk_size, 1, wf) != 1) {
+                    fprintf(stderr, "Failed to read WAV data chunk\n");
+                    free(buffer);
+                    fclose(wf);
+                    free(data_buffer);
+                    return 0;
+                }
+                free(data_buffer);
+                data_buffer = buffer;
+                data_size = chunk_size;
+                have_data = 1;
+            }
+        } else {
+            if (fseek(wf, chunk_size, SEEK_CUR) != 0) {
+                fprintf(stderr, "Failed to skip WAV chunk in '%s'\n", path);
+                fclose(wf);
+                free(data_buffer);
+                return 0;
+            }
+        }
+
+        if (chunk_size & 1u) {
+            if (fseek(wf, 1, SEEK_CUR) != 0) {
+                fprintf(stderr, "Failed to align WAV chunk in '%s'\n", path);
+                fclose(wf);
+                free(data_buffer);
+                return 0;
+            }
+        }
+
+        if (have_fmt && have_data) {
+            break;
+        }
+    }
+
+    fclose(wf);
+
+    if (!have_fmt || !have_data) {
+        fprintf(stderr, "WAV file '%s' is missing required chunks\n", path);
+        free(data_buffer);
+        return 0;
+    }
+
+    if (audio_format != 1) {
+        fprintf(stderr, "WAV file '%s' is not PCM encoded\n", path);
+        free(data_buffer);
+        return 0;
+    }
+
+    if (num_channels != 1) {
+        fprintf(stderr, "WAV file '%s' must be mono for tape loading\n", path);
+        free(data_buffer);
+        return 0;
+    }
+
+    if (bits_per_sample != 8 && bits_per_sample != 16) {
+        fprintf(stderr, "Unsupported WAV bit depth (%u) in '%s'\n", (unsigned)bits_per_sample, path);
+        free(data_buffer);
+        return 0;
+    }
+
+    if (sample_rate == 0) {
+        fprintf(stderr, "Invalid WAV sample rate in '%s'\n", path);
+        free(data_buffer);
+        return 0;
+    }
+
+    int bytes_per_sample = bits_per_sample / 8;
+    if (bytes_per_sample <= 0) {
+        free(data_buffer);
+        return 0;
+    }
+
+    if (data_size % (uint32_t)bytes_per_sample != 0u) {
+        fprintf(stderr, "Corrupt WAV data chunk in '%s'\n", path);
+        free(data_buffer);
+        return 0;
+    }
+
+    size_t total_samples = data_size / (size_t)bytes_per_sample;
+
+    tape_free_image(&state->image);
+    tape_waveform_reset(&state->waveform);
+    state->waveform.sample_rate = sample_rate;
+    state->format = TAPE_FORMAT_WAV;
+
+    if (total_samples == 0) {
+        free(data_buffer);
+        return 1;
+    }
+
+    size_t offset = 0;
+    int32_t first_value = 0;
+    if (bits_per_sample == 16) {
+        first_value = (int16_t)((uint16_t)data_buffer[offset] | ((uint16_t)data_buffer[offset + 1] << 8));
+    } else {
+        first_value = (int32_t)data_buffer[offset] - 128;
+    }
+    int previous_level = (first_value >= 0) ? 1 : 0;
+    state->waveform.initial_level = previous_level;
+    size_t run_length = 1;
+    offset += (size_t)bytes_per_sample;
+
+    double tstates_per_sample = CPU_CLOCK_HZ / (double)sample_rate;
+
+    for (size_t sample_index = 1; sample_index < total_samples; ++sample_index) {
+        int32_t sample_value = 0;
+        if (bits_per_sample == 16) {
+            sample_value = (int16_t)((uint16_t)data_buffer[offset] | ((uint16_t)data_buffer[offset + 1] << 8));
+        } else {
+            sample_value = (int32_t)data_buffer[offset] - 128;
+        }
+        int level = (sample_value >= 0) ? 1 : 0;
+
+        if (level == previous_level) {
+            run_length++;
+        } else {
+            uint64_t duration = (uint64_t)(tstates_per_sample * (double)run_length + 0.5);
+            if (duration == 0 && run_length > 0) {
+                duration = 1;
+            }
+            if (!tape_waveform_add_pulse(&state->waveform, duration)) {
+                fprintf(stderr, "Out of memory while decoding WAV tape\n");
+                free(data_buffer);
+                tape_waveform_reset(&state->waveform);
+                state->format = TAPE_FORMAT_NONE;
+                return 0;
+            }
+            previous_level = level;
+            run_length = 1;
+        }
+
+        offset += (size_t)bytes_per_sample;
+    }
+
+    free(data_buffer);
+    return 1;
+}
+
+static int tape_load_image(const char* path, TapeFormat format, TapeImage* image) {
+    if (!path || !image || format == TAPE_FORMAT_NONE) {
+        return 0;
+    }
+
+    tape_free_image(image);
+
+    switch (format) {
+        case TAPE_FORMAT_TAP:
+            return tape_load_tap(path, image);
+        case TAPE_FORMAT_TZX:
+            return tape_load_tzx(path, image);
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+static void tape_reset_playback(TapePlaybackState* state) {
+    if (!state) {
+        return;
+    }
+    state->current_block = 0;
+    state->phase = TAPE_PHASE_IDLE;
+    state->pilot_pulses_remaining = 0;
+    state->data_byte_index = 0;
+    state->data_bit_mask = 0x80u;
+    state->data_pulse_half = 0;
+    state->next_transition_tstate = 0;
+    state->pause_end_tstate = 0;
+    state->playing = 0;
+    state->waveform_index = 0;
+    if (state->format == TAPE_FORMAT_WAV) {
+        state->level = state->waveform.initial_level ? 1 : 0;
+        tape_ear_state = state->level;
+    } else {
+        state->level = 1;
+        tape_ear_state = 1;
+    }
+}
+
+static int tape_current_block_pilot_count(const TapePlaybackState* state) {
+    if (!state || state->current_block >= state->image.count) {
+        return TAPE_DATA_PILOT_COUNT;
+    }
+    const TapeBlock* block = &state->image.blocks[state->current_block];
+    if (block->length > 0 && block->data && block->data[0] == 0x00) {
+        return TAPE_HEADER_PILOT_COUNT;
+    }
+    return TAPE_DATA_PILOT_COUNT;
+}
+
+static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64_t start_time) {
+    if (!state || block_index >= state->image.count) {
+        return 0;
+    }
+
+    state->current_block = block_index;
+    state->pilot_pulses_remaining = tape_current_block_pilot_count(state);
+    state->data_byte_index = 0;
+    state->data_bit_mask = 0x80u;
+    state->data_pulse_half = 0;
+    state->phase = TAPE_PHASE_PILOT;
+    state->level = 1;
+    tape_ear_state = state->level;
+    state->next_transition_tstate = start_time + (uint64_t)TAPE_PILOT_PULSE_TSTATES;
+    state->playing = 1;
+    return 1;
+}
+
+static void tape_start_playback(TapePlaybackState* state, uint64_t start_time) {
+    if (!state) {
+        return;
+    }
+    tape_reset_playback(state);
+    if (state->format == TAPE_FORMAT_WAV) {
+        if (state->waveform.count == 0) {
+            return;
+        }
+        state->playing = 1;
+        state->next_transition_tstate = start_time + (uint64_t)state->waveform.pulses[0].duration;
+        return;
+    }
+    if (state->image.count == 0) {
+        return;
+    }
+    (void)tape_begin_block(state, 0u, start_time);
+}
+
+static int tape_duration_tolerance(int reference) {
+    int tolerance = reference / 4;
+    if (tolerance < 200) {
+        tolerance = 200;
+    }
+    return tolerance;
+}
+
+static int tape_duration_matches(uint32_t duration, int reference, int tolerance) {
+    int diff = (int)duration - reference;
+    if (diff < 0) {
+        diff = -diff;
+    }
+    return diff <= tolerance;
+}
+
+static void tape_finish_block_playback(TapePlaybackState* state) {
+    if (!state) {
+        return;
+    }
+    if (state->current_block < state->image.count) {
+        const TapeBlock* block = &state->image.blocks[state->current_block];
+        uint64_t pause = tape_pause_to_tstates(block->pause_ms);
+        state->phase = TAPE_PHASE_PAUSE;
+        state->pause_end_tstate = state->next_transition_tstate + pause;
+        state->current_block++;
+        if (pause == 0) {
+            uint64_t start_time = state->pause_end_tstate;
+            if (state->current_block < state->image.count) {
+                if (!tape_begin_block(state, state->current_block, start_time)) {
+                    state->phase = TAPE_PHASE_DONE;
+                    state->playing = 0;
+                    tape_ear_state = 1;
+                }
+            } else {
+                state->phase = TAPE_PHASE_DONE;
+                state->playing = 0;
+                tape_ear_state = 1;
+            }
+        }
+    } else {
+        state->phase = TAPE_PHASE_DONE;
+        state->playing = 0;
+        tape_ear_state = 1;
+    }
+}
+
+static void tape_update(uint64_t current_t_state) {
+    TapePlaybackState* state = &tape_playback;
+    if (!tape_input_enabled || !state->playing) {
+        return;
+    }
+
+    if (state->format == TAPE_FORMAT_WAV) {
+        while (state->playing && state->waveform_index < state->waveform.count &&
+               current_t_state >= state->next_transition_tstate) {
+            state->level = state->level ? 0 : 1;
+            tape_ear_state = state->level;
+            state->waveform_index++;
+            if (state->waveform_index < state->waveform.count) {
+                state->next_transition_tstate += (uint64_t)state->waveform.pulses[state->waveform_index].duration;
+            } else {
+                state->playing = 0;
+            }
+        }
+        return;
+    }
+
+    while (state->playing) {
+        if (state->phase == TAPE_PHASE_PAUSE) {
+            if (current_t_state >= state->pause_end_tstate) {
+                if (state->current_block >= state->image.count) {
+                    state->phase = TAPE_PHASE_DONE;
+                    state->playing = 0;
+                    tape_ear_state = 1;
+                    break;
+                }
+                if (!tape_begin_block(state, state->current_block, state->pause_end_tstate)) {
+                    state->phase = TAPE_PHASE_DONE;
+                    state->playing = 0;
+                    tape_ear_state = 1;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+
+        if (state->phase == TAPE_PHASE_DONE || state->phase == TAPE_PHASE_IDLE) {
+            break;
+        }
+
+        if (current_t_state < state->next_transition_tstate) {
+            break;
+        }
+
+        state->level = state->level ? 0 : 1;
+        tape_ear_state = state->level;
+
+        switch (state->phase) {
+            case TAPE_PHASE_PILOT:
+                state->pilot_pulses_remaining--;
+                if (state->pilot_pulses_remaining > 0) {
+                    state->next_transition_tstate += (uint64_t)TAPE_PILOT_PULSE_TSTATES;
+                } else {
+                    state->phase = TAPE_PHASE_SYNC1;
+                    state->next_transition_tstate += (uint64_t)TAPE_SYNC_FIRST_PULSE_TSTATES;
+                }
+                break;
+            case TAPE_PHASE_SYNC1:
+                state->phase = TAPE_PHASE_SYNC2;
+                state->next_transition_tstate += (uint64_t)TAPE_SYNC_SECOND_PULSE_TSTATES;
+                break;
+            case TAPE_PHASE_SYNC2: {
+                state->phase = TAPE_PHASE_DATA;
+                state->data_pulse_half = 0;
+                const TapeBlock* block = NULL;
+                if (state->current_block < state->image.count) {
+                    block = &state->image.blocks[state->current_block];
+                }
+                if (!block || block->length == 0 || !block->data) {
+                    tape_finish_block_playback(state);
+                } else {
+                    int bit = (block->data[state->data_byte_index] & state->data_bit_mask) ? 1 : 0;
+                    int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
+                    state->next_transition_tstate += (uint64_t)duration;
+                    state->data_pulse_half = 1;
+                }
+                break;
+            }
+            case TAPE_PHASE_DATA: {
+                const TapeBlock* block = NULL;
+                if (state->current_block < state->image.count) {
+                    block = &state->image.blocks[state->current_block];
+                }
+                if (!block || block->length == 0 || !block->data) {
+                    tape_finish_block_playback(state);
+                    break;
+                }
+
+                int bit = (block->data[state->data_byte_index] & state->data_bit_mask) ? 1 : 0;
+                int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
+                state->next_transition_tstate += (uint64_t)duration;
+
+                if (state->data_pulse_half == 0) {
+                    state->data_pulse_half = 1;
+                } else {
+                    state->data_pulse_half = 0;
+                    state->data_bit_mask >>= 1;
+                    if (state->data_bit_mask == 0) {
+                        state->data_bit_mask = 0x80u;
+                        state->data_byte_index++;
+                        if (state->data_byte_index >= block->length) {
+                            tape_finish_block_playback(state);
+                        }
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+
+        if (!state->playing) {
+            break;
+        }
+    }
+}
+
+static void tape_recorder_reset_pulses(void) {
+    if (tape_recorder.pulses) {
+        free(tape_recorder.pulses);
+        tape_recorder.pulses = NULL;
+    }
+    tape_recorder.pulse_count = 0;
+    tape_recorder.pulse_capacity = 0;
+}
+
+static void tape_recorder_reset_audio(void) {
+    if (tape_recorder.audio_samples) {
+        free(tape_recorder.audio_samples);
+        tape_recorder.audio_samples = NULL;
+    }
+    tape_recorder.audio_sample_count = 0;
+    tape_recorder.audio_sample_capacity = 0;
+}
+
+static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
+    tape_recorder.output_path = path;
+    tape_recorder.enabled = path ? 1 : 0;
+    tape_recorder.output_format = format;
+    tape_recorder.block_active = 0;
+    tape_recorder.last_transition_tstate = 0;
+    tape_recorder.last_level = -1;
+    tape_recorder.block_start_level = 0;
+    tape_recorder.sample_rate = (audio_sample_rate > 0) ? (uint32_t)audio_sample_rate : 44100u;
+    tape_recorder_reset_pulses();
+    tape_free_image(&tape_recorder.recorded);
+    tape_recorder_reset_audio();
+}
+
+static int tape_recorder_append_pulse(uint64_t duration) {
+    if (duration == 0) {
+        return 1;
+    }
+    if (duration > UINT32_MAX) {
+        duration = UINT32_MAX;
+    }
+    if (tape_recorder.pulse_count == tape_recorder.pulse_capacity) {
+        size_t new_capacity = tape_recorder.pulse_capacity ? tape_recorder.pulse_capacity * 2 : 512;
+        TapePulse* new_pulses = (TapePulse*)realloc(tape_recorder.pulses, new_capacity * sizeof(TapePulse));
+        if (!new_pulses) {
+            return 0;
+        }
+        tape_recorder.pulses = new_pulses;
+        tape_recorder.pulse_capacity = new_capacity;
+    }
+    tape_recorder.pulses[tape_recorder.pulse_count].duration = (uint32_t)duration;
+    tape_recorder.pulse_count++;
+    return 1;
+}
+
+static size_t tape_recorder_samples_from_tstates(uint64_t duration) {
+    if (duration == 0 || tape_recorder.sample_rate == 0) {
+        return 0;
+    }
+    double seconds = (double)duration / CPU_CLOCK_HZ;
+    double samples = seconds * (double)tape_recorder.sample_rate;
+    size_t count = (size_t)(samples + 0.5);
+    if (count == 0 && duration > 0) {
+        count = 1;
+    }
+    return count;
+}
+
+static int tape_recorder_append_audio_samples(int level, size_t sample_count) {
+    if (sample_count == 0) {
+        return 1;
+    }
+    if (tape_recorder.audio_sample_count > SIZE_MAX - sample_count) {
+        return 0;
+    }
+    size_t required = tape_recorder.audio_sample_count + sample_count;
+    if (required > tape_recorder.audio_sample_capacity) {
+        size_t new_capacity = tape_recorder.audio_sample_capacity ? tape_recorder.audio_sample_capacity : 4096;
+        while (new_capacity < required) {
+            new_capacity *= 2;
+        }
+        int16_t* new_samples = (int16_t*)realloc(tape_recorder.audio_samples, new_capacity * sizeof(int16_t));
+        if (!new_samples) {
+            return 0;
+        }
+        tape_recorder.audio_samples = new_samples;
+        tape_recorder.audio_sample_capacity = new_capacity;
+    }
+
+    int16_t value = level ? TAPE_WAV_AMPLITUDE : (int16_t)(-TAPE_WAV_AMPLITUDE);
+    int16_t* dest = tape_recorder.audio_samples + tape_recorder.audio_sample_count;
+    for (size_t i = 0; i < sample_count; ++i) {
+        dest[i] = value;
+    }
+    tape_recorder.audio_sample_count += sample_count;
+    return 1;
+}
+
+static void tape_recorder_append_block_audio(uint64_t idle_cycles) {
+    if (tape_recorder.output_format != TAPE_OUTPUT_WAV) {
+        return;
+    }
+
+    if (tape_recorder.pulse_count == 0) {
+        if (idle_cycles > 0 && tape_recorder.last_level >= 0) {
+            size_t idle_samples = tape_recorder_samples_from_tstates(idle_cycles);
+            if (!tape_recorder_append_audio_samples(tape_recorder.last_level ? 1 : 0, idle_samples)) {
+                fprintf(stderr, "Warning: failed to store recorded tape audio\n");
+            }
+        }
+        return;
+    }
+
+    int level = tape_recorder.block_start_level ? 1 : 0;
+    for (size_t i = 0; i < tape_recorder.pulse_count; ++i) {
+        uint32_t duration = tape_recorder.pulses[i].duration;
+        size_t samples = tape_recorder_samples_from_tstates(duration);
+        if (!tape_recorder_append_audio_samples(level, samples)) {
+            fprintf(stderr, "Warning: failed to store recorded tape audio\n");
+            return;
+        }
+        level = level ? 0 : 1;
+    }
+
+    if (idle_cycles > 0 && tape_recorder.last_level >= 0) {
+        size_t idle_samples = tape_recorder_samples_from_tstates(idle_cycles);
+        if (!tape_recorder_append_audio_samples(tape_recorder.last_level ? 1 : 0, idle_samples)) {
+            fprintf(stderr, "Warning: failed to store recorded tape audio\n");
+        }
+    }
+}
+
+static int tape_recorder_write_wav(void) {
+    if (!tape_recorder.output_path) {
+        return 1;
+    }
+
+    uint32_t sample_rate = tape_recorder.sample_rate ? tape_recorder.sample_rate : 44100u;
+    size_t sample_count = tape_recorder.audio_sample_count;
+    uint64_t data_bytes_64 = sample_count * sizeof(int16_t);
+    if (data_bytes_64 > UINT32_MAX) {
+        fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
+        return 0;
+    }
+    uint32_t data_bytes = (uint32_t)data_bytes_64;
+    uint32_t chunk_size = 36u + data_bytes;
+    if (chunk_size < data_bytes) {
+        fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
+        return 0;
+    }
+
+    FILE* tf = fopen(tape_recorder.output_path, "wb");
+    if (!tf) {
+        fprintf(stderr, "Failed to open tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t header[44];
+    memset(header, 0, sizeof(header));
+    memcpy(header + 0, "RIFF", 4);
+    header[4] = (uint8_t)(chunk_size & 0xFFu);
+    header[5] = (uint8_t)((chunk_size >> 8) & 0xFFu);
+    header[6] = (uint8_t)((chunk_size >> 16) & 0xFFu);
+    header[7] = (uint8_t)((chunk_size >> 24) & 0xFFu);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
+    header[16] = 16;
+    header[20] = 1;
+    header[22] = 1;
+    header[24] = (uint8_t)(sample_rate & 0xFFu);
+    header[25] = (uint8_t)((sample_rate >> 8) & 0xFFu);
+    header[26] = (uint8_t)((sample_rate >> 16) & 0xFFu);
+    header[27] = (uint8_t)((sample_rate >> 24) & 0xFFu);
+    uint32_t byte_rate = sample_rate * 2u;
+    header[28] = (uint8_t)(byte_rate & 0xFFu);
+    header[29] = (uint8_t)((byte_rate >> 8) & 0xFFu);
+    header[30] = (uint8_t)((byte_rate >> 16) & 0xFFu);
+    header[31] = (uint8_t)((byte_rate >> 24) & 0xFFu);
+    header[32] = 2;
+    header[34] = 16;
+    memcpy(header + 36, "data", 4);
+    header[40] = (uint8_t)(data_bytes & 0xFFu);
+    header[41] = (uint8_t)((data_bytes >> 8) & 0xFFu);
+    header[42] = (uint8_t)((data_bytes >> 16) & 0xFFu);
+    header[43] = (uint8_t)((data_bytes >> 24) & 0xFFu);
+
+    if (fwrite(header, sizeof(header), 1, tf) != 1) {
+        fprintf(stderr, "Failed to write WAV header\n");
+        fclose(tf);
+        return 0;
+    }
+
+    if (sample_count > 0) {
+        if (fwrite(tape_recorder.audio_samples, sizeof(int16_t), sample_count, tf) != sample_count) {
+            fprintf(stderr, "Failed to write WAV data\n");
+            fclose(tf);
+            return 0;
+        }
+    }
+
+    if (fclose(tf) != 0) {
+        fprintf(stderr, "Failed to finalize tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
+        return 0;
+    }
+
+    return 1;
+}
+
+static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, uint32_t pause_ms, TapeBlock* out_block) {
+    if (!pulses || count == 0 || !out_block) {
+        return 0;
+    }
+
+    size_t index = 0;
+    size_t pilot_count = 0;
+    size_t search_index = 0;
+    size_t pilot_start = 0;
+    const int pilot_tolerance = tape_duration_tolerance(TAPE_PILOT_PULSE_TSTATES);
+    while (search_index < count) {
+        if (!tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES, pilot_tolerance)) {
+            ++search_index;
+            continue;
+        }
+
+        size_t run_start = search_index;
+        while (search_index < count && tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES, pilot_tolerance)) {
+            ++search_index;
+        }
+
+        pilot_count = search_index - run_start;
+        if (pilot_count >= 100) {
+            pilot_start = run_start;
+            index = search_index;
+            break;
+        }
+    }
+
+    if (pilot_count < 100) {
+        return 0;
+    }
+
+    if (index + 1 >= count) {
+        return 0;
+    }
+
+    double scale = 1.0;
+    if (pilot_count > 0) {
+        size_t sample_count = pilot_count;
+        if (sample_count > 4096) {
+            sample_count = 4096;
+        }
+        if (sample_count == 0) {
+            sample_count = 1;
+        }
+        uint64_t pilot_sum = 0;
+        for (size_t i = 0; i < sample_count; ++i) {
+            pilot_sum += pulses[pilot_start + i].duration;
+        }
+        double pilot_average = (double)pilot_sum / (double)sample_count;
+        if (pilot_average > 0.0) {
+            scale = pilot_average / (double)TAPE_PILOT_PULSE_TSTATES;
+            if (scale < 0.5) {
+                scale = 0.5;
+            } else if (scale > 2.0) {
+                scale = 2.0;
+            }
+        }
+    }
+
+    int sync1_reference = (int)((double)TAPE_SYNC_FIRST_PULSE_TSTATES * scale + 0.5);
+    int sync2_reference = (int)((double)TAPE_SYNC_SECOND_PULSE_TSTATES * scale + 0.5);
+    if (sync1_reference <= 0) {
+        sync1_reference = TAPE_SYNC_FIRST_PULSE_TSTATES;
+    }
+    if (sync2_reference <= 0) {
+        sync2_reference = TAPE_SYNC_SECOND_PULSE_TSTATES;
+    }
+
+    const int sync1_tolerance = tape_duration_tolerance(sync1_reference);
+    const int sync2_tolerance = tape_duration_tolerance(sync2_reference);
+    if (!tape_duration_matches(pulses[index].duration, sync1_reference, sync1_tolerance) ||
+        !tape_duration_matches(pulses[index + 1].duration, sync2_reference, sync2_tolerance)) {
+        return 0;
+    }
+
+    index += 2;
+
+    size_t data_limit = count;
+    while (data_limit > index && ((data_limit - index) % 2u) != 0u) {
+        --data_limit;
+    }
+
+    if (data_limit <= index) {
+        return 0;
+    }
+
+    size_t bit_pairs = (data_limit - index) / 2u;
+    while (bit_pairs > 0 && (bit_pairs % 8u) != 0u) {
+        data_limit -= 2u;
+        bit_pairs = (data_limit - index) / 2u;
+    }
+
+    if (bit_pairs == 0 || (bit_pairs % 8u) != 0u) {
+        return 0;
+    }
+
+    size_t byte_count = bit_pairs / 8u;
+    uint8_t* data = (uint8_t*)malloc(byte_count ? byte_count : 1u);
+    if (!data) {
+        return 0;
+    }
+    memset(data, 0, byte_count ? byte_count : 1u);
+
+    int bit0_reference = (int)((double)TAPE_BIT0_PULSE_TSTATES * scale + 0.5);
+    int bit1_reference = (int)((double)TAPE_BIT1_PULSE_TSTATES * scale + 0.5);
+    if (bit0_reference <= 0) {
+        bit0_reference = TAPE_BIT0_PULSE_TSTATES;
+    }
+    if (bit1_reference <= 0) {
+        bit1_reference = TAPE_BIT1_PULSE_TSTATES;
+    }
+
+    const int bit0_tolerance = tape_duration_tolerance(bit0_reference);
+    const int bit1_tolerance = tape_duration_tolerance(bit1_reference);
+    const int bit0_pair_reference = bit0_reference * 2;
+    const int bit1_pair_reference = bit1_reference * 2;
+    const int bit0_pair_tolerance = tape_duration_tolerance(bit0_pair_reference);
+    const int bit1_pair_tolerance = tape_duration_tolerance(bit1_pair_reference);
+
+    for (size_t byte_index = 0; byte_index < byte_count; ++byte_index) {
+        uint8_t value = 0;
+        for (int bit = 7; bit >= 0; --bit) {
+            if (index >= data_limit) {
+                free(data);
+                return 0;
+            }
+            uint32_t d1 = pulses[index].duration;
+            uint32_t d2 = pulses[index + 1].duration;
+            index += 2;
+            int is_one = tape_duration_matches(d1, bit1_reference, bit1_tolerance) &&
+                         tape_duration_matches(d2, bit1_reference, bit1_tolerance);
+            int is_zero = tape_duration_matches(d1, bit0_reference, bit0_tolerance) &&
+                          tape_duration_matches(d2, bit0_reference, bit0_tolerance);
+            uint32_t pair_sum = d1 + d2;
+            if (!is_one && !is_zero) {
+                int sum_diff_one = abs((int)pair_sum - bit1_pair_reference);
+                int sum_diff_zero = abs((int)pair_sum - bit0_pair_reference);
+                if (sum_diff_one <= bit1_pair_tolerance && sum_diff_one < sum_diff_zero) {
+                    is_one = 1;
+                } else if (sum_diff_zero <= bit0_pair_tolerance) {
+                    is_zero = 1;
+                } else {
+                    int score_one = abs((int)d1 - bit1_reference) + abs((int)d2 - bit1_reference);
+                    int score_zero = abs((int)d1 - bit0_reference) + abs((int)d2 - bit0_reference);
+                    if (score_one < score_zero && score_one <= bit1_tolerance * 4) {
+                        is_one = 1;
+                    } else if (score_zero <= score_one && score_zero <= bit0_tolerance * 4) {
+                        is_zero = 1;
+                    } else {
+                        free(data);
+                        return 0;
+                    }
+                }
+            }
+            if (is_one) {
+                value |= (uint8_t)(1u << bit);
+            }
+        }
+        data[byte_index] = value;
+    }
+
+    out_block->data = data;
+    out_block->length = (uint32_t)byte_count;
+    out_block->pause_ms = pause_ms;
+    return 1;
+}
+
+static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flush) {
+    if (!tape_recorder.block_active || tape_recorder.pulse_count == 0) {
+        if (force_flush) {
+            tape_recorder.block_active = 0;
+        }
+        return;
+    }
+
+    uint64_t idle_cycles = 0;
+    if (current_t_state > tape_recorder.last_transition_tstate) {
+        idle_cycles = current_t_state - tape_recorder.last_transition_tstate;
+    }
+
+    if (!force_flush && idle_cycles < TAPE_SILENCE_THRESHOLD_TSTATES) {
+        return;
+    }
+
+    uint32_t pause_ms = 1000u;
+    if (idle_cycles > 0) {
+        double pause = ((double)idle_cycles / CPU_CLOCK_HZ) * 1000.0;
+        if (pause > 0.0) {
+            if (pause > 10000.0) {
+                pause = 10000.0;
+            }
+            pause_ms = (uint32_t)(pause + 0.5);
+        }
+    }
+
+    size_t pulse_count = tape_recorder.pulse_count;
+    if (tape_recorder.output_format == TAPE_OUTPUT_TAP && pulse_count >= 100) {
+        TapeBlock block = {0};
+        if (!tape_decode_pulses_to_block(tape_recorder.pulses, pulse_count, pause_ms, &block)) {
+            fprintf(stderr, "Warning: failed to decode saved tape block (%zu pulses)\n", pulse_count);
+        } else {
+            if (!tape_image_add_block(&tape_recorder.recorded, block.data, block.length, block.pause_ms)) {
+                fprintf(stderr, "Warning: failed to store recorded tape block\n");
+            }
+            free(block.data);
+        }
+    }
+
+    tape_recorder_append_block_audio(idle_cycles);
+
+    tape_recorder.block_active = 0;
+    tape_recorder.pulse_count = 0;
+    tape_recorder.last_transition_tstate = current_t_state;
+}
+
+static void tape_recorder_handle_mic(uint64_t t_state, int level) {
+    if (!tape_recorder.enabled) {
+        return;
+    }
+
+    if (!tape_recorder.block_active) {
+        tape_recorder.block_active = 1;
+        tape_recorder.last_transition_tstate = t_state;
+        tape_recorder.last_level = level;
+        tape_recorder.block_start_level = level ? 1 : 0;
+        return;
+    }
+
+    if (level == tape_recorder.last_level) {
+        return;
+    }
+
+    uint64_t duration = 0;
+    if (t_state > tape_recorder.last_transition_tstate) {
+        duration = t_state - tape_recorder.last_transition_tstate;
+    }
+    if (!tape_recorder_append_pulse(duration)) {
+        fprintf(stderr, "Warning: failed to record tape pulse\n");
+    }
+    tape_recorder.last_transition_tstate = t_state;
+    tape_recorder.last_level = level;
+}
+
+static void tape_recorder_update(uint64_t current_t_state, int force_flush) {
+    if (!tape_recorder.enabled) {
+        return;
+    }
+    tape_recorder_finalize_block(current_t_state, force_flush);
+}
+
+static int tape_recorder_write_output(void) {
+    if (!tape_recorder.enabled || !tape_recorder.output_path) {
+        return 1;
+    }
+
+    if (tape_recorder.output_format == TAPE_OUTPUT_WAV) {
+        return tape_recorder_write_wav();
+    }
+
+    FILE* tf = fopen(tape_recorder.output_path, "wb");
+    if (!tf) {
+        fprintf(stderr, "Failed to open tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
+        return 0;
+    }
+
+    int success = 1;
+
+    if (tape_recorder.recorded.count > 0) {
+        for (size_t i = 0; i < tape_recorder.recorded.count && success; ++i) {
+            const TapeBlock* block = &tape_recorder.recorded.blocks[i];
+            uint16_t length = (uint16_t)block->length;
+            uint8_t length_bytes[2];
+            length_bytes[0] = (uint8_t)(length & 0xFFu);
+            length_bytes[1] = (uint8_t)((length >> 8) & 0xFFu);
+            if (fwrite(length_bytes, sizeof(length_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Failed to write TAP block length\n");
+                success = 0;
+                break;
+            }
+            if (length > 0 && block->data) {
+                if (fwrite(block->data, length, 1, tf) != 1) {
+                    fprintf(stderr, "Failed to write TAP block payload\n");
+                    success = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (fclose(tf) != 0) {
+        fprintf(stderr, "Failed to finalize tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
+        success = 0;
+    }
+
+    return success;
+}
+
+static void tape_shutdown(void) {
+    tape_recorder_update(total_t_states, 1);
+    (void)tape_recorder_write_output();
+    tape_free_image(&tape_playback.image);
+    tape_waveform_reset(&tape_playback.waveform);
+    tape_free_image(&tape_recorder.recorded);
+    tape_recorder_reset_pulses();
+    tape_recorder_reset_audio();
+}
+
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
     if (beeper_cycles_per_sample <= 0.0) {
         return 0;
@@ -707,23 +2073,25 @@ static void beeper_push_event(uint64_t t_state, int level) {
 
 void io_write(uint16_t port, uint8_t value) {
     if ((port & 1) == 0) { // ULA Port FE
-        border_color_idx = value & 0x07;
-
-        int new_beeper_state = (value >> 4) & 0x01;
-
-        if (new_beeper_state != beeper_state) {
-            beeper_state = new_beeper_state;
-            beeper_push_event(total_t_states, beeper_state);
-        }
+        ula_queue_port_value(value);
     }
-    (void)port; (void)value;
+    (void)port;
+    (void)value;
 }
 uint8_t io_read(uint16_t port) {
     if ((port & 1) == 0) {
+        tape_update(total_t_states);
+        tape_recorder_update(total_t_states, 0);
+
         uint8_t result = 0xFF;
         uint8_t high_byte = (port >> 8) & 0xFF;
         for (int row = 0; row < 8; ++row) { if (! (high_byte & (1 << row)) ) { result &= keyboard_matrix[row]; } }
-        result |= 0xA0; // Set tape/unused bits high
+        if (tape_ear_state) {
+            result |= 0x40;
+        } else {
+            result &= (uint8_t)~0x40;
+        }
+        result |= 0xA0; // Set unused bits high
         // printf("IO Read Port 0x%04X (ULA/Keyboard): AddrHi=0x%02X -> Result=0x%02X\n", port, high_byte, result); // DEBUG
         return result;
     }
@@ -870,11 +2238,14 @@ int cpu_interrupt(Z80* cpu, uint16_t vector_addr) {
 
 // --- The Main CPU Execution Step ---
 int cpu_step(Z80* cpu) { // Returns T-states
+    ula_instruction_progress_ptr = NULL;
     if (cpu->ei_delay) { cpu->iff1 = cpu->iff2 = 1; cpu->ei_delay = 0; }
     if (cpu->halted) { cpu->reg_R = (cpu->reg_R+1)|(cpu->reg_R&0x80); return 4; }
 
     int prefix=0;
     int t_states = 0;
+    ula_instruction_base_tstate = total_t_states;
+    ula_instruction_progress_ptr = &t_states;
     cpu->reg_R=(cpu->reg_R+1)|(cpu->reg_R&0x80);
     uint8_t opcode=readByte(cpu->reg_PC++);
     t_states += 4;
@@ -1063,6 +2434,7 @@ int cpu_step(Z80* cpu) { // Returns T-states
         case 0x76: cpu->halted=1; break;
         default: if(prefix)cpu->reg_PC--; printf("Error: Unknown opcode: 0x%s%02X at address 0x%04X\n",(prefix==1?"DD":(prefix==2?"FD":"")),opcode,cpu->reg_PC-1); exit(1);
     }
+    ula_instruction_progress_ptr = NULL;
     return t_states;
 }
 
@@ -1294,18 +2666,71 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [rom_file]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
                 return 1;
             }
             audio_dump_path = argv[++i];
         } else if (strcmp(argv[i], "--beeper-log") == 0) {
             beeper_logging_enabled = 1;
+        } else if (strcmp(argv[i], "--tap") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
+            if (tape_input_format != TAPE_FORMAT_NONE) {
+                fprintf(stderr, "Only one tape image may be specified\n");
+                return 1;
+            }
+            tape_input_format = TAPE_FORMAT_TAP;
+            tape_input_path = argv[++i];
+        } else if (strcmp(argv[i], "--tzx") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
+            if (tape_input_format != TAPE_FORMAT_NONE) {
+                fprintf(stderr, "Only one tape image may be specified\n");
+                return 1;
+            }
+            tape_input_format = TAPE_FORMAT_TZX;
+            tape_input_path = argv[++i];
+        } else if (strcmp(argv[i], "--wav") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
+            if (tape_input_format != TAPE_FORMAT_NONE) {
+                fprintf(stderr, "Only one tape image may be specified\n");
+                return 1;
+            }
+            tape_input_format = TAPE_FORMAT_WAV;
+            tape_input_path = argv[++i];
+        } else if (strcmp(argv[i], "--save-tap") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
+            if (tape_recorder.enabled) {
+                fprintf(stderr, "Only one tape recording output may be specified\n");
+                return 1;
+            }
+            tape_recorder_enable(argv[++i], TAPE_OUTPUT_TAP);
+        } else if (strcmp(argv[i], "--save-wav") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
+            if (tape_recorder.enabled) {
+                fprintf(stderr, "Only one tape recording output may be specified\n");
+                return 1;
+            }
+            tape_recorder_enable(argv[++i], TAPE_OUTPUT_WAV);
         } else if (!rom_filename) {
             rom_filename = argv[i];
             rom_provided = 1;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [rom_file]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
             return 1;
         }
     }
@@ -1343,11 +2768,50 @@ int main(int argc, char *argv[]) {
     printf("Loaded %zu bytes from %s\n", br, rom_log_path);
     free(rom_fallback_path);
 
-    if(!init_sdl()){cleanup_sdl();return 1;}
+    if (tape_input_format != TAPE_FORMAT_NONE && tape_input_path) {
+        if (tape_input_format == TAPE_FORMAT_WAV) {
+            if (!tape_load_wav(tape_input_path, &tape_playback)) {
+                tape_waveform_reset(&tape_playback.waveform);
+                return 1;
+            }
+            printf("Loaded WAV tape %s (%zu transitions @ %u Hz)\n",
+                   tape_input_path,
+                   tape_playback.waveform.count,
+                   (unsigned)tape_playback.waveform.sample_rate);
+            if (tape_playback.waveform.count == 0) {
+                fprintf(stderr, "Warning: WAV tape '%s' contains no transitions\n", tape_input_path);
+                tape_input_enabled = 0;
+            } else {
+                tape_input_enabled = 1;
+            }
+        } else {
+            tape_playback.format = tape_input_format;
+            tape_waveform_reset(&tape_playback.waveform);
+            if (!tape_load_image(tape_input_path, tape_input_format, &tape_playback.image)) {
+                tape_free_image(&tape_playback.image);
+                return 1;
+            }
+            printf("Loaded tape image %s (%zu blocks)\n", tape_input_path, tape_playback.image.count);
+            if (tape_playback.image.count == 0) {
+                fprintf(stderr, "Warning: tape image '%s' is empty\n", tape_input_path);
+                tape_input_enabled = 0;
+            } else {
+                tape_input_enabled = 1;
+            }
+        }
+    } else {
+        tape_input_enabled = 0;
+    }
+
+    if(!init_sdl()){tape_shutdown();cleanup_sdl();return 1;}
 
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
     cpu.halted = 0; cpu.ei_delay = 0;
     total_t_states = 0;
+
+    if (tape_input_enabled) {
+        tape_start_playback(&tape_playback, total_t_states);
+    }
 
     if (audio_available) {
         SDL_LockAudio();
@@ -1455,6 +2919,10 @@ int main(int argc, char *argv[]) {
             frame_t_state_accumulator += t_states;
             total_t_states += t_states;
 
+            ula_process_port_events(total_t_states);
+            tape_update(total_t_states);
+            tape_recorder_update(total_t_states, 0);
+
             if (audio_available && latency_poll_threshold > 0) {
                 latency_poll_cycles += t_states;
                 if (latency_poll_cycles >= latency_poll_threshold) {
@@ -1487,5 +2955,55 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Emulation finished.\nFinal State:\nPC:%04X SP:%04X AF:%04X BC:%04X DE:%04X HL:%04X IX:%04X IY:%04X\n",cpu.reg_PC,cpu.reg_SP,get_AF(&cpu),get_BC(&cpu),get_DE(&cpu),get_HL(&cpu),cpu.reg_IX,cpu.reg_IY);
+    tape_shutdown();
     cleanup_sdl(); return 0;
 }
+static void ula_queue_port_value(uint8_t value) {
+    uint64_t event_t_state = total_t_states;
+    if (ula_instruction_progress_ptr) {
+        event_t_state = ula_instruction_base_tstate + (uint64_t)(*ula_instruction_progress_ptr);
+    }
+
+    if (ula_write_count > 0) {
+        uint64_t previous_t_state = ula_write_queue[ula_write_count - 1].t_state;
+        if (event_t_state < previous_t_state) {
+            event_t_state = previous_t_state;
+        }
+    }
+
+    if (ula_write_count < (sizeof(ula_write_queue) / sizeof(ula_write_queue[0]))) {
+        ula_write_queue[ula_write_count].value = value;
+        ula_write_queue[ula_write_count].t_state = event_t_state;
+        ula_write_count++;
+    } else {
+        memmove(&ula_write_queue[0], &ula_write_queue[1], (ula_write_count - 1) * sizeof(UlaWriteEvent));
+        ula_write_queue[ula_write_count - 1].value = value;
+        ula_write_queue[ula_write_count - 1].t_state = event_t_state;
+    }
+}
+
+static void ula_process_port_events(uint64_t current_t_state) {
+    if (ula_write_count == 0) {
+        return;
+    }
+
+    (void)current_t_state;
+
+    for (size_t i = 0; i < ula_write_count; ++i) {
+        uint8_t value = ula_write_queue[i].value;
+        uint64_t event_t_state = ula_write_queue[i].t_state;
+        border_color_idx = value & 0x07;
+
+        int new_beeper_state = (value >> 4) & 0x01;
+        if (new_beeper_state != beeper_state) {
+            beeper_state = new_beeper_state;
+            beeper_push_event(event_t_state, beeper_state);
+        }
+
+        int mic_level = (value >> 3) & 0x01;
+        tape_recorder_handle_mic(event_t_state, mic_level);
+    }
+
+    ula_write_count = 0;
+}
+
