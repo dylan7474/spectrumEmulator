@@ -39,6 +39,7 @@ uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 volatile int beeper_state = 0; // 0 = low, 1 = high
 const int AUDIO_AMPLITUDE = 2000;
 static const double BEEPER_IDLE_RESET_SAMPLES = 512.0;
+static const double BEEPER_REWIND_TOLERANCE_SAMPLES = 8.0;
 int audio_sample_rate = 44100;
 int audio_available = 0;
 
@@ -75,6 +76,7 @@ static int beeper_idle_log_active = 0;
 static uint64_t beeper_idle_reset_count = 0;
 
 static size_t beeper_pending_event_count(void);
+static void beeper_force_resync(uint64_t sync_t_state);
 
 // --- Timing Globals ---
 uint64_t total_t_states = 0; // A global clock for the entire CPU
@@ -169,6 +171,18 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
     beeper_hp_last_input = baseline;
     beeper_hp_last_output = 0.0;
     beeper_state = current_level ? 1 : 0;
+    beeper_idle_log_active = 0;
+}
+
+static void beeper_force_resync(uint64_t sync_t_state) {
+    double baseline = (beeper_playback_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+    beeper_event_head = 0;
+    beeper_event_tail = 0;
+    beeper_playback_position = (double)sync_t_state;
+    beeper_writer_cursor = (double)sync_t_state;
+    beeper_last_event_t_state = sync_t_state;
+    beeper_hp_last_input = baseline;
+    beeper_hp_last_output = 0.0;
     beeper_idle_log_active = 0;
 }
 
@@ -485,6 +499,30 @@ static void beeper_push_event(uint64_t t_state, int level) {
     int was_idle = beeper_idle_log_active;
     double playback_snapshot = beeper_playback_position;
     size_t pending_before = beeper_pending_event_count();
+    if (beeper_cycles_per_sample > 0.0) {
+        double event_offset_cycles = (double)t_state - playback_snapshot;
+        double rewind_threshold_cycles =
+            beeper_cycles_per_sample * BEEPER_REWIND_TOLERANCE_SAMPLES;
+
+        if (event_offset_cycles < -rewind_threshold_cycles) {
+            double rewind_samples = 0.0;
+            if (beeper_cycles_per_sample > 0.0) {
+                rewind_samples = -event_offset_cycles / beeper_cycles_per_sample;
+            }
+
+            fprintf(stderr,
+                    "[BEEPER] timeline rewind detected: event at %llu is %.2f samples behind playback %.0f (pending %zu); resyncing audio state\n",
+                    (unsigned long long)t_state,
+                    rewind_samples,
+                    playback_snapshot,
+                    pending_before);
+
+            beeper_force_resync(t_state);
+            playback_snapshot = beeper_playback_position;
+            pending_before = 0;
+            was_idle = 0;
+        }
+    }
 
     if (beeper_cycles_per_sample > 0.0) {
         double playback_position_snapshot = beeper_playback_position;
