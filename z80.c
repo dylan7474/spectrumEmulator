@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
+#include <stdbool.h>
 #include <SDL.h>
 
 // --- Z80 Flag Register Bits ---
@@ -89,6 +91,60 @@ const uint32_t spectrum_bright_colors[8] = {0x000000FF,0x0000FFFF,0xFF0000FF,0xF
 // --- Keyboard State ---
 uint8_t keyboard_matrix[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+// --- BASIC Autoload Support ---
+static const char *default_rom_filename = "48.rom";
+
+#define ZX_SYSVAR_PROG   0x5C53
+#define ZX_SYSVAR_VARS   0x5C55
+#define ZX_SYSVAR_DATADD 0x5C57
+#define ZX_SYSVAR_E_LINE 0x5C59
+#define ZX_SYSVAR_STKBOT 0x5C5B
+#define ZX_SYSVAR_STKEND 0x5C5D
+#define ZX_SYSVAR_RAMTOP 0x5CB2
+
+typedef struct {
+    uint16_t line_number;
+    uint8_t *bytes;
+    size_t length;
+} BasicSourceLine;
+
+typedef struct {
+    uint8_t code;
+    char name[12];
+    size_t length;
+} BasicTokenEntry;
+
+typedef struct {
+    const char *alias;
+    const char *canonical;
+    uint8_t code;
+} BasicTokenAlias;
+
+static BasicTokenEntry basic_token_entries[91];
+static size_t basic_token_count = 0;
+
+static BasicTokenAlias basic_token_aliases[] = {
+    {"GOTO", "GO TO", 0},
+    {"GOSUB", "GO SUB", 0},
+    {"OPEN#", "OPEN #", 0},
+    {"CLOSE#", "CLOSE #", 0}
+};
+
+static uint8_t *basic_program_image = NULL;
+static size_t basic_program_size = 0;
+static char *basic_program_label = NULL;
+static int basic_program_pending = 0;
+static uint64_t basic_program_install_tstate = 0;
+
+static char *build_executable_relative_path(const char *executable_path, const char *filename);
+static void basic_token_build_table(void);
+static int basic_token_find_code(const char *name, uint8_t *out_code);
+static void basic_free_program_image(void);
+static char *basic_strdup(const char *src);
+static int basic_load_program_file(const char *path);
+static void basic_install_program_if_ready(void);
+static int basic_parse_source_line(const char *text, BasicSourceLine *out_line);
+static void basic_free_source_line(BasicSourceLine *line);
 // --- Z80 CPU State ---
 typedef struct Z80 {
     // 8-bit Main Registers
@@ -144,6 +200,572 @@ static int audio_dump_start(const char* path, uint32_t sample_rate);
 static void audio_dump_write_samples(const Sint16* samples, size_t count);
 static void audio_dump_finish(void);
 static void audio_dump_abort(void);
+
+
+// --- BASIC Autoload Implementation ---
+static char *build_executable_relative_path(const char *executable_path, const char *filename) {
+    if (!executable_path || !filename) {
+        return NULL;
+    }
+
+    const char *last_sep = strrchr(executable_path, '/');
+#ifdef _WIN32
+    const char *last_backslash = strrchr(executable_path, '\\');
+    if (!last_sep || (last_backslash && last_backslash > last_sep)) {
+        last_sep = last_backslash;
+    }
+#endif
+    if (!last_sep) {
+        return NULL;
+    }
+
+    size_t dir_len = (size_t)(last_sep - executable_path + 1);
+    size_t name_len = strlen(filename);
+    char *joined = (char *)malloc(dir_len + name_len + 1);
+    if (!joined) {
+        return NULL;
+    }
+    memcpy(joined, executable_path, dir_len);
+    memcpy(joined + dir_len, filename, name_len + 1);
+    return joined;
+}
+
+static int basic_is_identifier_char(int c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '$';
+}
+
+static char *basic_strdup(const char *src) {
+    if (!src) {
+        return NULL;
+    }
+    size_t len = strlen(src);
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) {
+        return NULL;
+    }
+    memcpy(copy, src, len + 1);
+    return copy;
+}
+
+static void basic_free_program_image(void) {
+    if (basic_program_image) {
+        free(basic_program_image);
+        basic_program_image = NULL;
+    }
+    basic_program_size = 0;
+    basic_program_pending = 0;
+    if (basic_program_label) {
+        free(basic_program_label);
+        basic_program_label = NULL;
+    }
+}
+
+static void basic_token_build_table(void) {
+    if (basic_token_count > 0) {
+        return;
+    }
+
+    size_t idx = 0x0096;
+    unsigned int code = 0xA5;
+    while (code <= 0xFF && idx < 0x4000) {
+        BasicTokenEntry entry = {0};
+        entry.code = (uint8_t)code;
+        size_t len = 0;
+        while (idx < 0x4000) {
+            uint8_t raw = memory[idx++];
+            char ch = (char)(raw & 0x7F);
+            if (len + 1 < sizeof(entry.name)) {
+                entry.name[len++] = ch;
+            }
+            if (raw & 0x80) {
+                break;
+            }
+        }
+        entry.name[len < sizeof(entry.name) ? len : sizeof(entry.name) - 1] = '\0';
+        entry.length = strlen(entry.name);
+        basic_token_entries[basic_token_count++] = entry;
+        code++;
+    }
+
+    for (size_t i = 0; i < sizeof(basic_token_aliases) / sizeof(basic_token_aliases[0]); ++i) {
+        uint8_t alias_code = 0;
+        if (basic_token_find_code(basic_token_aliases[i].canonical, &alias_code)) {
+            basic_token_aliases[i].code = alias_code;
+        }
+    }
+}
+
+static int basic_token_find_code(const char *name, uint8_t *out_code) {
+    basic_token_build_table();
+    for (size_t i = 0; i < basic_token_count; ++i) {
+        if (strcmp(basic_token_entries[i].name, name) == 0) {
+            if (out_code) {
+                *out_code = basic_token_entries[i].code;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int basic_match_token(const char *text, size_t text_len, size_t pos, uint8_t *out_code, size_t *out_length) {
+    basic_token_build_table();
+
+    size_t best_len = 0;
+    uint8_t best_code = 0;
+
+    for (size_t i = 0; i < basic_token_count; ++i) {
+        const BasicTokenEntry *entry = &basic_token_entries[i];
+        size_t name_len = entry->length;
+        if (name_len == 0 || pos + name_len > text_len) {
+            continue;
+        }
+        size_t j;
+        for (j = 0; j < name_len; ++j) {
+            char expected = entry->name[j];
+            char c = text[pos + j];
+            if (expected == ' ') {
+                if (c != ' ') {
+                    break;
+                }
+            } else {
+                if (toupper((unsigned char)c) != expected) {
+                    break;
+                }
+            }
+        }
+        if (j != name_len) {
+            continue;
+        }
+
+        char prev = (pos == 0) ? '\0' : text[pos - 1];
+        char next = (pos + name_len >= text_len) ? '\0' : text[pos + name_len];
+        if ((pos > 0) && basic_is_identifier_char(prev)) {
+            continue;
+        }
+        if ((pos + name_len < text_len) && basic_is_identifier_char(next)) {
+            continue;
+        }
+
+        if (name_len > best_len) {
+            best_len = name_len;
+            best_code = entry->code;
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(basic_token_aliases) / sizeof(basic_token_aliases[0]); ++i) {
+        uint8_t code = basic_token_aliases[i].code;
+        const char *alias = basic_token_aliases[i].alias;
+        size_t alias_len = strlen(alias);
+        if (!code || alias_len == 0 || pos + alias_len > text_len) {
+            continue;
+        }
+        size_t j;
+        for (j = 0; j < alias_len; ++j) {
+            char expected = alias[j];
+            char c = text[pos + j];
+            if (toupper((unsigned char)c) != expected) {
+                break;
+            }
+        }
+        if (j != alias_len) {
+            continue;
+        }
+        char prev = (pos == 0) ? '\0' : text[pos - 1];
+        char next = (pos + alias_len >= text_len) ? '\0' : text[pos + alias_len];
+        if ((pos > 0) && basic_is_identifier_char(prev)) {
+            continue;
+        }
+        if ((pos + alias_len < text_len) && basic_is_identifier_char(next)) {
+            continue;
+        }
+
+        if (alias_len > best_len) {
+            best_len = alias_len;
+            best_code = code;
+        }
+    }
+
+    if (best_len == 0) {
+        return 0;
+    }
+
+    if (out_code) {
+        *out_code = best_code;
+    }
+    if (out_length) {
+        *out_length = best_len;
+    }
+    return 1;
+}
+
+static int basic_line_append_byte(uint8_t **buffer, size_t *length, size_t *capacity, uint8_t byte) {
+    if (*length + 1 > *capacity) {
+        size_t new_capacity = (*capacity == 0) ? 32 : (*capacity * 2);
+        uint8_t *new_buffer = (uint8_t *)realloc(*buffer, new_capacity);
+        if (!new_buffer) {
+            return 0;
+        }
+        *buffer = new_buffer;
+        *capacity = new_capacity;
+    }
+    (*buffer)[(*length)++] = byte;
+    return 1;
+}
+
+static void basic_free_source_line(BasicSourceLine *line) {
+    if (!line) {
+        return;
+    }
+    if (line->bytes) {
+        free(line->bytes);
+        line->bytes = NULL;
+    }
+    line->length = 0;
+    line->line_number = 0;
+}
+
+static int basic_parse_source_line(const char *text, BasicSourceLine *out_line) {
+    uint8_t *buffer = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+
+    size_t text_len = strlen(text);
+    size_t pos = 0;
+    int in_string = 0;
+    int in_rem = 0;
+
+    while (pos < text_len) {
+        char c = text[pos];
+        if (c == '\r') {
+            pos++;
+            continue;
+        }
+
+        if (!in_string && !in_rem && c == '"') {
+            if (!basic_line_append_byte(&buffer, &length, &capacity, '"')) {
+                basic_free_source_line(out_line);
+                free(buffer);
+                return 0;
+            }
+            in_string = 1;
+            pos++;
+            continue;
+        }
+
+        if (in_string) {
+            if (!basic_line_append_byte(&buffer, &length, &capacity, (uint8_t)c)) {
+                basic_free_source_line(out_line);
+                free(buffer);
+                return 0;
+            }
+            if (c == '"') {
+                in_string = 0;
+            }
+            pos++;
+            continue;
+        }
+
+        if (in_rem) {
+            if (!basic_line_append_byte(&buffer, &length, &capacity, (uint8_t)c)) {
+                basic_free_source_line(out_line);
+                free(buffer);
+                return 0;
+            }
+            pos++;
+            continue;
+        }
+
+        uint8_t token_code = 0;
+        size_t token_len = 0;
+        if (basic_match_token(text, text_len, pos, &token_code, &token_len)) {
+            if (!basic_line_append_byte(&buffer, &length, &capacity, token_code)) {
+                basic_free_source_line(out_line);
+                free(buffer);
+                return 0;
+            }
+            if (token_code == 0xEA) {
+                in_rem = 1;
+            }
+            pos += token_len;
+            continue;
+        }
+
+        if (c == ' ') {
+            if (!basic_line_append_byte(&buffer, &length, &capacity, (uint8_t)c)) {
+                basic_free_source_line(out_line);
+                free(buffer);
+                return 0;
+            }
+            pos++;
+            continue;
+        }
+
+        if (!basic_line_append_byte(&buffer, &length, &capacity, (uint8_t)(in_rem ? c : toupper((unsigned char)c)))) {
+            basic_free_source_line(out_line);
+            free(buffer);
+            return 0;
+        }
+        pos++;
+    }
+
+    if (!basic_line_append_byte(&buffer, &length, &capacity, 0x0D)) {
+        free(buffer);
+        return 0;
+    }
+
+    out_line->bytes = buffer;
+    out_line->length = length;
+    return 1;
+}
+
+static int basic_load_program_file(const char *path) {
+    basic_free_program_image();
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        perror("BASIC open error");
+        return 0;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return 0;
+    }
+    long file_size = ftell(fp);
+    if (file_size < 0) {
+        fclose(fp);
+        return 0;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return 0;
+    }
+
+    char *file_data = (char *)malloc((size_t)file_size + 1);
+    if (!file_data) {
+        fclose(fp);
+        return 0;
+    }
+    size_t read_bytes = fread(file_data, 1, (size_t)file_size, fp);
+    fclose(fp);
+    if (read_bytes != (size_t)file_size) {
+        free(file_data);
+        return 0;
+    }
+    file_data[file_size] = '\0';
+
+    BasicSourceLine *lines = NULL;
+    size_t line_count = 0;
+    size_t line_capacity = 0;
+
+    size_t offset = 0;
+    while (offset < (size_t)file_size) {
+        size_t line_start = offset;
+        while (offset < (size_t)file_size && file_data[offset] != '\n' && file_data[offset] != '\r') {
+            offset++;
+        }
+        size_t line_len = offset - line_start;
+        while (offset < (size_t)file_size && (file_data[offset] == '\n' || file_data[offset] == '\r')) {
+            offset++;
+        }
+
+        size_t begin = 0;
+        while (begin < line_len && isspace((unsigned char)file_data[line_start + begin])) {
+            begin++;
+        }
+        size_t end = line_len;
+        while (end > begin && isspace((unsigned char)file_data[line_start + end - 1])) {
+            end--;
+        }
+        if (begin >= end) {
+            continue;
+        }
+
+        size_t line_text_len = end - begin;
+        char *line_text = (char *)malloc(line_text_len + 1);
+        if (!line_text) {
+            free(file_data);
+            for (size_t i = 0; i < line_count; ++i) {
+                basic_free_source_line(&lines[i]);
+            }
+            free(lines);
+            return 0;
+        }
+        memcpy(line_text, &file_data[line_start + begin], line_text_len);
+        line_text[line_text_len] = '\0';
+
+        char *cursor = line_text;
+        char *endptr = NULL;
+        errno = 0;
+        long line_number = strtol(cursor, &endptr, 10);
+        if (errno != 0 || line_number < 0 || line_number > 9999) {
+            fprintf(stderr, "Invalid BASIC line number near: %s\n", line_text);
+            free(line_text);
+            free(file_data);
+            for (size_t i = 0; i < line_count; ++i) {
+                basic_free_source_line(&lines[i]);
+            }
+            free(lines);
+            return 0;
+        }
+        while (endptr && isspace((unsigned char)*endptr)) {
+            endptr++;
+        }
+        if (!endptr || *endptr == '\0') {
+            BasicSourceLine empty_line = {0};
+            if (!basic_parse_source_line("", &empty_line)) {
+                free(line_text);
+                free(file_data);
+                for (size_t i = 0; i < line_count; ++i) {
+                    basic_free_source_line(&lines[i]);
+                }
+                free(lines);
+                return 0;
+            }
+            empty_line.line_number = (uint16_t)line_number;
+            if (line_count == line_capacity) {
+                size_t new_capacity = (line_capacity == 0) ? 8 : line_capacity * 2;
+                BasicSourceLine *new_lines = (BasicSourceLine *)realloc(lines, new_capacity * sizeof(BasicSourceLine));
+                if (!new_lines) {
+                    basic_free_source_line(&empty_line);
+                    free(line_text);
+                    free(file_data);
+                    for (size_t i = 0; i < line_count; ++i) {
+                        basic_free_source_line(&lines[i]);
+                    }
+                    free(lines);
+                    return 0;
+                }
+                lines = new_lines;
+                line_capacity = new_capacity;
+            }
+            lines[line_count++] = empty_line;
+            free(line_text);
+            continue;
+        }
+
+        BasicSourceLine parsed = {0};
+        if (!basic_parse_source_line(endptr, &parsed)) {
+            free(line_text);
+            free(file_data);
+            for (size_t i = 0; i < line_count; ++i) {
+                basic_free_source_line(&lines[i]);
+            }
+            free(lines);
+            return 0;
+        }
+        parsed.line_number = (uint16_t)line_number;
+
+        if (line_count == line_capacity) {
+            size_t new_capacity = (line_capacity == 0) ? 8 : line_capacity * 2;
+            BasicSourceLine *new_lines = (BasicSourceLine *)realloc(lines, new_capacity * sizeof(BasicSourceLine));
+            if (!new_lines) {
+                basic_free_source_line(&parsed);
+                free(line_text);
+                free(file_data);
+                for (size_t i = 0; i < line_count; ++i) {
+                    basic_free_source_line(&lines[i]);
+                }
+                free(lines);
+                return 0;
+            }
+            lines = new_lines;
+            line_capacity = new_capacity;
+        }
+        lines[line_count++] = parsed;
+        free(line_text);
+    }
+
+    free(file_data);
+
+    if (line_count == 0) {
+        fprintf(stderr, "No BASIC lines found in %s\n", path);
+        free(lines);
+        return 0;
+    }
+
+    size_t total_size = 2;
+    for (size_t i = 0; i < line_count; ++i) {
+        total_size += 4 + lines[i].length;
+    }
+
+    uint8_t *program = (uint8_t *)malloc(total_size);
+    if (!program) {
+        for (size_t i = 0; i < line_count; ++i) {
+            basic_free_source_line(&lines[i]);
+        }
+        free(lines);
+        return 0;
+    }
+
+    size_t cursor = 0;
+    for (size_t i = 0; i < line_count; ++i) {
+        uint16_t line_number = lines[i].line_number;
+        uint16_t line_length = (uint16_t)lines[i].length;
+
+        program[cursor++] = (uint8_t)((line_number >> 8) & 0xFF);
+        program[cursor++] = (uint8_t)(line_number & 0xFF);
+        program[cursor++] = (uint8_t)(line_length & 0xFF);
+        program[cursor++] = (uint8_t)((line_length >> 8) & 0xFF);
+        memcpy(&program[cursor], lines[i].bytes, lines[i].length);
+        cursor += lines[i].length;
+    }
+    program[cursor++] = 0x00;
+    program[cursor++] = 0x00;
+
+    for (size_t i = 0; i < line_count; ++i) {
+        basic_free_source_line(&lines[i]);
+    }
+    free(lines);
+
+    basic_program_image = program;
+    basic_program_size = total_size;
+    basic_program_pending = 1;
+    basic_program_install_tstate = (uint64_t)(CPU_CLOCK_HZ * 2.0);
+    basic_program_label = basic_strdup(path);
+    if (!basic_program_label) {
+        basic_program_label = basic_strdup("BASIC script");
+    }
+
+    return 1;
+}
+
+static void basic_install_program_if_ready(void) {
+    if (!basic_program_pending || !basic_program_image) {
+        return;
+    }
+    if (total_t_states < basic_program_install_tstate) {
+        return;
+    }
+
+    uint16_t prog_start = (uint16_t)(memory[ZX_SYSVAR_PROG] | (memory[ZX_SYSVAR_PROG + 1] << 8));
+    uint16_t ramtop = (uint16_t)(memory[ZX_SYSVAR_RAMTOP] | (memory[ZX_SYSVAR_RAMTOP + 1] << 8));
+    uint16_t end_address = (uint16_t)(prog_start + basic_program_size);
+
+    if (end_address >= ramtop) {
+        fprintf(stderr, "BASIC program does not fit in RAM (needs %zu bytes)\n", basic_program_size);
+        basic_free_program_image();
+        return;
+    }
+
+    memcpy(&memory[prog_start], basic_program_image, basic_program_size);
+
+    memory[ZX_SYSVAR_VARS] = (uint8_t)(end_address & 0xFF);
+    memory[ZX_SYSVAR_VARS + 1] = (uint8_t)(end_address >> 8);
+    memory[ZX_SYSVAR_DATADD] = (uint8_t)(end_address & 0xFF);
+    memory[ZX_SYSVAR_DATADD + 1] = (uint8_t)(end_address >> 8);
+    memory[ZX_SYSVAR_E_LINE] = (uint8_t)(end_address & 0xFF);
+    memory[ZX_SYSVAR_E_LINE + 1] = (uint8_t)(end_address >> 8);
+    memory[ZX_SYSVAR_STKBOT] = (uint8_t)(end_address & 0xFF);
+    memory[ZX_SYSVAR_STKBOT + 1] = (uint8_t)(end_address >> 8);
+    memory[ZX_SYSVAR_STKEND] = (uint8_t)(end_address & 0xFF);
+    memory[ZX_SYSVAR_STKEND + 1] = (uint8_t)(end_address >> 8);
+
+    printf("Loaded BASIC program (%zu bytes) from %s\n", basic_program_size, basic_program_label ? basic_program_label : "source");
+
+    basic_free_program_image();
+}
 
 
 // --- Memory Access Helpers ---
@@ -1221,42 +1843,71 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 // --- Main Program ---
 int main(int argc, char *argv[]) {
     const char* rom_filename = NULL;
+    const char* basic_source_path = NULL;
+    int rom_provided = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--basic <program.bas>] [rom_file]\n", argv[0]);
                 return 1;
             }
             audio_dump_path = argv[++i];
+        } else if (strcmp(argv[i], "--basic") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--basic <program.bas>] [rom_file]\n", argv[0]);
+                return 1;
+            }
+            basic_source_path = argv[++i];
         } else if (!rom_filename) {
             rom_filename = argv[i];
+            rom_provided = 1;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--basic <program.bas>] [rom_file]\n", argv[0]);
             return 1;
         }
     }
 
     if (!rom_filename) {
-        fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] <rom_file>\n", argv[0]);
-        return 1;
+        rom_filename = default_rom_filename;
     }
 
     FILE* rf = fopen(rom_filename, "rb");
+    char *rom_fallback_path = NULL;
+    const char *rom_log_path = rom_filename;
+    if (!rf && !rom_provided) {
+        rom_fallback_path = build_executable_relative_path(argv[0], rom_filename);
+        if (rom_fallback_path) {
+            rf = fopen(rom_fallback_path, "rb");
+            if (rf) {
+                rom_log_path = rom_fallback_path;
+            }
+        }
+    }
     if (!rf) {
         perror("ROM open error");
-        fprintf(stderr, "File: %s\n", rom_filename);
+        fprintf(stderr, "File: %s\n", rom_log_path);
+        free(rom_fallback_path);
         return 1;
     }
     size_t br = fread(memory, 1, 0x4000, rf);
     if (br != 0x4000) {
         fprintf(stderr, "ROM read error(%zu)\n", br);
         fclose(rf);
+        free(rom_fallback_path);
         return 1;
     }
     fclose(rf);
-    printf("Loaded %zu bytes from %s\n", br, rom_filename);
+    printf("Loaded %zu bytes from %s\n", br, rom_log_path);
+    free(rom_fallback_path);
+
+    if (basic_source_path) {
+        if (!basic_load_program_file(basic_source_path)) {
+            return 1;
+        }
+        printf("Queued BASIC autoload from %s\n", basic_source_path);
+    }
     if(!init_sdl()){cleanup_sdl();return 1;}
 
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
@@ -1369,6 +2020,8 @@ int main(int argc, char *argv[]) {
             frame_t_state_accumulator += t_states;
             total_t_states += t_states;
 
+            basic_install_program_if_ready();
+
             if (audio_available && latency_poll_threshold > 0) {
                 latency_poll_cycles += t_states;
                 if (latency_poll_cycles >= latency_poll_threshold) {
@@ -1401,5 +2054,6 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Emulation finished.\nFinal State:\nPC:%04X SP:%04X AF:%04X BC:%04X DE:%04X HL:%04X IX:%04X IY:%04X\n",cpu.reg_PC,cpu.reg_SP,get_AF(&cpu),get_BC(&cpu),get_DE(&cpu),get_HL(&cpu),cpu.reg_IX,cpu.reg_IY);
+    basic_free_program_image();
     cleanup_sdl(); return 0;
 }
