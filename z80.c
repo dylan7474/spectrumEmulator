@@ -459,6 +459,12 @@ static size_t beeper_catch_up_to(double catch_up_position, double playback_posit
 }
 
 static void beeper_push_event(uint64_t t_state, int level) {
+    int locked_audio = 0;
+    if (audio_available) {
+        SDL_LockAudio();
+        locked_audio = 1;
+    }
+
     if (beeper_cycles_per_sample > 0.0) {
         double playback_position_snapshot = beeper_playback_position;
         double latency_cycles = (double)t_state - playback_position_snapshot;
@@ -496,6 +502,46 @@ static void beeper_push_event(uint64_t t_state, int level) {
                 if (catch_up_cycles > beeper_last_event_t_state) {
                     beeper_last_event_t_state = catch_up_cycles;
                 }
+            } else {
+                double throttle_cycles = beeper_cycles_per_sample * beeper_latency_throttle_samples;
+
+                if (throttle_cycles > 0.0 && latency_cycles > throttle_cycles) {
+                    double catch_up_position = (double)t_state - throttle_cycles;
+                    if (catch_up_position < 0.0) {
+                        catch_up_position = 0.0;
+                    }
+
+                    double playback_snapshot = beeper_playback_position;
+                    size_t pending_before = beeper_pending_event_count();
+                    size_t consumed = beeper_catch_up_to(catch_up_position, playback_snapshot);
+                    double new_latency_cycles = (double)t_state - beeper_playback_position;
+                    double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
+                    double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
+                    size_t pending_after = beeper_pending_event_count();
+                    double catch_up_error_samples = 0.0;
+                    if (beeper_cycles_per_sample > 0.0) {
+                        catch_up_error_samples = (catch_up_position - beeper_playback_position) /
+                                                 beeper_cycles_per_sample;
+                    }
+
+                    if (consumed > 0 || queued_samples_after < queued_samples_before) {
+                        fprintf(stderr,
+                                "[BEEPER] trimmed backlog %.2f -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
+                                queued_samples_before,
+                                queued_samples_after,
+                                consumed,
+                                pending_before,
+                                pending_after,
+                                catch_up_error_samples);
+                    }
+
+                    uint64_t catch_up_cycles = (uint64_t)catch_up_position;
+                    if (catch_up_cycles > beeper_last_event_t_state) {
+                        beeper_last_event_t_state = catch_up_cycles;
+                    }
+
+                    latency_cycles = new_latency_cycles;
+                }
             }
         } else if (audio_available && beeper_latency_warning_active) {
             beeper_latency_warning_active = 0;
@@ -516,6 +562,10 @@ static void beeper_push_event(uint64_t t_state, int level) {
     beeper_events[beeper_event_tail].t_state = t_state;
     beeper_events[beeper_event_tail].level = (uint8_t)(level ? 1 : 0);
     beeper_event_tail = next_tail;
+
+    if (locked_audio) {
+        SDL_UnlockAudio();
+    }
 }
 
 void io_write(uint16_t port, uint8_t value) {
@@ -525,14 +575,8 @@ void io_write(uint16_t port, uint8_t value) {
         int new_beeper_state = (value >> 4) & 0x01;
 
         if (new_beeper_state != beeper_state) {
-            if (audio_available) {
-                SDL_LockAudio();
-            }
             beeper_state = new_beeper_state;
             beeper_push_event(total_t_states, beeper_state);
-            if (audio_available) {
-                SDL_UnlockAudio();
-            }
         }
     }
     (void)port; (void)value;
