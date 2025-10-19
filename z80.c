@@ -65,6 +65,7 @@ static double beeper_playback_position = 0.0;
 static double beeper_hp_last_input = 0.0;
 static double beeper_hp_last_output = 0.0;
 static int beeper_playback_level = 0;
+static int beeper_latency_warning_active = 0;
 
 static size_t beeper_pending_event_count(void);
 
@@ -126,6 +127,7 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
 static void beeper_set_latency_limit(double sample_limit);
 static void beeper_push_event(uint64_t t_state, int level);
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
+static double beeper_current_latency_samples(void);
 static int audio_dump_start(const char* path, uint32_t sample_rate);
 static void audio_dump_write_samples(const Sint16* samples, size_t count);
 static void audio_dump_finish(void);
@@ -168,6 +170,48 @@ static size_t beeper_pending_event_count(void) {
     }
 
     return (size_t)BEEPER_EVENT_CAPACITY - head + tail;
+}
+
+static double beeper_current_latency_samples(void) {
+    if (!audio_available || beeper_cycles_per_sample <= 0.0) {
+        beeper_latency_warning_active = 0;
+        return 0.0;
+    }
+
+    uint64_t writer_cycles;
+    double playback_position;
+
+    SDL_LockAudio();
+    writer_cycles = beeper_last_event_t_state;
+    playback_position = beeper_playback_position;
+    SDL_UnlockAudio();
+
+    double latency_cycles = (double)writer_cycles - playback_position;
+    if (latency_cycles <= 0.0) {
+        if (beeper_latency_warning_active) {
+            beeper_latency_warning_active = 0;
+        }
+        return 0.0;
+    }
+
+    double latency_samples = latency_cycles / beeper_cycles_per_sample;
+    if (latency_samples < 0.0) {
+        latency_samples = 0.0;
+    }
+
+    if (latency_samples >= beeper_max_latency_samples) {
+        if (!beeper_latency_warning_active) {
+            fprintf(stderr,
+                    "[BEEPER] latency %.2f samples exceeds clamp %.2f; throttling CPU until audio catches up\n",
+                    latency_samples,
+                    beeper_max_latency_samples);
+            beeper_latency_warning_active = 1;
+        }
+    } else if (latency_samples < beeper_max_latency_samples * 0.75 && beeper_latency_warning_active) {
+        beeper_latency_warning_active = 0;
+    }
+
+    return latency_samples;
 }
 
 static void beeper_set_latency_limit(double sample_limit) {
@@ -356,36 +400,40 @@ static void beeper_push_event(uint64_t t_state, int level) {
         double max_latency_cycles = beeper_cycles_per_sample * beeper_max_latency_samples;
 
         if (latency_cycles > max_latency_cycles) {
-            double catch_up_position = (double)t_state - max_latency_cycles;
-            if (catch_up_position < 0.0) {
-                catch_up_position = 0.0;
-            }
-            size_t pending_before = beeper_pending_event_count();
-            size_t consumed = beeper_catch_up_to(catch_up_position, playback_position_snapshot);
+            if (!audio_available) {
+                double catch_up_position = (double)t_state - max_latency_cycles;
+                if (catch_up_position < 0.0) {
+                    catch_up_position = 0.0;
+                }
+                size_t pending_before = beeper_pending_event_count();
+                size_t consumed = beeper_catch_up_to(catch_up_position, playback_position_snapshot);
 
-            double new_latency_cycles = (double)t_state - beeper_playback_position;
-            double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
-            double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
-            size_t pending_after = beeper_pending_event_count();
-            double catch_up_error_samples = 0.0;
-            if (beeper_cycles_per_sample > 0.0) {
-                catch_up_error_samples = (catch_up_position - beeper_playback_position) /
-                                         beeper_cycles_per_sample;
-            }
+                double new_latency_cycles = (double)t_state - beeper_playback_position;
+                double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
+                double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
+                size_t pending_after = beeper_pending_event_count();
+                double catch_up_error_samples = 0.0;
+                if (beeper_cycles_per_sample > 0.0) {
+                    catch_up_error_samples = (catch_up_position - beeper_playback_position) /
+                                             beeper_cycles_per_sample;
+                }
 
-            fprintf(stderr,
-                    "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
-                    queued_samples_before,
-                    queued_samples_after,
-                    consumed,
-                    pending_before,
-                    pending_after,
-                    catch_up_error_samples);
+                fprintf(stderr,
+                        "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
+                        queued_samples_before,
+                        queued_samples_after,
+                        consumed,
+                        pending_before,
+                        pending_after,
+                        catch_up_error_samples);
 
-            uint64_t catch_up_cycles = (uint64_t)catch_up_position;
-            if (catch_up_cycles > beeper_last_event_t_state) {
-                beeper_last_event_t_state = catch_up_cycles;
+                uint64_t catch_up_cycles = (uint64_t)catch_up_position;
+                if (catch_up_cycles > beeper_last_event_t_state) {
+                    beeper_last_event_t_state = catch_up_cycles;
+                }
             }
+        } else if (audio_available && beeper_latency_warning_active) {
+            beeper_latency_warning_active = 0;
         }
     }
 
@@ -1008,12 +1056,30 @@ int main(int argc, char *argv[]) {
             cycle_accumulator = CPU_CLOCK_HZ * 0.25;
         }
 
+        if (audio_available && beeper_cycles_per_sample > 0.0) {
+            double latency_samples = beeper_current_latency_samples();
+            if (latency_samples >= beeper_max_latency_samples) {
+                SDL_Delay(1);
+                continue;
+            }
+        }
+
         if (cycle_accumulator < 1.0) {
             SDL_Delay(0);
             continue;
         }
 
         int cycles_to_execute = (int)cycle_accumulator;
+        int latency_poll_cycles = 0;
+        int latency_poll_threshold = 0;
+        int throttled_audio = 0;
+
+        if (audio_available && beeper_cycles_per_sample > 0.0) {
+            latency_poll_threshold = (int)(beeper_cycles_per_sample * 32.0);
+            if (latency_poll_threshold < 128) {
+                latency_poll_threshold = 128;
+            }
+        }
 
         while (cycles_to_execute > 0) {
             if (cpu.ei_delay) {
@@ -1035,6 +1101,18 @@ int main(int argc, char *argv[]) {
             frame_t_state_accumulator += t_states;
             total_t_states += t_states;
 
+            if (audio_available && latency_poll_threshold > 0) {
+                latency_poll_cycles += t_states;
+                if (latency_poll_cycles >= latency_poll_threshold) {
+                    latency_poll_cycles = 0;
+                    double latency_samples = beeper_current_latency_samples();
+                    if (latency_samples >= beeper_max_latency_samples) {
+                        throttled_audio = 1;
+                        break;
+                    }
+                }
+            }
+
             while (frame_t_state_accumulator >= T_STATES_PER_FRAME) {
                 if (cpu.iff1) {
                     int interrupt_t_states = cpu_interrupt(&cpu, 0x0038);
@@ -1044,6 +1122,11 @@ int main(int argc, char *argv[]) {
                 render_screen();
                 frame_t_state_accumulator -= T_STATES_PER_FRAME;
             }
+        }
+
+        if (throttled_audio) {
+            SDL_Delay(1);
+            continue;
         }
     }
 
