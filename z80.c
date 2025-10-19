@@ -56,6 +56,7 @@ static const double BEEPER_HP_ALPHA = 0.995;
 static const char* audio_dump_path = NULL;
 
 static const int16_t TAPE_WAV_AMPLITUDE = 20000;
+static const char* const TAPE_DEFAULT_OUTPUT_PATH = "recording.tap";
 
 // --- Tape Constants ---
 static const int TAPE_PILOT_PULSE_TSTATES = 2168;
@@ -1807,8 +1808,9 @@ static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
 
 static void tape_recorder_start_session(uint64_t current_t_state, int clear_existing) {
     if (!tape_recorder.enabled) {
-        fprintf(stderr, "Tape RECORD ignored (no output configured)\n");
-        return;
+        tape_recorder_enable(TAPE_DEFAULT_OUTPUT_PATH, TAPE_OUTPUT_TAP);
+        printf("Tape recorder output defaulting to %s (use --save-tap or --save-wav to choose a path)\n",
+               tape_recorder.output_path);
     }
 
     if (tape_recorder.recording) {
