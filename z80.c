@@ -2,8 +2,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <string.h>
 #include <SDL.h>
-#include <math.h> // For fmod in audio callback
+#include <math.h>
 
 // --- Z80 Flag Register Bits ---
 #define FLAG_C  (1 << 0) // Carry Flag
@@ -26,6 +27,8 @@ uint8_t memory[0x10000]; // 65536 bytes
 #define ATTR_START 0x5800
 #define T_STATES_PER_FRAME 69888 // 3.5MHz / 50Hz (Spectrum CPU speed)
 
+const double CPU_CLOCK_HZ = 3500000.0;
+
 // --- SDL Globals ---
 SDL_Window* window = NULL;
 SDL_Renderer* renderer = NULL;
@@ -33,14 +36,30 @@ SDL_Texture* texture = NULL;
 uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 
 // --- Audio Globals ---
-volatile int beeper_state = 0; // 0 = off, 1 = on
+volatile int beeper_state = 0; // 0 = low, 1 = high
 const int AUDIO_AMPLITUDE = 2000;
-volatile double beeper_frequency = 440.0; // The frequency the Z80 is *trying* to play
-volatile double audio_sample_index = 0.0; // Tracks our position in the generated wave
+int audio_sample_rate = 44100;
+int audio_available = 0;
+
+#define BEEPER_EVENT_CAPACITY 8192
+
+typedef struct {
+    uint64_t t_state;
+    uint8_t level;
+} BeeperEvent;
+
+static BeeperEvent beeper_events[BEEPER_EVENT_CAPACITY];
+static size_t beeper_event_head = 0;
+static size_t beeper_event_tail = 0;
+static uint64_t beeper_last_event_t_state = 0;
+static double beeper_cycles_per_sample = 0.0;
+static double beeper_playback_position = 0.0;
+static double beeper_hp_last_input = 0.0;
+static double beeper_hp_last_output = 0.0;
+static int beeper_playback_level = 0;
 
 // --- Timing Globals ---
 uint64_t total_t_states = 0; // A global clock for the entire CPU
-uint32_t last_beeper_toggle_t_states = 0; // T-state time of the last beeper toggle
 
 // --- ZX Spectrum Colours ---
 const uint32_t spectrum_colors[8] = {0x000000FF,0x0000CDFF,0xCD0000FF,0xCD00CDFF,0x00CD00FF,0x00CDCDFF,0xCDCD00FF,0xCFCFCFFF};
@@ -93,6 +112,8 @@ int cpu_step(Z80* cpu); int init_sdl(void); void cleanup_sdl(void); void render_
 int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr);
 int cpu_interrupt(Z80* cpu, uint16_t vector_addr);
 void audio_callback(void* userdata, Uint8* stream, int len);
+static void beeper_reset_audio_state(void);
+static void beeper_push_event(uint64_t t_state, int level);
 
 
 // --- Memory Access Helpers ---
@@ -109,22 +130,51 @@ void writeWord(uint16_t addr, uint16_t val) { uint8_t lo=val&0xFF; uint8_t hi=(v
 
 // --- I/O Port Access Helpers ---
 uint8_t border_color_idx = 0;
+
+static void beeper_reset_audio_state(void) {
+    beeper_event_head = 0;
+    beeper_event_tail = 0;
+    beeper_last_event_t_state = 0;
+    beeper_playback_position = 0.0;
+    beeper_playback_level = 0;
+    double baseline = -(double)AUDIO_AMPLITUDE;
+    beeper_hp_last_input = baseline;
+    beeper_hp_last_output = baseline;
+    beeper_state = 0;
+}
+
+static void beeper_push_event(uint64_t t_state, int level) {
+    if (t_state < beeper_last_event_t_state) {
+        t_state = beeper_last_event_t_state;
+    } else {
+        beeper_last_event_t_state = t_state;
+    }
+
+    size_t next_tail = (beeper_event_tail + 1) % BEEPER_EVENT_CAPACITY;
+    if (next_tail == beeper_event_head) {
+        beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
+    }
+
+    beeper_events[beeper_event_tail].t_state = t_state;
+    beeper_events[beeper_event_tail].level = (uint8_t)(level ? 1 : 0);
+    beeper_event_tail = next_tail;
+}
+
 void io_write(uint16_t port, uint8_t value) {
     if ((port & 1) == 0) { // ULA Port FE
         border_color_idx = value & 0x07;
-        
+
         int new_beeper_state = (value >> 4) & 0x01;
-        
-        // Check if the beeper bit has *toggled*
+
         if (new_beeper_state != beeper_state) {
-            uint32_t half_period_t_states = total_t_states - last_beeper_toggle_t_states;
-            
-            if (half_period_t_states > 20) { // Avoid division by zero
-                uint32_t full_period_t_states = half_period_t_states * 2;
-                beeper_frequency = 3500000.0 / full_period_t_states;
+            if (audio_available) {
+                SDL_LockAudio();
             }
-            last_beeper_toggle_t_states = total_t_states;
             beeper_state = new_beeper_state;
+            beeper_push_event(total_t_states, beeper_state);
+            if (audio_available) {
+                SDL_UnlockAudio();
+            }
         }
     }
     (void)port; (void)value;
@@ -478,13 +528,37 @@ int init_sdl(void) {
     if (SDL_OpenAudio(&wanted_spec, &have_spec) < 0) {
         fprintf(stderr, "Failed to open audio: %s\n", SDL_GetError());
     } else {
-        SDL_PauseAudio(0); // Start playing sound
+        if (have_spec.format != AUDIO_S16SYS || have_spec.channels != 1) {
+            fprintf(stderr, "Unexpected audio format (format=%d, channels=%d). Audio disabled.\n", have_spec.format, have_spec.channels);
+            SDL_CloseAudio();
+        } else {
+            audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
+            audio_available = 1;
+            beeper_cycles_per_sample = CPU_CLOCK_HZ / (double)audio_sample_rate;
+            beeper_reset_audio_state();
+            SDL_PauseAudio(0); // Start playing sound
+        }
     }
     return 1;
 }
 
 // --- SDL Cleanup ---
-void cleanup_sdl(void) { SDL_CloseAudio(); if(texture)SDL_DestroyTexture(texture); if(renderer)SDL_DestroyRenderer(renderer); if(window)SDL_DestroyWindow(window); SDL_Quit(); }
+void cleanup_sdl(void) {
+    if (audio_available) {
+        SDL_CloseAudio();
+        audio_available = 0;
+    }
+    if (texture) {
+        SDL_DestroyTexture(texture);
+    }
+    if (renderer) {
+        SDL_DestroyRenderer(renderer);
+    }
+    if (window) {
+        SDL_DestroyWindow(window);
+    }
+    SDL_Quit();
+}
 
 // --- Render ZX Spectrum Screen ---
 void render_screen(void) {
@@ -521,18 +595,48 @@ int map_sdl_key_to_spectrum(SDL_Keycode k, int* r, uint8_t* m) {
 // --- Audio Callback ---
 void audio_callback(void* userdata, Uint8* stream, int len) {
     Sint16* buffer = (Sint16*)stream;
-    int num_samples = len / 2;
-    double sample_step = beeper_frequency / 44100.0; // 44100 is sample rate
+    int num_samples = len / (int)sizeof(Sint16);
+    double cycles_per_sample = beeper_cycles_per_sample;
+    double playback_position = beeper_playback_position;
+    double last_input = beeper_hp_last_input;
+    double last_output = beeper_hp_last_output;
+    int level = beeper_playback_level;
+
+    if (cycles_per_sample <= 0.0) {
+        memset(buffer, 0, (size_t)len);
+        return;
+    }
 
     for (int i = 0; i < num_samples; ++i) {
-        if (beeper_state == 0) {
-            buffer[i] = 0; // Silent
-        } else {
-            // Generate a square wave
-            buffer[i] = (fmod(audio_sample_index, 1.0) < 0.5) ? AUDIO_AMPLITUDE : -AUDIO_AMPLITUDE;
+        double target_position = playback_position + cycles_per_sample;
+
+        while (beeper_event_head != beeper_event_tail &&
+               beeper_events[beeper_event_head].t_state <= (uint64_t)target_position) {
+            level = beeper_events[beeper_event_head].level ? 1 : 0;
+            playback_position = (double)beeper_events[beeper_event_head].t_state;
+            beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
         }
-        audio_sample_index += sample_step;
+
+        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double filtered_sample = raw_sample - last_input + 0.995 * last_output;
+        last_input = raw_sample;
+        last_output = filtered_sample;
+
+        if (filtered_sample > 32767.0) {
+            filtered_sample = 32767.0;
+        } else if (filtered_sample < -32768.0) {
+            filtered_sample = -32768.0;
+        }
+        buffer[i] = (Sint16)lrint(filtered_sample);
+
+        playback_position = target_position;
     }
+
+    beeper_playback_level = level;
+    beeper_playback_position = playback_position;
+    beeper_hp_last_input = last_input;
+    beeper_hp_last_output = last_output;
+
     (void)userdata;
 }
 
@@ -547,68 +651,101 @@ int main(int argc, char *argv[]) {
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
     cpu.halted = 0; cpu.ei_delay = 0;
     total_t_states = 0;
-    last_beeper_toggle_t_states = 0;
+
+    if (audio_available) {
+        SDL_LockAudio();
+        beeper_reset_audio_state();
+        SDL_UnlockAudio();
+    } else {
+        beeper_reset_audio_state();
+    }
 
     printf("Starting Z80 emulation...\n");
 
-    int quit=0; SDL_Event e;
-    const int FRAME_DURATION_MS = 20; // 1000ms / 50Hz
-    int t_states_elapsed_in_frame = 0;
+    int quit = 0;
+    SDL_Event e;
+    uint64_t performance_frequency = SDL_GetPerformanceFrequency();
+    uint64_t previous_counter = SDL_GetPerformanceCounter();
+    double cycle_accumulator = 0.0;
+    int frame_t_state_accumulator = 0;
 
-    while(!quit){
-        uint32_t frame_start_time = SDL_GetTicks();
-        t_states_elapsed_in_frame = 0;
-
-        while (t_states_elapsed_in_frame < T_STATES_PER_FRAME) {
-            if (cpu.ei_delay) {
-                cpu.iff1 = cpu.iff2 = 1;
-                cpu.ei_delay = 0;
-            }
-            
-            int t_states = 0;
-            if (cpu.halted) {
-                t_states = 4; // HALT burns 4 T-states per cycle
-            } else {
-                t_states = cpu_step(&cpu); // Execute one instruction
-            }
-            t_states_elapsed_in_frame += t_states;
-            total_t_states += t_states;
-        }
-
-        // Trigger Maskable Interrupt (IM 1)
-        if (cpu.iff1) {
-            t_states_elapsed_in_frame += cpu_interrupt(&cpu, 0x0038);
-            total_t_states += 13; // Add interrupt T-states
-        }
-
-        // Handle SDL Events
-        while(SDL_PollEvent(&e)!=0){
-            if(e.type==SDL_QUIT){quit=1;}
-            else if(e.type==SDL_KEYDOWN||e.type==SDL_KEYUP){
-                int row=-1; uint8_t mask=0;
-                int mapped=map_sdl_key_to_spectrum(e.key.keysym.sym,&row,&mask);
-                if(mapped){
-                    if(e.type==SDL_KEYDOWN){
-                        keyboard_matrix[row]&=~mask;
-                        // printf("Key Down: SDLKey=0x%X -> SpecRow=%d, Mask=0x%02X -> Matrix[%d]=0x%02X\n", e.key.keysym.sym, row, mask, row, keyboard_matrix[row]); // DEBUG
-                        if(e.key.keysym.sym==SDLK_BACKSPACE) keyboard_matrix[0]&=~0x01; // Press Shift
+    while (!quit) {
+        while (SDL_PollEvent(&e) != 0) {
+            if (e.type == SDL_QUIT) {
+                quit = 1;
+            } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
+                int row = -1;
+                uint8_t mask = 0;
+                int mapped = map_sdl_key_to_spectrum(e.key.keysym.sym, &row, &mask);
+                if (mapped) {
+                    if (e.type == SDL_KEYDOWN) {
+                        keyboard_matrix[row] &= ~mask;
+                        if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                            keyboard_matrix[0] &= ~0x01; // Press Shift
+                        }
                     } else {
-                        keyboard_matrix[row]|=mask;
-                        // printf("Key Up:   SDLKey=0x%X -> SpecRow=%d, Mask=0x%02X -> Matrix[%d]=0x%02X\n", e.key.keysym.sym, row, mask, row, keyboard_matrix[row]); // DEBUG
-                        if(e.key.keysym.sym==SDLK_BACKSPACE) keyboard_matrix[0]|=0x01; // Release Shift
+                        keyboard_matrix[row] |= mask;
+                        if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                            keyboard_matrix[0] |= 0x01; // Release Shift
+                        }
                     }
                 }
             }
         }
 
-        // Render
-        render_screen();
+        if (quit) {
+            break;
+        }
 
-        // Synchronize to 50Hz
-        uint32_t frame_end_time = SDL_GetTicks();
-        int frame_delta = frame_end_time - frame_start_time;
-        if (frame_delta < FRAME_DURATION_MS) {
-            SDL_Delay(FRAME_DURATION_MS - frame_delta);
+        uint64_t current_counter = SDL_GetPerformanceCounter();
+        double elapsed_seconds = (double)(current_counter - previous_counter) / (double)performance_frequency;
+        previous_counter = current_counter;
+
+        if (elapsed_seconds < 0.0) {
+            elapsed_seconds = 0.0;
+        }
+
+        cycle_accumulator += elapsed_seconds * CPU_CLOCK_HZ;
+        if (cycle_accumulator > CPU_CLOCK_HZ * 0.25) {
+            cycle_accumulator = CPU_CLOCK_HZ * 0.25;
+        }
+
+        if (cycle_accumulator < 1.0) {
+            SDL_Delay(0);
+            continue;
+        }
+
+        int cycles_to_execute = (int)cycle_accumulator;
+
+        while (cycles_to_execute > 0) {
+            if (cpu.ei_delay) {
+                cpu.iff1 = cpu.iff2 = 1;
+                cpu.ei_delay = 0;
+            }
+
+            int t_states = cpu.halted ? 4 : cpu_step(&cpu);
+            if (t_states <= 0) {
+                t_states = 4;
+            }
+
+            cycles_to_execute -= t_states;
+            cycle_accumulator -= t_states;
+            if (cycle_accumulator < 0.0) {
+                cycle_accumulator = 0.0;
+            }
+
+            frame_t_state_accumulator += t_states;
+            total_t_states += t_states;
+
+            while (frame_t_state_accumulator >= T_STATES_PER_FRAME) {
+                if (cpu.iff1) {
+                    int interrupt_t_states = cpu_interrupt(&cpu, 0x0038);
+                    total_t_states += interrupt_t_states;
+                    frame_t_state_accumulator += interrupt_t_states;
+                }
+                render_screen();
+                frame_t_state_accumulator -= T_STATES_PER_FRAME;
+            }
         }
     }
 
