@@ -76,6 +76,14 @@ static int beeper_playback_level = 0;
 static int beeper_latency_warning_active = 0;
 static int beeper_idle_log_active = 0;
 static uint64_t beeper_idle_reset_count = 0;
+static int beeper_logging_enabled = 0;
+
+#define BEEPER_LOG(...)                                              \
+    do {                                                             \
+        if (beeper_logging_enabled) {                                \
+            fprintf(stderr, __VA_ARGS__);                            \
+        }                                                            \
+    } while (0)
 
 static size_t beeper_pending_event_count(void);
 static void beeper_force_resync(uint64_t sync_t_state);
@@ -300,11 +308,11 @@ static double beeper_current_latency_samples(void) {
     double throttle_threshold = beeper_latency_threshold();
     if (latency_samples >= throttle_threshold) {
         if (!beeper_latency_warning_active) {
-            fprintf(stderr,
-                    "[BEEPER] latency %.2f samples exceeds throttle %.2f (clamp %.2f); throttling CPU until audio catches up\n",
-                    latency_samples,
-                    throttle_threshold,
-                    beeper_max_latency_samples);
+            BEEPER_LOG(
+                "[BEEPER] latency %.2f samples exceeds throttle %.2f (clamp %.2f); throttling CPU until audio catches up\n",
+                latency_samples,
+                throttle_threshold,
+                beeper_max_latency_samples);
             beeper_latency_warning_active = 1;
         }
     } else {
@@ -397,7 +405,7 @@ static int audio_dump_start(const char* path, uint32_t sample_rate) {
         return 0;
     }
 
-    fprintf(stderr, "[BEEPER] dumping audio to %s\n", path);
+    BEEPER_LOG("[BEEPER] dumping audio to %s\n", path);
     return 1;
 }
 
@@ -545,12 +553,12 @@ static void beeper_push_event(uint64_t t_state, int level) {
                 rewind_samples = -event_offset_cycles / beeper_cycles_per_sample;
             }
 
-            fprintf(stderr,
-                    "[BEEPER] timeline rewind detected: event at %llu is %.2f samples behind playback %.0f (pending %zu); resyncing audio state\n",
-                    (unsigned long long)t_state,
-                    rewind_samples,
-                    playback_snapshot,
-                    pending_before);
+            BEEPER_LOG(
+                "[BEEPER] timeline rewind detected: event at %llu is %.2f samples behind playback %.0f (pending %zu); resyncing audio state\n",
+                (unsigned long long)t_state,
+                rewind_samples,
+                playback_snapshot,
+                pending_before);
 
             beeper_force_resync(t_state);
             playback_snapshot = beeper_playback_position;
@@ -583,14 +591,14 @@ static void beeper_push_event(uint64_t t_state, int level) {
                                              beeper_cycles_per_sample;
                 }
 
-                fprintf(stderr,
-                        "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
-                        queued_samples_before,
-                        queued_samples_after,
-                        consumed,
-                        pending_before,
-                        pending_after,
-                        catch_up_error_samples);
+                BEEPER_LOG(
+                    "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
+                    queued_samples_before,
+                    queued_samples_after,
+                    consumed,
+                    pending_before,
+                    pending_after,
+                    catch_up_error_samples);
 
                 uint64_t catch_up_cycles = (uint64_t)catch_up_position;
                 if (catch_up_cycles > beeper_last_event_t_state) {
@@ -623,14 +631,14 @@ static void beeper_push_event(uint64_t t_state, int level) {
                         }
 
                         if (consumed > 0 || queued_samples_after < queued_samples_before) {
-                            fprintf(stderr,
-                                    "[BEEPER] trimmed backlog %.2f -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
-                                    queued_samples_before,
-                                    queued_samples_after,
-                                    consumed,
-                                    pending_before,
-                                    pending_after,
-                                    catch_up_error_samples);
+                            BEEPER_LOG(
+                                "[BEEPER] trimmed backlog %.2f -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
+                                queued_samples_before,
+                                queued_samples_after,
+                                consumed,
+                                pending_before,
+                                pending_after,
+                                catch_up_error_samples);
                         }
 
                         uint64_t catch_up_cycles = (uint64_t)catch_up_position;
@@ -653,12 +661,12 @@ static void beeper_push_event(uint64_t t_state, int level) {
         if (beeper_cycles_per_sample > 0.0) {
             drift_samples = (double)(clamped_t_state - original_t_state) / beeper_cycles_per_sample;
         }
-        fprintf(stderr,
-                "[BEEPER] event time rewind: requested %llu, clamped to %llu (drift %.2f samples, playback %.0f)\n",
-                (unsigned long long)original_t_state,
-                (unsigned long long)clamped_t_state,
-                drift_samples,
-                playback_snapshot);
+        BEEPER_LOG(
+            "[BEEPER] event time rewind: requested %llu, clamped to %llu (drift %.2f samples, playback %.0f)\n",
+            (unsigned long long)original_t_state,
+            (unsigned long long)clamped_t_state,
+            drift_samples,
+            playback_snapshot);
         t_state = clamped_t_state;
     } else {
         beeper_last_event_t_state = t_state;
@@ -674,12 +682,12 @@ static void beeper_push_event(uint64_t t_state, int level) {
         if (beeper_cycles_per_sample > 0.0) {
             delta_samples = ((double)t_state - playback_snapshot) / beeper_cycles_per_sample;
         }
-        fprintf(stderr,
-                "[BEEPER] idle period cleared by event at %llu (delta %.2f samples, playback %.0f, pending %zu)\n",
-                (unsigned long long)t_state,
-                delta_samples,
-                playback_snapshot,
-                pending_before);
+        BEEPER_LOG(
+            "[BEEPER] idle period cleared by event at %llu (delta %.2f samples, playback %.0f, pending %zu)\n",
+            (unsigned long long)t_state,
+            delta_samples,
+            playback_snapshot,
+            pending_before);
         beeper_idle_log_active = 0;
     }
 
@@ -1097,12 +1105,12 @@ int init_sdl(void) {
                 latency_limit = 256.0;
             }
             beeper_set_latency_limit(latency_limit);
-            fprintf(stderr,
-                    "[BEEPER] latency clamp set to %.0f samples (audio buffer %u, throttle %.0f, trim %.0f)\n",
-                    beeper_max_latency_samples,
-                    have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples,
-                    beeper_latency_threshold(),
-                    beeper_latency_trim_samples);
+            BEEPER_LOG(
+                "[BEEPER] latency clamp set to %.0f samples (audio buffer %u, throttle %.0f, trim %.0f)\n",
+                beeper_max_latency_samples,
+                have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples,
+                beeper_latency_threshold(),
+                beeper_latency_trim_samples);
             beeper_reset_audio_state(total_t_states, beeper_state);
             if (audio_dump_path && !audio_dump_file) {
                 if (!audio_dump_start(audio_dump_path, (uint32_t)audio_sample_rate)) {
@@ -1198,18 +1206,20 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
                 if (!beeper_idle_log_active) {
                     double idle_ms = (idle_cycles / CPU_CLOCK_HZ) * 1000.0;
-                    fprintf(stderr,
-                            "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, cursor %.0f, lag %.2f samples)\n",
-                            (unsigned long long)(beeper_idle_reset_count + 1u),
-                            idle_samples,
-                            idle_ms,
-                            playback_position,
-                            new_position,
-                            (unsigned long long)beeper_last_event_t_state,
-                            writer_cursor,
-                            writer_lag_samples);
-                    beeper_idle_log_active = 1;
-                    ++beeper_idle_reset_count;
+                    BEEPER_LOG(
+                        "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, cursor %.0f, lag %.2f samples)\n",
+                        (unsigned long long)(beeper_idle_reset_count + 1u),
+                        idle_samples,
+                        idle_ms,
+                        playback_position,
+                        new_position,
+                        (unsigned long long)beeper_last_event_t_state,
+                        writer_cursor,
+                        writer_lag_samples);
+                    if (beeper_logging_enabled) {
+                        beeper_idle_log_active = 1;
+                        ++beeper_idle_reset_count;
+                    }
                 }
 
                 double baseline = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
@@ -1284,16 +1294,18 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [rom_file]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [rom_file]\n", argv[0]);
                 return 1;
             }
             audio_dump_path = argv[++i];
+        } else if (strcmp(argv[i], "--beeper-log") == 0) {
+            beeper_logging_enabled = 1;
         } else if (!rom_filename) {
             rom_filename = argv[i];
             rom_provided = 1;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [rom_file]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [rom_file]\n", argv[0]);
             return 1;
         }
     }
