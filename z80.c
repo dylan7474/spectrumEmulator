@@ -2,8 +2,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <string.h>
 #include <SDL.h>
-#include <math.h> // For fmod in audio callback
+#include <math.h>
 
 // --- Z80 Flag Register Bits ---
 #define FLAG_C  (1 << 0) // Carry Flag
@@ -35,16 +36,30 @@ SDL_Texture* texture = NULL;
 uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 
 // --- Audio Globals ---
-volatile int beeper_state = 0; // 0 = off, 1 = on
+volatile int beeper_state = 0; // 0 = low, 1 = high
 const int AUDIO_AMPLITUDE = 2000;
-volatile double beeper_frequency = 440.0; // The frequency the Z80 is *trying* to play
-volatile double audio_sample_index = 0.0; // Tracks the fractional position in the generated wave
 int audio_sample_rate = 44100;
 int audio_available = 0;
 
+#define BEEPER_EVENT_CAPACITY 8192
+
+typedef struct {
+    uint64_t t_state;
+    uint8_t level;
+} BeeperEvent;
+
+static BeeperEvent beeper_events[BEEPER_EVENT_CAPACITY];
+static size_t beeper_event_head = 0;
+static size_t beeper_event_tail = 0;
+static uint64_t beeper_last_event_t_state = 0;
+static double beeper_cycles_per_sample = 0.0;
+static double beeper_playback_position = 0.0;
+static double beeper_hp_last_input = 0.0;
+static double beeper_hp_last_output = 0.0;
+static int beeper_playback_level = 0;
+
 // --- Timing Globals ---
 uint64_t total_t_states = 0; // A global clock for the entire CPU
-uint64_t last_beeper_toggle_t_states = 0; // T-state time of the last beeper toggle
 
 // --- ZX Spectrum Colours ---
 const uint32_t spectrum_colors[8] = {0x000000FF,0x0000CDFF,0xCD0000FF,0xCD00CDFF,0x00CD00FF,0x00CDCDFF,0xCDCD00FF,0xCFCFCFFF};
@@ -97,6 +112,8 @@ int cpu_step(Z80* cpu); int init_sdl(void); void cleanup_sdl(void); void render_
 int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr);
 int cpu_interrupt(Z80* cpu, uint16_t vector_addr);
 void audio_callback(void* userdata, Uint8* stream, int len);
+static void beeper_reset_audio_state(void);
+static void beeper_push_event(uint64_t t_state, int level);
 
 
 // --- Memory Access Helpers ---
@@ -113,33 +130,48 @@ void writeWord(uint16_t addr, uint16_t val) { uint8_t lo=val&0xFF; uint8_t hi=(v
 
 // --- I/O Port Access Helpers ---
 uint8_t border_color_idx = 0;
+
+static void beeper_reset_audio_state(void) {
+    beeper_event_head = 0;
+    beeper_event_tail = 0;
+    beeper_last_event_t_state = 0;
+    beeper_playback_position = 0.0;
+    beeper_playback_level = 0;
+    double baseline = -(double)AUDIO_AMPLITUDE;
+    beeper_hp_last_input = baseline;
+    beeper_hp_last_output = baseline;
+    beeper_state = 0;
+}
+
+static void beeper_push_event(uint64_t t_state, int level) {
+    if (t_state < beeper_last_event_t_state) {
+        t_state = beeper_last_event_t_state;
+    } else {
+        beeper_last_event_t_state = t_state;
+    }
+
+    size_t next_tail = (beeper_event_tail + 1) % BEEPER_EVENT_CAPACITY;
+    if (next_tail == beeper_event_head) {
+        beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
+    }
+
+    beeper_events[beeper_event_tail].t_state = t_state;
+    beeper_events[beeper_event_tail].level = (uint8_t)(level ? 1 : 0);
+    beeper_event_tail = next_tail;
+}
+
 void io_write(uint16_t port, uint8_t value) {
     if ((port & 1) == 0) { // ULA Port FE
         border_color_idx = value & 0x07;
-        
+
         int new_beeper_state = (value >> 4) & 0x01;
 
         if (new_beeper_state != beeper_state) {
-            uint64_t half_period_t_states = total_t_states - last_beeper_toggle_t_states;
-            double new_frequency = beeper_frequency;
-
-            if (half_period_t_states > 20) { // Avoid division by zero
-                uint64_t full_period_t_states = half_period_t_states * 2;
-                new_frequency = 3500000.0 / (double)full_period_t_states;
-            } else {
-                new_frequency = 0.0;
-            }
-
-            last_beeper_toggle_t_states = total_t_states;
-
             if (audio_available) {
                 SDL_LockAudio();
             }
             beeper_state = new_beeper_state;
-            beeper_frequency = new_frequency;
-            if (!beeper_state) {
-                audio_sample_index = 0.0;
-            }
+            beeper_push_event(total_t_states, beeper_state);
             if (audio_available) {
                 SDL_UnlockAudio();
             }
@@ -502,6 +534,8 @@ int init_sdl(void) {
         } else {
             audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
             audio_available = 1;
+            beeper_cycles_per_sample = CPU_CLOCK_HZ / (double)audio_sample_rate;
+            beeper_reset_audio_state();
             SDL_PauseAudio(0); // Start playing sound
         }
     }
@@ -562,35 +596,47 @@ int map_sdl_key_to_spectrum(SDL_Keycode k, int* r, uint8_t* m) {
 void audio_callback(void* userdata, Uint8* stream, int len) {
     Sint16* buffer = (Sint16*)stream;
     int num_samples = len / (int)sizeof(Sint16);
-    int current_state = beeper_state;
-    double frequency = beeper_frequency;
-    double step = (audio_sample_rate > 0) ? frequency / (double)audio_sample_rate : 0.0;
-    double phase = audio_sample_index;
+    double cycles_per_sample = beeper_cycles_per_sample;
+    double playback_position = beeper_playback_position;
+    double last_input = beeper_hp_last_input;
+    double last_output = beeper_hp_last_output;
+    int level = beeper_playback_level;
 
-    if (phase >= 1.0 || phase < 0.0) {
-        phase = fmod(phase, 1.0);
-        if (phase < 0.0) {
-            phase += 1.0;
-        }
+    if (cycles_per_sample <= 0.0) {
+        memset(buffer, 0, (size_t)len);
+        return;
     }
 
     for (int i = 0; i < num_samples; ++i) {
-        if (current_state == 0 || step <= 0.0) {
-            buffer[i] = 0;
-        } else {
-            buffer[i] = (phase < 0.5) ? AUDIO_AMPLITUDE : -AUDIO_AMPLITUDE;
-            phase += step;
-            if (phase >= 1.0) {
-                phase -= 1.0;
-            }
+        double target_position = playback_position + cycles_per_sample;
+
+        while (beeper_event_head != beeper_event_tail &&
+               beeper_events[beeper_event_head].t_state <= (uint64_t)target_position) {
+            level = beeper_events[beeper_event_head].level ? 1 : 0;
+            playback_position = (double)beeper_events[beeper_event_head].t_state;
+            beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
         }
+
+        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double filtered_sample = raw_sample - last_input + 0.995 * last_output;
+        last_input = raw_sample;
+        last_output = filtered_sample;
+
+        if (filtered_sample > 32767.0) {
+            filtered_sample = 32767.0;
+        } else if (filtered_sample < -32768.0) {
+            filtered_sample = -32768.0;
+        }
+        buffer[i] = (Sint16)lrint(filtered_sample);
+
+        playback_position = target_position;
     }
 
-    if (current_state == 0 || step <= 0.0) {
-        audio_sample_index = 0.0;
-    } else {
-        audio_sample_index = phase;
-    }
+    beeper_playback_level = level;
+    beeper_playback_position = playback_position;
+    beeper_hp_last_input = last_input;
+    beeper_hp_last_output = last_output;
+
     (void)userdata;
 }
 
@@ -605,7 +651,14 @@ int main(int argc, char *argv[]) {
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
     cpu.halted = 0; cpu.ei_delay = 0;
     total_t_states = 0;
-    last_beeper_toggle_t_states = 0;
+
+    if (audio_available) {
+        SDL_LockAudio();
+        beeper_reset_audio_state();
+        SDL_UnlockAudio();
+    } else {
+        beeper_reset_audio_state();
+    }
 
     printf("Starting Z80 emulation...\n");
 
@@ -658,7 +711,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (cycle_accumulator < 1.0) {
-            SDL_Delay(1);
+            SDL_Delay(0);
             continue;
         }
 
