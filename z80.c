@@ -1029,6 +1029,7 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
     size_t index = 0;
     size_t pilot_count = 0;
     size_t search_index = 0;
+    size_t pilot_start = 0;
     const int pilot_tolerance = tape_duration_tolerance(TAPE_PILOT_PULSE_TSTATES);
     while (search_index < count) {
         if (!tape_duration_matches(pulses[search_index].duration, TAPE_PILOT_PULSE_TSTATES, pilot_tolerance)) {
@@ -1043,6 +1044,7 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
 
         pilot_count = search_index - run_start;
         if (pilot_count >= 100) {
+            pilot_start = run_start;
             index = search_index;
             break;
         }
@@ -1056,10 +1058,43 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
         return 0;
     }
 
-    const int sync1_tolerance = tape_duration_tolerance(TAPE_SYNC_FIRST_PULSE_TSTATES);
-    const int sync2_tolerance = tape_duration_tolerance(TAPE_SYNC_SECOND_PULSE_TSTATES);
-    if (!tape_duration_matches(pulses[index].duration, TAPE_SYNC_FIRST_PULSE_TSTATES, sync1_tolerance) ||
-        !tape_duration_matches(pulses[index + 1].duration, TAPE_SYNC_SECOND_PULSE_TSTATES, sync2_tolerance)) {
+    double scale = 1.0;
+    if (pilot_count > 0) {
+        size_t sample_count = pilot_count;
+        if (sample_count > 4096) {
+            sample_count = 4096;
+        }
+        if (sample_count == 0) {
+            sample_count = 1;
+        }
+        uint64_t pilot_sum = 0;
+        for (size_t i = 0; i < sample_count; ++i) {
+            pilot_sum += pulses[pilot_start + i].duration;
+        }
+        double pilot_average = (double)pilot_sum / (double)sample_count;
+        if (pilot_average > 0.0) {
+            scale = pilot_average / (double)TAPE_PILOT_PULSE_TSTATES;
+            if (scale < 0.5) {
+                scale = 0.5;
+            } else if (scale > 2.0) {
+                scale = 2.0;
+            }
+        }
+    }
+
+    int sync1_reference = (int)((double)TAPE_SYNC_FIRST_PULSE_TSTATES * scale + 0.5);
+    int sync2_reference = (int)((double)TAPE_SYNC_SECOND_PULSE_TSTATES * scale + 0.5);
+    if (sync1_reference <= 0) {
+        sync1_reference = TAPE_SYNC_FIRST_PULSE_TSTATES;
+    }
+    if (sync2_reference <= 0) {
+        sync2_reference = TAPE_SYNC_SECOND_PULSE_TSTATES;
+    }
+
+    const int sync1_tolerance = tape_duration_tolerance(sync1_reference);
+    const int sync2_tolerance = tape_duration_tolerance(sync2_reference);
+    if (!tape_duration_matches(pulses[index].duration, sync1_reference, sync1_tolerance) ||
+        !tape_duration_matches(pulses[index + 1].duration, sync2_reference, sync2_tolerance)) {
         return 0;
     }
 
@@ -1091,8 +1126,21 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
     }
     memset(data, 0, byte_count ? byte_count : 1u);
 
-    const int bit0_tolerance = tape_duration_tolerance(TAPE_BIT0_PULSE_TSTATES);
-    const int bit1_tolerance = tape_duration_tolerance(TAPE_BIT1_PULSE_TSTATES);
+    int bit0_reference = (int)((double)TAPE_BIT0_PULSE_TSTATES * scale + 0.5);
+    int bit1_reference = (int)((double)TAPE_BIT1_PULSE_TSTATES * scale + 0.5);
+    if (bit0_reference <= 0) {
+        bit0_reference = TAPE_BIT0_PULSE_TSTATES;
+    }
+    if (bit1_reference <= 0) {
+        bit1_reference = TAPE_BIT1_PULSE_TSTATES;
+    }
+
+    const int bit0_tolerance = tape_duration_tolerance(bit0_reference);
+    const int bit1_tolerance = tape_duration_tolerance(bit1_reference);
+    const int bit0_pair_reference = bit0_reference * 2;
+    const int bit1_pair_reference = bit1_reference * 2;
+    const int bit0_pair_tolerance = tape_duration_tolerance(bit0_pair_reference);
+    const int bit1_pair_tolerance = tape_duration_tolerance(bit1_pair_reference);
 
     for (size_t byte_index = 0; byte_index < byte_count; ++byte_index) {
         uint8_t value = 0;
@@ -1104,20 +1152,29 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
             uint32_t d1 = pulses[index].duration;
             uint32_t d2 = pulses[index + 1].duration;
             index += 2;
-            int is_one = tape_duration_matches(d1, TAPE_BIT1_PULSE_TSTATES, bit1_tolerance) &&
-                         tape_duration_matches(d2, TAPE_BIT1_PULSE_TSTATES, bit1_tolerance);
-            int is_zero = tape_duration_matches(d1, TAPE_BIT0_PULSE_TSTATES, bit0_tolerance) &&
-                          tape_duration_matches(d2, TAPE_BIT0_PULSE_TSTATES, bit0_tolerance);
+            int is_one = tape_duration_matches(d1, bit1_reference, bit1_tolerance) &&
+                         tape_duration_matches(d2, bit1_reference, bit1_tolerance);
+            int is_zero = tape_duration_matches(d1, bit0_reference, bit0_tolerance) &&
+                          tape_duration_matches(d2, bit0_reference, bit0_tolerance);
+            uint32_t pair_sum = d1 + d2;
             if (!is_one && !is_zero) {
-                int score_one = abs((int)d1 - TAPE_BIT1_PULSE_TSTATES) + abs((int)d2 - TAPE_BIT1_PULSE_TSTATES);
-                int score_zero = abs((int)d1 - TAPE_BIT0_PULSE_TSTATES) + abs((int)d2 - TAPE_BIT0_PULSE_TSTATES);
-                if (score_one < score_zero && score_one <= bit1_tolerance * 4) {
+                int sum_diff_one = abs((int)pair_sum - bit1_pair_reference);
+                int sum_diff_zero = abs((int)pair_sum - bit0_pair_reference);
+                if (sum_diff_one <= bit1_pair_tolerance && sum_diff_one < sum_diff_zero) {
                     is_one = 1;
-                } else if (score_zero < score_one && score_zero <= bit0_tolerance * 4) {
+                } else if (sum_diff_zero <= bit0_pair_tolerance) {
                     is_zero = 1;
                 } else {
-                    free(data);
-                    return 0;
+                    int score_one = abs((int)d1 - bit1_reference) + abs((int)d2 - bit1_reference);
+                    int score_zero = abs((int)d1 - bit0_reference) + abs((int)d2 - bit0_reference);
+                    if (score_one < score_zero && score_one <= bit1_tolerance * 4) {
+                        is_one = 1;
+                    } else if (score_zero <= score_one && score_zero <= bit0_tolerance * 4) {
+                        is_zero = 1;
+                    } else {
+                        free(data);
+                        return 0;
+                    }
                 }
             }
             if (is_one) {
