@@ -60,6 +60,8 @@ static double beeper_hp_last_input = 0.0;
 static double beeper_hp_last_output = 0.0;
 static int beeper_playback_level = 0;
 
+static size_t beeper_pending_event_count(void);
+
 // --- Timing Globals ---
 uint64_t total_t_states = 0; // A global clock for the entire CPU
 
@@ -145,6 +147,17 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
     beeper_hp_last_input = baseline;
     beeper_hp_last_output = baseline;
     beeper_state = current_level ? 1 : 0;
+}
+
+static size_t beeper_pending_event_count(void) {
+    size_t head = beeper_event_head;
+    size_t tail = beeper_event_tail;
+
+    if (tail >= head) {
+        return tail - head;
+    }
+
+    return (size_t)BEEPER_EVENT_CAPACITY - head + tail;
 }
 
 static void beeper_set_latency_limit(double sample_limit) {
@@ -234,17 +247,27 @@ static void beeper_push_event(uint64_t t_state, int level) {
             if (catch_up_position < 0.0) {
                 catch_up_position = 0.0;
             }
+            size_t pending_before = beeper_pending_event_count();
             size_t consumed = beeper_catch_up_to(catch_up_position, playback_position_snapshot);
 
             double new_latency_cycles = (double)t_state - beeper_playback_position;
             double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
             double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
+            size_t pending_after = beeper_pending_event_count();
+            double catch_up_error_samples = 0.0;
+            if (beeper_cycles_per_sample > 0.0) {
+                catch_up_error_samples = (catch_up_position - beeper_playback_position) /
+                                         beeper_cycles_per_sample;
+            }
 
             fprintf(stderr,
-                    "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (consumed %zu events)\n",
+                    "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (consumed %zu events, queue %zu -> %zu, catch-up err %.4f samples)\n",
                     queued_samples_before,
                     queued_samples_after,
-                    consumed);
+                    consumed,
+                    pending_before,
+                    pending_after,
+                    catch_up_error_samples);
 
             uint64_t catch_up_cycles = (uint64_t)catch_up_position;
             if (catch_up_cycles > beeper_last_event_t_state) {
