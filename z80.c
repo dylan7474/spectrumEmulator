@@ -123,6 +123,11 @@ typedef struct {
     int level;
     int playing;
     size_t waveform_index;
+    uint64_t paused_transition_remaining;
+    uint64_t paused_pause_remaining;
+    uint64_t position_tstates;
+    uint64_t position_start_tstate;
+    uint64_t last_transition_tstate;
 } TapePlaybackState;
 
 typedef enum {
@@ -147,12 +152,61 @@ typedef struct {
     size_t audio_sample_count;
     size_t audio_sample_capacity;
     TapeOutputFormat output_format;
+    int recording;
+    int session_dirty;
+    uint64_t position_tstates;
+    uint64_t position_start_tstate;
 } TapeRecorder;
 
 static TapePlaybackState tape_playback = {0};
 static TapeRecorder tape_recorder = {0};
 static int tape_ear_state = 1;
 static int tape_input_enabled = 0;
+
+typedef enum {
+    TAPE_DECK_STATUS_IDLE,
+    TAPE_DECK_STATUS_PLAY,
+    TAPE_DECK_STATUS_STOP,
+    TAPE_DECK_STATUS_REWIND,
+    TAPE_DECK_STATUS_RECORD
+} TapeDeckStatus;
+
+static TapeDeckStatus tape_deck_status = TAPE_DECK_STATUS_IDLE;
+
+#define TAPE_OVERLAY_FONT_WIDTH 5
+#define TAPE_OVERLAY_FONT_HEIGHT 7
+
+typedef struct {
+    char ch;
+    uint8_t rows[TAPE_OVERLAY_FONT_HEIGHT];
+} TapeOverlayGlyph;
+
+static const TapeOverlayGlyph tape_overlay_font[] = {
+    {' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+    {'0', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
+    {'3', {0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E}},
+    {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
+    {'5', {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}},
+    {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
+    {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
+    {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+    {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+    {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+    {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+    {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+    {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}},
+    {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+    {':', {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}},
+    {'.', {0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x00}}
+};
 
 typedef struct {
     uint8_t value;
@@ -167,11 +221,16 @@ static int* ula_instruction_progress_ptr = NULL;
 static TapeFormat tape_input_format = TAPE_FORMAT_NONE;
 static const char* tape_input_path = NULL;
 
+static int string_ends_with_case_insensitive(const char* str, const char* suffix);
+static TapeFormat tape_format_from_extension(const char* path);
 static int tape_load_image(const char* path, TapeFormat format, TapeImage* image);
 static void tape_free_image(TapeImage* image);
 static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t length, uint32_t pause_ms);
 static void tape_reset_playback(TapePlaybackState* state);
 static void tape_start_playback(TapePlaybackState* state, uint64_t start_time);
+static void tape_pause_playback(TapePlaybackState* state, uint64_t current_t_state);
+static int tape_resume_playback(TapePlaybackState* state, uint64_t current_t_state);
+static void tape_rewind_playback(TapePlaybackState* state);
 static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64_t start_time);
 static void tape_update(uint64_t current_t_state);
 static int tape_current_block_pilot_count(const TapePlaybackState* state);
@@ -179,6 +238,8 @@ static void tape_waveform_reset(TapeWaveform* waveform);
 static int tape_waveform_add_pulse(TapeWaveform* waveform, uint64_t duration);
 static int tape_load_wav(const char* path, TapePlaybackState* state);
 static void tape_recorder_enable(const char* path, TapeOutputFormat format);
+static void tape_recorder_start_session(uint64_t current_t_state, int clear_existing);
+static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_output);
 static void tape_recorder_handle_mic(uint64_t t_state, int level);
 static void tape_recorder_update(uint64_t current_t_state, int force_flush);
 static int tape_recorder_write_output(void);
@@ -188,6 +249,15 @@ static int tape_recorder_append_audio_samples(int level, size_t sample_count);
 static void tape_recorder_append_block_audio(uint64_t idle_cycles);
 static int tape_recorder_write_wav(void);
 static void tape_shutdown(void);
+static void tape_deck_play(uint64_t current_t_state);
+static void tape_deck_stop(uint64_t current_t_state);
+static void tape_deck_rewind(uint64_t current_t_state);
+static void tape_deck_record(uint64_t current_t_state);
+static int tape_handle_control_key(const SDL_Event* event);
+static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t stop_t_state);
+static uint64_t tape_playback_elapsed_tstates(const TapePlaybackState* state, uint64_t current_t_state);
+static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
+static void tape_render_overlay(void);
 static void ula_queue_port_value(uint8_t value);
 static void ula_process_port_events(uint64_t current_t_state);
 
@@ -1051,6 +1121,53 @@ static int tape_load_wav(const char* path, TapePlaybackState* state) {
     return 1;
 }
 
+static int string_ends_with_case_insensitive(const char* str, const char* suffix) {
+    if (!str || !suffix) {
+        return 0;
+    }
+
+    size_t str_len = strlen(str);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len == 0 || suffix_len > str_len) {
+        return 0;
+    }
+
+    const char* str_tail = str + (str_len - suffix_len);
+    for (size_t i = 0; i < suffix_len; ++i) {
+        char a = str_tail[i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static TapeFormat tape_format_from_extension(const char* path) {
+    if (!path) {
+        return TAPE_FORMAT_NONE;
+    }
+
+    if (string_ends_with_case_insensitive(path, ".tap")) {
+        return TAPE_FORMAT_TAP;
+    }
+    if (string_ends_with_case_insensitive(path, ".tzx")) {
+        return TAPE_FORMAT_TZX;
+    }
+    if (string_ends_with_case_insensitive(path, ".wav")) {
+        return TAPE_FORMAT_WAV;
+    }
+
+    return TAPE_FORMAT_NONE;
+}
+
 static int tape_load_image(const char* path, TapeFormat format, TapeImage* image) {
     if (!path || !image || format == TAPE_FORMAT_NONE) {
         return 0;
@@ -1084,6 +1201,11 @@ static void tape_reset_playback(TapePlaybackState* state) {
     state->pause_end_tstate = 0;
     state->playing = 0;
     state->waveform_index = 0;
+    state->paused_transition_remaining = 0;
+    state->paused_pause_remaining = 0;
+    state->position_tstates = 0;
+    state->position_start_tstate = 0;
+    state->last_transition_tstate = 0;
     if (state->format == TAPE_FORMAT_WAV) {
         state->level = state->waveform.initial_level ? 1 : 0;
         tape_ear_state = state->level;
@@ -1119,6 +1241,9 @@ static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64
     tape_ear_state = state->level;
     state->next_transition_tstate = start_time + (uint64_t)TAPE_PILOT_PULSE_TSTATES;
     state->playing = 1;
+    state->last_transition_tstate = start_time;
+    state->paused_transition_remaining = 0;
+    state->paused_pause_remaining = 0;
     return 1;
 }
 
@@ -1127,18 +1252,321 @@ static void tape_start_playback(TapePlaybackState* state, uint64_t start_time) {
         return;
     }
     tape_reset_playback(state);
+    state->position_start_tstate = start_time;
+    state->last_transition_tstate = start_time;
     if (state->format == TAPE_FORMAT_WAV) {
         if (state->waveform.count == 0) {
             return;
         }
         state->playing = 1;
         state->next_transition_tstate = start_time + (uint64_t)state->waveform.pulses[0].duration;
+        state->paused_transition_remaining = 0;
+        state->paused_pause_remaining = 0;
         return;
     }
     if (state->image.count == 0) {
         return;
     }
     (void)tape_begin_block(state, 0u, start_time);
+}
+
+static void tape_pause_playback(TapePlaybackState* state, uint64_t current_t_state) {
+    if (!state || !state->playing) {
+        return;
+    }
+
+    if (state->next_transition_tstate > current_t_state) {
+        state->paused_transition_remaining = state->next_transition_tstate - current_t_state;
+    } else {
+        state->paused_transition_remaining = 0;
+    }
+
+    if (state->phase == TAPE_PHASE_PAUSE && state->pause_end_tstate > current_t_state) {
+        state->paused_pause_remaining = state->pause_end_tstate - current_t_state;
+    } else {
+        state->paused_pause_remaining = 0;
+    }
+
+    tape_playback_accumulate_elapsed(state, current_t_state);
+    state->last_transition_tstate = current_t_state;
+    state->playing = 0;
+}
+
+static int tape_resume_playback(TapePlaybackState* state, uint64_t current_t_state) {
+    if (!state || state->playing) {
+        return 0;
+    }
+
+    if (state->format == TAPE_FORMAT_WAV) {
+        if (state->waveform.count == 0 || state->waveform_index >= state->waveform.count) {
+            return 0;
+        }
+        uint64_t delay = state->paused_transition_remaining;
+        state->next_transition_tstate = current_t_state + delay;
+        if (delay == 0 && state->next_transition_tstate < current_t_state) {
+            state->next_transition_tstate = current_t_state;
+        }
+        state->playing = 1;
+    } else {
+        if (state->phase == TAPE_PHASE_IDLE || state->phase == TAPE_PHASE_DONE) {
+            tape_start_playback(state, current_t_state);
+            return state->playing;
+        }
+        uint64_t delay = state->paused_transition_remaining;
+        state->next_transition_tstate = current_t_state + delay;
+        if (delay == 0 && state->next_transition_tstate < current_t_state) {
+            state->next_transition_tstate = current_t_state;
+        }
+        if (state->phase == TAPE_PHASE_PAUSE) {
+            uint64_t pause_delay = state->paused_pause_remaining;
+            state->pause_end_tstate = current_t_state + pause_delay;
+            if (pause_delay == 0 && state->pause_end_tstate < current_t_state) {
+                state->pause_end_tstate = current_t_state;
+            }
+        }
+        state->playing = 1;
+    }
+
+    if (state->playing) {
+        state->position_start_tstate = current_t_state;
+        state->last_transition_tstate = current_t_state;
+    }
+
+    state->paused_transition_remaining = 0;
+    state->paused_pause_remaining = 0;
+    tape_ear_state = state->level;
+    return 1;
+}
+
+static void tape_rewind_playback(TapePlaybackState* state) {
+    if (!state) {
+        return;
+    }
+    tape_reset_playback(state);
+}
+
+static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t stop_t_state) {
+    if (!state) {
+        return;
+    }
+
+    if (stop_t_state < state->position_start_tstate) {
+        stop_t_state = state->position_start_tstate;
+    }
+
+    if (stop_t_state > state->position_start_tstate) {
+        state->position_tstates += stop_t_state - state->position_start_tstate;
+    }
+
+    state->position_start_tstate = stop_t_state;
+}
+
+static uint64_t tape_playback_elapsed_tstates(const TapePlaybackState* state, uint64_t current_t_state) {
+    if (!state) {
+        return 0;
+    }
+
+    uint64_t elapsed = state->position_tstates;
+    if (state->playing && current_t_state > state->position_start_tstate) {
+        elapsed += current_t_state - state->position_start_tstate;
+    }
+
+    return elapsed;
+}
+
+static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state) {
+    if (!tape_recorder.enabled) {
+        return 0;
+    }
+
+    uint64_t elapsed = tape_recorder.position_tstates;
+    if (tape_recorder.recording && current_t_state > tape_recorder.position_start_tstate) {
+        elapsed += current_t_state - tape_recorder.position_start_tstate;
+    }
+
+    return elapsed;
+}
+
+static const TapeOverlayGlyph* tape_overlay_find_glyph(char ch) {
+    size_t glyph_count = sizeof(tape_overlay_font) / sizeof(tape_overlay_font[0]);
+    for (size_t i = 0; i < glyph_count; ++i) {
+        if (tape_overlay_font[i].ch == ch) {
+            return &tape_overlay_font[i];
+        }
+    }
+    return &tape_overlay_font[0];
+}
+
+static int tape_overlay_text_width(const char* text, int scale, int spacing) {
+    if (!text) {
+        return 0;
+    }
+
+    int width = 0;
+    int first = 1;
+    for (const char* c = text; *c; ++c) {
+        if (!first) {
+            width += spacing;
+        }
+        first = 0;
+        width += TAPE_OVERLAY_FONT_WIDTH * scale;
+    }
+
+    return width;
+}
+
+static void tape_overlay_draw_text(int origin_x, int origin_y, const char* text, int scale, int spacing, uint32_t color) {
+    if (!text) {
+        return;
+    }
+
+    int cursor_x = origin_x;
+    for (const char* c = text; *c; ++c) {
+        char ch = *c;
+        if (ch >= 'a' && ch <= 'z') {
+            ch = (char)(ch - 'a' + 'A');
+        }
+        const TapeOverlayGlyph* glyph = tape_overlay_find_glyph(ch);
+        for (int row = 0; row < TAPE_OVERLAY_FONT_HEIGHT; ++row) {
+            uint8_t bits = glyph->rows[row];
+            for (int col = 0; col < TAPE_OVERLAY_FONT_WIDTH; ++col) {
+                int bit_index = TAPE_OVERLAY_FONT_WIDTH - 1 - col;
+                if (bits & (1u << bit_index)) {
+                    for (int dy = 0; dy < scale; ++dy) {
+                        int py = origin_y + row * scale + dy;
+                        if (py < 0 || py >= TOTAL_HEIGHT) {
+                            continue;
+                        }
+                        for (int dx = 0; dx < scale; ++dx) {
+                            int px = cursor_x + col * scale + dx;
+                            if (px < 0 || px >= TOTAL_WIDTH) {
+                                continue;
+                            }
+                            pixels[py * TOTAL_WIDTH + px] = color;
+                        }
+                    }
+                }
+            }
+        }
+        cursor_x += TAPE_OVERLAY_FONT_WIDTH * scale + spacing;
+    }
+}
+
+static void tape_render_overlay(void) {
+    if (!tape_input_enabled && !tape_recorder.enabled) {
+        return;
+    }
+
+    const char* mode_text = "STOP";
+    int mode_is_record = 0;
+    int use_recorder_time = 0;
+
+    if (tape_recorder.recording) {
+        mode_text = "REC";
+        mode_is_record = 1;
+        use_recorder_time = 1;
+    } else if (tape_playback.playing) {
+        mode_text = "PLAY";
+    } else {
+        switch (tape_deck_status) {
+            case TAPE_DECK_STATUS_PLAY:
+                mode_text = "PLAY";
+                break;
+            case TAPE_DECK_STATUS_REWIND:
+                mode_text = "REW";
+                break;
+            case TAPE_DECK_STATUS_RECORD:
+                mode_text = "REC";
+                mode_is_record = 1;
+                use_recorder_time = 1;
+                break;
+            case TAPE_DECK_STATUS_STOP:
+            case TAPE_DECK_STATUS_IDLE:
+            default:
+                mode_text = "STOP";
+                break;
+        }
+    }
+
+    if (!use_recorder_time && !tape_input_enabled && tape_recorder.enabled) {
+        use_recorder_time = 1;
+    }
+
+    uint64_t elapsed_tstates = 0;
+    if (use_recorder_time) {
+        elapsed_tstates = tape_recorder_elapsed_tstates(total_t_states);
+    } else if (tape_input_enabled) {
+        elapsed_tstates = tape_playback_elapsed_tstates(&tape_playback, total_t_states);
+    }
+
+    uint64_t clock_hz = (uint64_t)(CPU_CLOCK_HZ + 0.5);
+    if (clock_hz == 0) {
+        clock_hz = 1;
+    }
+    uint64_t total_tenths = (elapsed_tstates * 10ull + clock_hz / 2ull) / clock_hz;
+    uint64_t minutes = total_tenths / 600ull;
+    uint64_t seconds = (total_tenths / 10ull) % 60ull;
+    uint64_t tenths = total_tenths % 10ull;
+    if (minutes > 99ull) {
+        minutes = 99ull;
+    }
+
+    char counter_text[16];
+    (void)snprintf(counter_text, sizeof(counter_text), "%02llu:%02llu.%1llu",
+                   (unsigned long long)minutes,
+                   (unsigned long long)seconds,
+                   (unsigned long long)tenths);
+
+    int scale = 2;
+    int spacing = scale;
+    int padding = 6;
+    int line_gap = scale;
+    int line_height = TAPE_OVERLAY_FONT_HEIGHT * scale;
+
+    int status_width = tape_overlay_text_width(mode_text, scale, spacing);
+    int counter_width = tape_overlay_text_width(counter_text, scale, spacing);
+    int content_width = status_width > counter_width ? status_width : counter_width;
+    int panel_width = content_width + padding * 2;
+    int panel_height = line_height * 2 + padding * 2 + line_gap;
+
+    int origin_x = TOTAL_WIDTH - panel_width - 6;
+    if (origin_x < 0) {
+        origin_x = 0;
+    }
+    int origin_y = 3;
+    if (origin_y + panel_height > BORDER_SIZE) {
+        origin_y = BORDER_SIZE - panel_height;
+        if (origin_y < 0) {
+            origin_y = 0;
+        }
+    }
+
+    uint32_t background_color = 0x202020FFu;
+    uint32_t border_color = 0xFFFFFFFFu;
+    uint32_t status_color = mode_is_record ? 0xFF5555FFu : 0xFFFFFFFFu;
+    uint32_t counter_color = 0xFFFFFFFFu;
+
+    for (int y = 0; y < panel_height; ++y) {
+        int py = origin_y + y;
+        if (py < 0 || py >= TOTAL_HEIGHT) {
+            continue;
+        }
+        for (int x = 0; x < panel_width; ++x) {
+            int px = origin_x + x;
+            if (px < 0 || px >= TOTAL_WIDTH) {
+                continue;
+            }
+            int is_border = (y == 0 || y == panel_height - 1 || x == 0 || x == panel_width - 1);
+            pixels[py * TOTAL_WIDTH + px] = is_border ? border_color : background_color;
+        }
+    }
+
+    int text_x = origin_x + padding;
+    int status_y = origin_y + padding;
+    int counter_y = status_y + line_height + line_gap;
+
+    tape_overlay_draw_text(text_x, status_y, mode_text, scale, spacing, status_color);
+    tape_overlay_draw_text(text_x, counter_y, counter_text, scale, spacing, counter_color);
 }
 
 static int tape_duration_tolerance(int reference) {
@@ -1197,13 +1625,22 @@ static void tape_update(uint64_t current_t_state) {
     if (state->format == TAPE_FORMAT_WAV) {
         while (state->playing && state->waveform_index < state->waveform.count &&
                current_t_state >= state->next_transition_tstate) {
+            uint64_t transition_time = state->next_transition_tstate;
+            if (transition_time < state->last_transition_tstate) {
+                transition_time = state->last_transition_tstate;
+            }
             state->level = state->level ? 0 : 1;
             tape_ear_state = state->level;
             state->waveform_index++;
+            state->last_transition_tstate = transition_time;
             if (state->waveform_index < state->waveform.count) {
-                state->next_transition_tstate += (uint64_t)state->waveform.pulses[state->waveform_index].duration;
+                uint64_t duration = (uint64_t)state->waveform.pulses[state->waveform_index].duration;
+                state->next_transition_tstate = transition_time + duration;
             } else {
                 state->playing = 0;
+                tape_playback_accumulate_elapsed(state, transition_time);
+                tape_deck_status = TAPE_DECK_STATUS_STOP;
+                break;
             }
         }
         return;
@@ -1216,12 +1653,18 @@ static void tape_update(uint64_t current_t_state) {
                     state->phase = TAPE_PHASE_DONE;
                     state->playing = 0;
                     tape_ear_state = 1;
+                    tape_playback_accumulate_elapsed(state, state->pause_end_tstate);
+                    state->last_transition_tstate = state->pause_end_tstate;
+                    tape_deck_status = TAPE_DECK_STATUS_STOP;
                     break;
                 }
                 if (!tape_begin_block(state, state->current_block, state->pause_end_tstate)) {
                     state->phase = TAPE_PHASE_DONE;
                     state->playing = 0;
                     tape_ear_state = 1;
+                    tape_playback_accumulate_elapsed(state, state->pause_end_tstate);
+                    state->last_transition_tstate = state->pause_end_tstate;
+                    tape_deck_status = TAPE_DECK_STATUS_STOP;
                     break;
                 }
                 continue;
@@ -1237,22 +1680,28 @@ static void tape_update(uint64_t current_t_state) {
             break;
         }
 
+        uint64_t transition_time = state->next_transition_tstate;
+        if (transition_time < state->last_transition_tstate) {
+            transition_time = state->last_transition_tstate;
+        }
+
         state->level = state->level ? 0 : 1;
         tape_ear_state = state->level;
+        state->last_transition_tstate = transition_time;
 
         switch (state->phase) {
             case TAPE_PHASE_PILOT:
                 state->pilot_pulses_remaining--;
                 if (state->pilot_pulses_remaining > 0) {
-                    state->next_transition_tstate += (uint64_t)TAPE_PILOT_PULSE_TSTATES;
+                    state->next_transition_tstate = transition_time + (uint64_t)TAPE_PILOT_PULSE_TSTATES;
                 } else {
                     state->phase = TAPE_PHASE_SYNC1;
-                    state->next_transition_tstate += (uint64_t)TAPE_SYNC_FIRST_PULSE_TSTATES;
+                    state->next_transition_tstate = transition_time + (uint64_t)TAPE_SYNC_FIRST_PULSE_TSTATES;
                 }
                 break;
             case TAPE_PHASE_SYNC1:
                 state->phase = TAPE_PHASE_SYNC2;
-                state->next_transition_tstate += (uint64_t)TAPE_SYNC_SECOND_PULSE_TSTATES;
+                state->next_transition_tstate = transition_time + (uint64_t)TAPE_SYNC_SECOND_PULSE_TSTATES;
                 break;
             case TAPE_PHASE_SYNC2: {
                 state->phase = TAPE_PHASE_DATA;
@@ -1266,7 +1715,7 @@ static void tape_update(uint64_t current_t_state) {
                 } else {
                     int bit = (block->data[state->data_byte_index] & state->data_bit_mask) ? 1 : 0;
                     int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
-                    state->next_transition_tstate += (uint64_t)duration;
+                    state->next_transition_tstate = transition_time + (uint64_t)duration;
                     state->data_pulse_half = 1;
                 }
                 break;
@@ -1283,7 +1732,7 @@ static void tape_update(uint64_t current_t_state) {
 
                 int bit = (block->data[state->data_byte_index] & state->data_bit_mask) ? 1 : 0;
                 int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
-                state->next_transition_tstate += (uint64_t)duration;
+                state->next_transition_tstate = transition_time + (uint64_t)duration;
 
                 if (state->data_pulse_half == 0) {
                     state->data_pulse_half = 1;
@@ -1305,6 +1754,16 @@ static void tape_update(uint64_t current_t_state) {
         }
 
         if (!state->playing) {
+            uint64_t stop_time = state->pause_end_tstate;
+            if (stop_time < transition_time) {
+                stop_time = state->next_transition_tstate;
+            }
+            if (stop_time < transition_time) {
+                stop_time = transition_time;
+            }
+            tape_playback_accumulate_elapsed(state, stop_time);
+            state->last_transition_tstate = stop_time;
+            tape_deck_status = TAPE_DECK_STATUS_STOP;
             break;
         }
     }
@@ -1337,9 +1796,68 @@ static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
     tape_recorder.last_level = -1;
     tape_recorder.block_start_level = 0;
     tape_recorder.sample_rate = (audio_sample_rate > 0) ? (uint32_t)audio_sample_rate : 44100u;
+    tape_recorder.recording = 0;
+    tape_recorder.session_dirty = 0;
+    tape_recorder.position_tstates = 0;
+    tape_recorder.position_start_tstate = 0;
     tape_recorder_reset_pulses();
     tape_free_image(&tape_recorder.recorded);
     tape_recorder_reset_audio();
+}
+
+static void tape_recorder_start_session(uint64_t current_t_state, int clear_existing) {
+    if (!tape_recorder.enabled) {
+        fprintf(stderr, "Tape RECORD ignored (no output configured)\n");
+        return;
+    }
+
+    if (tape_recorder.recording) {
+        printf("Tape recorder already active\n");
+        return;
+    }
+
+    if (clear_existing) {
+        tape_recorder_reset_pulses();
+        tape_free_image(&tape_recorder.recorded);
+        tape_recorder_reset_audio();
+        tape_recorder.session_dirty = 0;
+        if (tape_recorder.output_path) {
+            (void)remove(tape_recorder.output_path);
+        }
+        tape_recorder.position_tstates = 0;
+    }
+
+    tape_recorder.recording = 1;
+    tape_recorder.block_active = 0;
+    tape_recorder.last_transition_tstate = current_t_state;
+    tape_recorder.last_level = -1;
+    tape_recorder.block_start_level = 0;
+    tape_recorder.position_start_tstate = current_t_state;
+    printf("Tape RECORD\n");
+}
+
+static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_output) {
+    if (!tape_recorder.enabled) {
+        return;
+    }
+
+    if (tape_recorder.recording) {
+        tape_recorder_update(current_t_state, 1);
+        tape_recorder.recording = 0;
+        tape_recorder.block_active = 0;
+        tape_recorder.last_transition_tstate = current_t_state;
+        tape_recorder.last_level = -1;
+        if (current_t_state > tape_recorder.position_start_tstate) {
+            tape_recorder.position_tstates += current_t_state - tape_recorder.position_start_tstate;
+        }
+        tape_recorder.position_start_tstate = current_t_state;
+    }
+
+    if (finalize_output && tape_recorder.session_dirty) {
+        if (!tape_recorder_write_output()) {
+            fprintf(stderr, "Failed to save tape recording\n");
+        }
+    }
 }
 
 static int tape_recorder_append_pulse(uint64_t duration) {
@@ -1360,6 +1878,7 @@ static int tape_recorder_append_pulse(uint64_t duration) {
     }
     tape_recorder.pulses[tape_recorder.pulse_count].duration = (uint32_t)duration;
     tape_recorder.pulse_count++;
+    tape_recorder.session_dirty = 1;
     return 1;
 }
 
@@ -1403,6 +1922,9 @@ static int tape_recorder_append_audio_samples(int level, size_t sample_count) {
         dest[i] = value;
     }
     tape_recorder.audio_sample_count += sample_count;
+    if (sample_count > 0) {
+        tape_recorder.session_dirty = 1;
+    }
     return 1;
 }
 
@@ -1512,6 +2034,9 @@ static int tape_recorder_write_wav(void) {
         fprintf(stderr, "Failed to finalize tape output '%s': %s\n", tape_recorder.output_path, strerror(errno));
         return 0;
     }
+
+    tape_recorder.session_dirty = 0;
+    printf("Tape recording saved to %s\n", tape_recorder.output_path);
 
     return 1;
 }
@@ -1734,7 +2259,7 @@ static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flu
 }
 
 static void tape_recorder_handle_mic(uint64_t t_state, int level) {
-    if (!tape_recorder.enabled) {
+    if (!tape_recorder.enabled || !tape_recorder.recording) {
         return;
     }
 
@@ -1765,11 +2290,18 @@ static void tape_recorder_update(uint64_t current_t_state, int force_flush) {
     if (!tape_recorder.enabled) {
         return;
     }
+    if (!tape_recorder.recording && !force_flush) {
+        return;
+    }
     tape_recorder_finalize_block(current_t_state, force_flush);
 }
 
 static int tape_recorder_write_output(void) {
     if (!tape_recorder.enabled || !tape_recorder.output_path) {
+        return 1;
+    }
+
+    if (!tape_recorder.session_dirty) {
         return 1;
     }
 
@@ -1812,17 +2344,128 @@ static int tape_recorder_write_output(void) {
         success = 0;
     }
 
+    if (success) {
+        tape_recorder.session_dirty = 0;
+        printf("Tape recording saved to %s\n", tape_recorder.output_path);
+    }
+
     return success;
 }
 
 static void tape_shutdown(void) {
-    tape_recorder_update(total_t_states, 1);
-    (void)tape_recorder_write_output();
+    tape_pause_playback(&tape_playback, total_t_states);
+    tape_recorder_stop_session(total_t_states, 1);
     tape_free_image(&tape_playback.image);
     tape_waveform_reset(&tape_playback.waveform);
     tape_free_image(&tape_recorder.recorded);
     tape_recorder_reset_pulses();
     tape_recorder_reset_audio();
+}
+
+static void tape_deck_play(uint64_t current_t_state) {
+    TapePlaybackState* state = &tape_playback;
+    if (!tape_input_enabled) {
+        printf("Tape PLAY ignored (no tape loaded)\n");
+        return;
+    }
+
+    if (state->playing) {
+        printf("Tape already playing\n");
+        return;
+    }
+
+    if (state->format == TAPE_FORMAT_WAV) {
+        if (state->waveform.count == 0) {
+            printf("Tape PLAY ignored (empty tape)\n");
+            return;
+        }
+        if (!tape_resume_playback(state, current_t_state)) {
+            tape_start_playback(state, current_t_state);
+        }
+    } else {
+        if (state->image.count == 0) {
+            printf("Tape PLAY ignored (empty tape)\n");
+            return;
+        }
+        if (!tape_resume_playback(state, current_t_state)) {
+            tape_start_playback(state, current_t_state);
+        }
+    }
+
+    if (state->playing) {
+        printf("Tape PLAY\n");
+        tape_deck_status = TAPE_DECK_STATUS_PLAY;
+    } else {
+        printf("Tape PLAY ignored (tape at end)\n");
+    }
+}
+
+static void tape_deck_stop(uint64_t current_t_state) {
+    int was_playing = tape_playback.playing;
+    if (was_playing) {
+        tape_pause_playback(&tape_playback, current_t_state);
+    }
+
+    int was_recording = tape_recorder.recording;
+    tape_recorder_stop_session(current_t_state, 1);
+
+    if (was_playing || was_recording) {
+        printf("Tape STOP\n");
+    } else {
+        printf("Tape STOP (idle)\n");
+    }
+    tape_deck_status = TAPE_DECK_STATUS_STOP;
+}
+
+static void tape_deck_rewind(uint64_t current_t_state) {
+    tape_pause_playback(&tape_playback, current_t_state);
+    tape_rewind_playback(&tape_playback);
+    tape_recorder_stop_session(current_t_state, 1);
+    printf("Tape REWIND\n");
+    tape_deck_status = TAPE_DECK_STATUS_REWIND;
+}
+
+static void tape_deck_record(uint64_t current_t_state) {
+    tape_pause_playback(&tape_playback, current_t_state);
+    tape_recorder_start_session(current_t_state, 1);
+    if (tape_recorder.recording) {
+        tape_deck_status = TAPE_DECK_STATUS_RECORD;
+    }
+}
+
+static int tape_handle_control_key(const SDL_Event* event) {
+    if (!event || (event->type != SDL_KEYDOWN && event->type != SDL_KEYUP)) {
+        return 0;
+    }
+
+    SDL_Keycode key = event->key.keysym.sym;
+    if (key != SDLK_F5 && key != SDLK_F6 && key != SDLK_F7 && key != SDLK_F8) {
+        return 0;
+    }
+
+    if (event->type == SDL_KEYDOWN) {
+        if (event->key.repeat) {
+            return 1;
+        }
+        switch (key) {
+            case SDLK_F5:
+                tape_deck_play(total_t_states);
+                break;
+            case SDLK_F6:
+                tape_deck_stop(total_t_states);
+                break;
+            case SDLK_F7:
+                tape_deck_rewind(total_t_states);
+                break;
+            case SDLK_F8:
+                tape_deck_record(total_t_states);
+                break;
+            default:
+                break;
+        }
+    }
+
+    return 1;
 }
 
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
@@ -2529,6 +3172,7 @@ void render_screen(void) {
             for (int bit = 0; bit < 8; ++bit) { int sx=BORDER_SIZE+x_char*8+(7-bit); int sy=BORDER_SIZE+y; pixels[sy*TOTAL_WIDTH+sx]=((pix_byte>>bit)&1)?ink:pap; }
         }
     }
+    tape_render_overlay();
     SDL_UpdateTexture(texture, NULL, pixels, TOTAL_WIDTH * sizeof(uint32_t));
     SDL_RenderClear(renderer); SDL_RenderCopy(renderer, texture, NULL, NULL); SDL_RenderPresent(renderer);
 }
@@ -2725,13 +3369,19 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             tape_recorder_enable(argv[++i], TAPE_OUTPUT_WAV);
-        } else if (!rom_filename) {
-            rom_filename = argv[i];
-            rom_provided = 1;
         } else {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
-            return 1;
+            TapeFormat inferred_format = tape_format_from_extension(argv[i]);
+            if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
+                tape_input_format = inferred_format;
+                tape_input_path = argv[i];
+            } else if (!rom_filename) {
+                rom_filename = argv[i];
+                rom_provided = 1;
+            } else {
+                fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                return 1;
+            }
         }
     }
 
@@ -2810,7 +3460,20 @@ int main(int argc, char *argv[]) {
     total_t_states = 0;
 
     if (tape_input_enabled) {
-        tape_start_playback(&tape_playback, total_t_states);
+        tape_reset_playback(&tape_playback);
+        tape_deck_status = TAPE_DECK_STATUS_STOP;
+    } else if (tape_recorder.enabled) {
+        tape_deck_status = TAPE_DECK_STATUS_STOP;
+    } else {
+        tape_deck_status = TAPE_DECK_STATUS_IDLE;
+    }
+
+    if (tape_input_enabled || tape_recorder.enabled) {
+        printf("Tape controls: F5 Play, F6 Stop, F7 Rewind");
+        if (tape_recorder.enabled) {
+            printf(", F8 Record");
+        }
+        printf("\n");
     }
 
     if (audio_available) {
@@ -2835,6 +3498,9 @@ int main(int argc, char *argv[]) {
             if (e.type == SDL_QUIT) {
                 quit = 1;
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
+                if (tape_handle_control_key(&e)) {
+                    continue;
+                }
                 int row = -1;
                 uint8_t mask = 0;
                 int mapped = map_sdl_key_to_spectrum(e.key.keysym.sym, &row, &mask);
