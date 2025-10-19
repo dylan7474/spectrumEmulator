@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <string.h>
 #include <SDL.h>
-#include <math.h>
 
 // --- Z80 Flag Register Bits ---
 #define FLAG_C  (1 << 0) // Carry Flag
@@ -117,6 +116,7 @@ int cpu_interrupt(Z80* cpu, uint16_t vector_addr);
 void audio_callback(void* userdata, Uint8* stream, int len);
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
 static void beeper_push_event(uint64_t t_state, int level);
+static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
 
 
 // --- Memory Access Helpers ---
@@ -146,6 +146,57 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
     beeper_state = current_level ? 1 : 0;
 }
 
+static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
+    if (beeper_cycles_per_sample <= 0.0) {
+        return 0;
+    }
+
+    double playback_position = playback_position_snapshot;
+    if (catch_up_position <= playback_position) {
+        return 0;
+    }
+
+    double cycles_per_sample = beeper_cycles_per_sample;
+    double last_input = beeper_hp_last_input;
+    double last_output = beeper_hp_last_output;
+    int level = beeper_playback_level;
+    size_t head = beeper_event_head;
+    size_t trimmed = 0;
+
+    while (playback_position + cycles_per_sample <= catch_up_position) {
+        double target_position = playback_position + cycles_per_sample;
+
+        while (head != beeper_event_tail &&
+               (double)beeper_events[head].t_state <= target_position) {
+            level = beeper_events[head].level ? 1 : 0;
+            head = (head + 1) % BEEPER_EVENT_CAPACITY;
+            ++trimmed;
+        }
+
+        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
+        last_input = raw_sample;
+        last_output = filtered_sample;
+
+        playback_position = target_position;
+    }
+
+    while (head != beeper_event_tail &&
+           (double)beeper_events[head].t_state <= catch_up_position) {
+        level = beeper_events[head].level ? 1 : 0;
+        head = (head + 1) % BEEPER_EVENT_CAPACITY;
+        ++trimmed;
+    }
+
+    beeper_event_head = head;
+    beeper_playback_position = playback_position;
+    beeper_playback_level = level;
+    beeper_hp_last_input = last_input;
+    beeper_hp_last_output = last_output;
+
+    return trimmed;
+}
+
 static void beeper_push_event(uint64_t t_state, int level) {
     if (beeper_cycles_per_sample > 0.0) {
         double playback_position_snapshot = beeper_playback_position;
@@ -157,62 +208,17 @@ static void beeper_push_event(uint64_t t_state, int level) {
             if (catch_up_position < 0.0) {
                 catch_up_position = 0.0;
             }
-            size_t head = beeper_event_head;
-            double playback_position = playback_position_snapshot;
-            double last_input = beeper_hp_last_input;
-            double last_output = beeper_hp_last_output;
-            int playback_level = beeper_playback_level;
-            double current_raw = (playback_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+            size_t trimmed = beeper_catch_up_to(catch_up_position, playback_position_snapshot);
 
-            if (playback_position > catch_up_position) {
-                playback_position = catch_up_position;
-            }
+            double new_latency_cycles = (double)t_state - beeper_playback_position;
+            double queued_samples_before = latency_cycles / beeper_cycles_per_sample;
+            double queued_samples_after = new_latency_cycles / beeper_cycles_per_sample;
 
-            while (head != beeper_event_tail &&
-                   beeper_events[head].t_state <= (uint64_t)catch_up_position) {
-                uint64_t event_t_state = beeper_events[head].t_state;
-                double event_position = (double)event_t_state;
-
-                if (event_position < playback_position) {
-                    event_position = playback_position;
-                }
-
-                double delta_cycles = event_position - playback_position;
-                if (delta_cycles > 0.0) {
-                    double sample_delta = delta_cycles / beeper_cycles_per_sample;
-                    double decay = pow(BEEPER_HP_ALPHA, sample_delta);
-                    last_output *= decay;
-                    last_input = current_raw;
-                    playback_position = event_position;
-                }
-
-                int new_level = beeper_events[head].level ? 1 : 0;
-                double new_raw = (new_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
-                double filtered = new_raw - last_input + BEEPER_HP_ALPHA * last_output;
-
-                last_input = new_raw;
-                last_output = filtered;
-                playback_level = new_level;
-                current_raw = new_raw;
-                playback_position = event_position;
-
-                head = (head + 1) % BEEPER_EVENT_CAPACITY;
-            }
-
-            double remaining_cycles = catch_up_position - playback_position;
-            if (remaining_cycles > 0.0) {
-                double sample_delta = remaining_cycles / beeper_cycles_per_sample;
-                double decay = pow(BEEPER_HP_ALPHA, sample_delta);
-                last_output *= decay;
-                last_input = current_raw;
-                playback_position = catch_up_position;
-            }
-
-            beeper_event_head = head;
-            beeper_playback_position = playback_position;
-            beeper_playback_level = playback_level;
-            beeper_hp_last_input = last_input;
-            beeper_hp_last_output = last_output;
+            fprintf(stderr,
+                    "[BEEPER] catch-up: backlog %.2f samples -> %.2f samples (trimmed %zu events)\n",
+                    queued_samples_before,
+                    queued_samples_after,
+                    trimmed);
 
             uint64_t catch_up_cycles = (uint64_t)catch_up_position;
             if (catch_up_cycles > beeper_last_event_t_state) {
