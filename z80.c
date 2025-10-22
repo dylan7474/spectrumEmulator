@@ -156,6 +156,9 @@ typedef struct {
     int session_dirty;
     uint64_t position_tstates;
     uint64_t position_start_tstate;
+    int append_mode;
+    uint32_t append_data_chunk_offset;
+    uint32_t append_existing_data_bytes;
 } TapeRecorder;
 
 static TapePlaybackState tape_playback = {0};
@@ -284,21 +287,25 @@ static void tape_waveform_reset(TapeWaveform* waveform);
 static int tape_waveform_add_pulse(TapeWaveform* waveform, uint64_t duration);
 static int tape_load_wav(const char* path, TapePlaybackState* state);
 static void tape_recorder_enable(const char* path, TapeOutputFormat format);
-static void tape_recorder_start_session(uint64_t current_t_state, int clear_existing);
+static int tape_recorder_start_session(uint64_t current_t_state, int append_mode);
 static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_output);
 static void tape_recorder_handle_mic(uint64_t t_state, int level);
 static void tape_recorder_update(uint64_t current_t_state, int force_flush);
 static int tape_recorder_write_output(void);
 static void tape_recorder_reset_audio(void);
 static size_t tape_recorder_samples_from_tstates(uint64_t duration);
+static uint64_t tape_recorder_tstates_from_samples(uint64_t sample_count);
 static int tape_recorder_append_audio_samples(int level, size_t sample_count);
 static void tape_recorder_append_block_audio(uint64_t idle_cycles);
 static int tape_recorder_write_wav(void);
+static int tape_recorder_prepare_append_wav(uint32_t* data_chunk_offset,
+                                            uint32_t* existing_bytes,
+                                            uint32_t* sample_rate_out);
 static void tape_shutdown(void);
 static void tape_deck_play(uint64_t current_t_state);
 static void tape_deck_stop(uint64_t current_t_state);
 static void tape_deck_rewind(uint64_t current_t_state);
-static void tape_deck_record(uint64_t current_t_state);
+static void tape_deck_record(uint64_t current_t_state, int append_mode);
 static int tape_handle_control_key(const SDL_Event* event);
 static int tape_handle_mouse_button(const SDL_Event* event);
 static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t stop_t_state);
@@ -1701,10 +1708,12 @@ static void tape_render_overlay(void) {
     int button_gap = scale;
     int button_area_width = 0;
     int button_count = 0;
+    int record_available = (tape_recorder.enabled ||
+                            (tape_input_format == TAPE_FORMAT_WAV && tape_input_path)) ? 1 : 0;
     int show_play = tape_input_enabled ? 1 : 0;
     int show_stop = (tape_input_enabled || tape_recorder.enabled) ? 1 : 0;
     int show_rewind = tape_input_enabled ? 1 : 0;
-    int show_record = tape_recorder.enabled ? 1 : 0;
+    int show_record = record_available ? 1 : 0;
 
     if (show_play) {
         if (button_count > 0) {
@@ -1821,7 +1830,7 @@ static void tape_render_overlay(void) {
                                              button_size,
                                              scale,
                                              TAPE_CONTROL_ACTION_RECORD,
-                                             tape_recorder.enabled,
+                                             record_available,
                                              highlight_action == TAPE_CONTROL_ACTION_RECORD);
             button_x += button_size + button_gap;
         }
@@ -2046,6 +2055,174 @@ static void tape_recorder_reset_audio(void) {
     tape_recorder.audio_sample_capacity = 0;
 }
 
+static int tape_recorder_prepare_append_wav(uint32_t* data_chunk_offset,
+                                            uint32_t* existing_bytes,
+                                            uint32_t* sample_rate_out) {
+    if (!tape_recorder.output_path) {
+        return 0;
+    }
+
+    FILE* wf = fopen(tape_recorder.output_path, "rb");
+    if (!wf) {
+        fprintf(stderr,
+                "Tape RECORD append failed: unable to open '%s': %s\n",
+                tape_recorder.output_path,
+                strerror(errno));
+        return 0;
+    }
+
+    uint8_t riff_header[12];
+    if (fread(riff_header, sizeof(riff_header), 1, wf) != 1) {
+        fprintf(stderr,
+                "Tape RECORD append failed: '%s' is not a valid WAV file\n",
+                tape_recorder.output_path);
+        fclose(wf);
+        return 0;
+    }
+
+    if (memcmp(riff_header, "RIFF", 4) != 0 || memcmp(riff_header + 8, "WAVE", 4) != 0) {
+        fprintf(stderr,
+                "Tape RECORD append failed: '%s' is not a valid WAV file\n",
+                tape_recorder.output_path);
+        fclose(wf);
+        return 0;
+    }
+
+    uint16_t audio_format = 0;
+    uint16_t num_channels = 0;
+    uint16_t bits_per_sample = 0;
+    uint32_t sample_rate = 0;
+    uint32_t data_offset = 0;
+    uint32_t data_size = 0;
+    int have_fmt = 0;
+    int have_data = 0;
+
+    for (;;) {
+        uint8_t chunk_header[8];
+        if (fread(chunk_header, sizeof(chunk_header), 1, wf) != 1) {
+            break;
+        }
+
+        long chunk_start = ftell(wf);
+        if (chunk_start < 0) {
+            fclose(wf);
+            return 0;
+        }
+        chunk_start -= 8;
+        if (chunk_start < 0) {
+            fclose(wf);
+            return 0;
+        }
+        uint32_t chunk_size = (uint32_t)chunk_header[4] |
+                               ((uint32_t)chunk_header[5] << 8) |
+                               ((uint32_t)chunk_header[6] << 16) |
+                               ((uint32_t)chunk_header[7] << 24);
+
+        if (memcmp(chunk_header, "fmt ", 4) == 0) {
+            if (chunk_size < 16) {
+                fprintf(stderr,
+                        "Tape RECORD append failed: '%s' has an invalid WAV fmt chunk\n",
+                        tape_recorder.output_path);
+                fclose(wf);
+                return 0;
+            }
+            uint8_t* fmt_data = (uint8_t*)malloc(chunk_size);
+            if (!fmt_data) {
+                fprintf(stderr, "Out of memory while preparing WAV append\n");
+                fclose(wf);
+                return 0;
+            }
+            if (fread(fmt_data, chunk_size, 1, wf) != 1) {
+                fprintf(stderr,
+                        "Tape RECORD append failed: unable to read fmt chunk from '%s'\n",
+                        tape_recorder.output_path);
+                free(fmt_data);
+                fclose(wf);
+                return 0;
+            }
+            audio_format = (uint16_t)fmt_data[0] | ((uint16_t)fmt_data[1] << 8);
+            num_channels = (uint16_t)fmt_data[2] | ((uint16_t)fmt_data[3] << 8);
+            sample_rate = (uint32_t)fmt_data[4] |
+                          ((uint32_t)fmt_data[5] << 8) |
+                          ((uint32_t)fmt_data[6] << 16) |
+                          ((uint32_t)fmt_data[7] << 24);
+            bits_per_sample = (uint16_t)fmt_data[14] | ((uint16_t)fmt_data[15] << 8);
+            free(fmt_data);
+            have_fmt = 1;
+        } else if (memcmp(chunk_header, "data", 4) == 0) {
+            if (chunk_start > (long)UINT32_MAX) {
+                fclose(wf);
+                return 0;
+            }
+            data_offset = (uint32_t)chunk_start;
+            data_size = chunk_size;
+            if (fseek(wf, chunk_size, SEEK_CUR) != 0) {
+                fclose(wf);
+                return 0;
+            }
+            have_data = 1;
+        } else {
+            if (fseek(wf, chunk_size, SEEK_CUR) != 0) {
+                fclose(wf);
+                return 0;
+            }
+        }
+
+        if (chunk_size & 1u) {
+            if (fseek(wf, 1, SEEK_CUR) != 0) {
+                fclose(wf);
+                return 0;
+            }
+        }
+
+        if (have_fmt && have_data) {
+            break;
+        }
+    }
+
+    fclose(wf);
+
+    if (!have_fmt || !have_data) {
+        fprintf(stderr,
+                "Tape RECORD append failed: '%s' is missing WAV metadata\n",
+                tape_recorder.output_path);
+        return 0;
+    }
+
+    if (audio_format != 1 || num_channels != 1 || bits_per_sample != 16) {
+        fprintf(stderr,
+                "Tape RECORD append failed: '%s' must be 16-bit mono PCM\n",
+                tape_recorder.output_path);
+        return 0;
+    }
+
+    if (sample_rate == 0) {
+        fprintf(stderr,
+                "Tape RECORD append failed: '%s' reports an invalid sample rate\n",
+                tape_recorder.output_path);
+        return 0;
+    }
+
+    if ((data_size & 1u) != 0u) {
+        fprintf(stderr,
+                "Tape RECORD append failed: '%s' contains incomplete 16-bit samples\n",
+                tape_recorder.output_path);
+        return 0;
+    }
+
+    if (data_chunk_offset) {
+        *data_chunk_offset = data_offset;
+    }
+    if (existing_bytes) {
+        *existing_bytes = data_size;
+    }
+    if (sample_rate_out) {
+        *sample_rate_out = sample_rate;
+    }
+
+    return 1;
+}
+
 static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
     tape_recorder.output_path = path;
     tape_recorder.enabled = path ? 1 : 0;
@@ -2059,31 +2236,56 @@ static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
     tape_recorder.session_dirty = 0;
     tape_recorder.position_tstates = 0;
     tape_recorder.position_start_tstate = 0;
+    tape_recorder.append_mode = 0;
+    tape_recorder.append_data_chunk_offset = 0;
+    tape_recorder.append_existing_data_bytes = 0;
     tape_recorder_reset_pulses();
     tape_free_image(&tape_recorder.recorded);
     tape_recorder_reset_audio();
 }
 
-static void tape_recorder_start_session(uint64_t current_t_state, int clear_existing) {
+static int tape_recorder_start_session(uint64_t current_t_state, int append_mode) {
     if (!tape_recorder.enabled) {
         fprintf(stderr, "Tape RECORD ignored (no output configured)\n");
-        return;
+        return 0;
     }
 
     if (tape_recorder.recording) {
         printf("Tape recorder already active\n");
-        return;
+        return 0;
     }
 
-    if (clear_existing) {
-        tape_recorder_reset_pulses();
-        tape_free_image(&tape_recorder.recorded);
-        tape_recorder_reset_audio();
-        tape_recorder.session_dirty = 0;
+    int use_append = (append_mode && tape_recorder.output_format == TAPE_OUTPUT_WAV) ? 1 : 0;
+    if (append_mode && tape_recorder.output_format != TAPE_OUTPUT_WAV) {
+        printf("Tape RECORD append is only supported for WAV outputs; starting new capture\n");
+    }
+
+    tape_recorder_reset_pulses();
+    tape_free_image(&tape_recorder.recorded);
+    tape_recorder_reset_audio();
+    tape_recorder.session_dirty = 0;
+    tape_recorder.append_mode = use_append;
+
+    if (use_append) {
+        uint32_t data_offset = 0;
+        uint32_t existing_bytes = 0;
+        uint32_t sample_rate = tape_recorder.sample_rate;
+        if (!tape_recorder_prepare_append_wav(&data_offset, &existing_bytes, &sample_rate)) {
+            tape_recorder.append_mode = 0;
+            return 0;
+        }
+        tape_recorder.append_data_chunk_offset = data_offset;
+        tape_recorder.append_existing_data_bytes = existing_bytes;
+        tape_recorder.sample_rate = sample_rate;
+        uint64_t existing_samples = existing_bytes / sizeof(int16_t);
+        tape_recorder.position_tstates = tape_recorder_tstates_from_samples(existing_samples);
+    } else {
+        tape_recorder.append_data_chunk_offset = 0;
+        tape_recorder.append_existing_data_bytes = 0;
+        tape_recorder.position_tstates = 0;
         if (tape_recorder.output_path) {
             (void)remove(tape_recorder.output_path);
         }
-        tape_recorder.position_tstates = 0;
     }
 
     tape_recorder.recording = 1;
@@ -2092,7 +2294,8 @@ static void tape_recorder_start_session(uint64_t current_t_state, int clear_exis
     tape_recorder.last_level = -1;
     tape_recorder.block_start_level = 0;
     tape_recorder.position_start_tstate = current_t_state;
-    printf("Tape RECORD\n");
+    printf("Tape RECORD%s\n", use_append ? " (append)" : "");
+    return 1;
 }
 
 static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_output) {
@@ -2147,11 +2350,41 @@ static size_t tape_recorder_samples_from_tstates(uint64_t duration) {
     }
     double seconds = (double)duration / CPU_CLOCK_HZ;
     double samples = seconds * (double)tape_recorder.sample_rate;
+    if (samples <= 0.0) {
+        return 0;
+    }
+    if (samples >= (double)SIZE_MAX) {
+        return SIZE_MAX;
+    }
     size_t count = (size_t)(samples + 0.5);
-    if (count == 0 && duration > 0) {
+    if (count == 0 && samples > 0.0) {
         count = 1;
     }
     return count;
+}
+
+static uint64_t tape_recorder_tstates_from_samples(uint64_t sample_count) {
+    uint32_t sample_rate = tape_recorder.sample_rate ? tape_recorder.sample_rate : 44100u;
+    if (sample_rate == 0 || sample_count == 0) {
+        return 0;
+    }
+
+    double seconds = (double)sample_count / (double)sample_rate;
+    double tstates = seconds * CPU_CLOCK_HZ;
+    if (tstates <= 0.0) {
+        return 0;
+    }
+
+    if (tstates >= (double)UINT64_MAX) {
+        return UINT64_MAX;
+    }
+
+    uint64_t rounded = (uint64_t)(tstates + 0.5);
+    if (rounded == 0 && tstates > 0.0) {
+        rounded = 1;
+    }
+
+    return rounded;
 }
 
 static int tape_recorder_append_audio_samples(int level, size_t sample_count) {
@@ -2228,6 +2461,112 @@ static int tape_recorder_write_wav(void) {
 
     uint32_t sample_rate = tape_recorder.sample_rate ? tape_recorder.sample_rate : 44100u;
     size_t sample_count = tape_recorder.audio_sample_count;
+    if (tape_recorder.append_mode) {
+        if (sample_count == 0) {
+            tape_recorder.session_dirty = 0;
+            return 1;
+        }
+
+        uint64_t append_bytes = (uint64_t)sample_count * sizeof(int16_t);
+        if (append_bytes > UINT32_MAX) {
+            fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
+            return 0;
+        }
+
+        uint32_t data_offset = tape_recorder.append_data_chunk_offset;
+        uint32_t existing_bytes = tape_recorder.append_existing_data_bytes;
+        uint64_t total_bytes = (uint64_t)existing_bytes + append_bytes;
+        if (total_bytes > UINT32_MAX) {
+            fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
+            return 0;
+        }
+
+        FILE* tf = fopen(tape_recorder.output_path, "rb+");
+        if (!tf) {
+            fprintf(stderr,
+                    "Failed to open tape output '%s': %s\n",
+                    tape_recorder.output_path,
+                    strerror(errno));
+            return 0;
+        }
+
+        if (fseek(tf, 0, SEEK_END) != 0) {
+            fclose(tf);
+            return 0;
+        }
+
+        if (sample_count > 0) {
+            if (fwrite(tape_recorder.audio_samples, sizeof(int16_t), sample_count, tf) != sample_count) {
+                fprintf(stderr, "Failed to append WAV data\n");
+                fclose(tf);
+                return 0;
+            }
+        }
+
+        long final_pos = ftell(tf);
+        if (final_pos < 0) {
+            fclose(tf);
+            return 0;
+        }
+
+        uint64_t chunk_size_64 = (uint64_t)final_pos - 8u;
+        if (chunk_size_64 > UINT32_MAX) {
+            fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
+            fclose(tf);
+            return 0;
+        }
+        uint32_t chunk_size = (uint32_t)chunk_size_64;
+        uint32_t data_bytes = (uint32_t)total_bytes;
+
+        if (fseek(tf, 4, SEEK_SET) != 0) {
+            fclose(tf);
+            return 0;
+        }
+        uint8_t chunk_size_bytes[4];
+        chunk_size_bytes[0] = (uint8_t)(chunk_size & 0xFFu);
+        chunk_size_bytes[1] = (uint8_t)((chunk_size >> 8) & 0xFFu);
+        chunk_size_bytes[2] = (uint8_t)((chunk_size >> 16) & 0xFFu);
+        chunk_size_bytes[3] = (uint8_t)((chunk_size >> 24) & 0xFFu);
+        if (fwrite(chunk_size_bytes, sizeof(chunk_size_bytes), 1, tf) != 1) {
+            fprintf(stderr, "Failed to update WAV header\n");
+            fclose(tf);
+            return 0;
+        }
+
+        if (data_offset > (uint32_t)LONG_MAX - 4u) {
+            fclose(tf);
+            return 0;
+        }
+        long data_size_pos = (long)data_offset + 4l;
+        if (data_size_pos < 0 || fseek(tf, data_size_pos, SEEK_SET) != 0) {
+            fclose(tf);
+            return 0;
+        }
+        uint8_t data_bytes_array[4];
+        data_bytes_array[0] = (uint8_t)(data_bytes & 0xFFu);
+        data_bytes_array[1] = (uint8_t)((data_bytes >> 8) & 0xFFu);
+        data_bytes_array[2] = (uint8_t)((data_bytes >> 16) & 0xFFu);
+        data_bytes_array[3] = (uint8_t)((data_bytes >> 24) & 0xFFu);
+        if (fwrite(data_bytes_array, sizeof(data_bytes_array), 1, tf) != 1) {
+            fprintf(stderr, "Failed to update WAV header\n");
+            fclose(tf);
+            return 0;
+        }
+
+        if (fclose(tf) != 0) {
+            fprintf(stderr,
+                    "Failed to finalize tape output '%s': %s\n",
+                    tape_recorder.output_path,
+                    strerror(errno));
+            return 0;
+        }
+
+        tape_recorder.append_existing_data_bytes = data_bytes;
+        tape_recorder.session_dirty = 0;
+        printf("Tape recording saved to %s\n", tape_recorder.output_path);
+        return 1;
+    }
+
     uint64_t data_bytes_64 = sample_count * sizeof(int16_t);
     if (data_bytes_64 > UINT32_MAX) {
         fprintf(stderr, "Recorded audio exceeds WAV size limits\n");
@@ -2684,9 +3023,24 @@ static void tape_deck_rewind(uint64_t current_t_state) {
     tape_deck_status = TAPE_DECK_STATUS_REWIND;
 }
 
-static void tape_deck_record(uint64_t current_t_state) {
+static void tape_deck_record(uint64_t current_t_state, int append_mode) {
+    if (!tape_recorder.enabled) {
+        if (tape_input_format == TAPE_FORMAT_WAV && tape_input_path) {
+            tape_recorder_enable(tape_input_path, TAPE_OUTPUT_WAV);
+            if (tape_playback.waveform.sample_rate > 0) {
+                tape_recorder.sample_rate = tape_playback.waveform.sample_rate;
+            }
+            printf("Tape recorder destination set to %s\n", tape_recorder.output_path);
+        } else {
+            printf("Tape RECORD ignored (no output configured)\n");
+            return;
+        }
+    }
+
     tape_pause_playback(&tape_playback, current_t_state);
-    tape_recorder_start_session(current_t_state, 1);
+    if (!tape_recorder_start_session(current_t_state, append_mode ? 1 : 0)) {
+        return;
+    }
     if (tape_recorder.recording) {
         tape_deck_status = TAPE_DECK_STATUS_RECORD;
     }
@@ -2706,6 +3060,7 @@ static int tape_handle_control_key(const SDL_Event* event) {
         if (event->key.repeat) {
             return 1;
         }
+        int append_mode = (event->key.keysym.mod & KMOD_SHIFT) ? 1 : 0;
         switch (key) {
             case SDLK_F5:
                 tape_deck_play(total_t_states);
@@ -2717,7 +3072,7 @@ static int tape_handle_control_key(const SDL_Event* event) {
                 tape_deck_rewind(total_t_states);
                 break;
             case SDLK_F8:
-                tape_deck_record(total_t_states);
+                tape_deck_record(total_t_states, append_mode);
                 break;
             default:
                 break;
@@ -2773,7 +3128,11 @@ static int tape_handle_mouse_button(const SDL_Event* event) {
                 tape_deck_rewind(total_t_states);
                 break;
             case TAPE_CONTROL_ACTION_RECORD:
-                tape_deck_record(total_t_states);
+                {
+                    SDL_Keymod mods = SDL_GetModState();
+                    int append_mode = (mods & KMOD_SHIFT) ? 1 : 0;
+                    tape_deck_record(total_t_states, append_mode);
+                }
                 break;
             case TAPE_CONTROL_ACTION_NONE:
             default:
