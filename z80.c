@@ -3500,7 +3500,9 @@ static void tape_deck_stop(uint64_t current_t_state) {
     }
 
     int was_recording = tape_recorder.recording;
-    tape_recorder_stop_session(current_t_state, 1);
+    if (was_recording || tape_recorder.session_dirty) {
+        tape_recorder_stop_session(current_t_state, 1);
+    }
 
     if (was_playing || was_recording) {
         printf("Tape STOP\n");
