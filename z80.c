@@ -173,6 +173,33 @@ typedef enum {
 
 static TapeDeckStatus tape_deck_status = TAPE_DECK_STATUS_IDLE;
 
+typedef enum {
+    TAPE_CONTROL_ACTION_NONE = 0,
+    TAPE_CONTROL_ACTION_PLAY,
+    TAPE_CONTROL_ACTION_STOP,
+    TAPE_CONTROL_ACTION_REWIND,
+    TAPE_CONTROL_ACTION_RECORD
+} TapeControlAction;
+
+#define TAPE_CONTROL_BUTTON_MAX 4
+#define TAPE_CONTROL_ICON_WIDTH 7
+#define TAPE_CONTROL_ICON_HEIGHT 7
+
+typedef struct {
+    TapeControlAction action;
+    SDL_Rect rect;
+    int enabled;
+    int visible;
+} TapeControlButton;
+
+typedef struct {
+    TapeControlAction action;
+    uint8_t rows[TAPE_CONTROL_ICON_HEIGHT];
+} TapeControlIcon;
+
+static TapeControlButton tape_control_buttons[TAPE_CONTROL_BUTTON_MAX];
+static int tape_control_button_count = 0;
+
 #define TAPE_OVERLAY_FONT_WIDTH 5
 #define TAPE_OVERLAY_FONT_HEIGHT 7
 
@@ -206,6 +233,25 @@ static const TapeOverlayGlyph tape_overlay_font[] = {
     {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
     {':', {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}},
     {'.', {0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x00}}
+};
+
+static const TapeControlIcon tape_control_icons[] = {
+    {
+        TAPE_CONTROL_ACTION_PLAY,
+        {0x08, 0x0C, 0x0E, 0x0F, 0x0E, 0x0C, 0x08}
+    },
+    {
+        TAPE_CONTROL_ACTION_STOP,
+        {0x00, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x00}
+    },
+    {
+        TAPE_CONTROL_ACTION_REWIND,
+        {0x48, 0x6C, 0x7E, 0x7F, 0x7E, 0x6C, 0x48}
+    },
+    {
+        TAPE_CONTROL_ACTION_RECORD,
+        {0x00, 0x1C, 0x3E, 0x3E, 0x3E, 0x1C, 0x00}
+    }
 };
 
 typedef struct {
@@ -254,6 +300,7 @@ static void tape_deck_stop(uint64_t current_t_state);
 static void tape_deck_rewind(uint64_t current_t_state);
 static void tape_deck_record(uint64_t current_t_state);
 static int tape_handle_control_key(const SDL_Event* event);
+static int tape_handle_mouse_button(const SDL_Event* event);
 static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t stop_t_state);
 static uint64_t tape_playback_elapsed_tstates(const TapePlaybackState* state, uint64_t current_t_state);
 static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
@@ -1452,7 +1499,132 @@ static void tape_overlay_draw_text(int origin_x, int origin_y, const char* text,
     }
 }
 
+static const TapeControlIcon* tape_control_find_icon(TapeControlAction action) {
+    size_t icon_count = sizeof(tape_control_icons) / sizeof(tape_control_icons[0]);
+    for (size_t i = 0; i < icon_count; ++i) {
+        if (tape_control_icons[i].action == action) {
+            return &tape_control_icons[i];
+        }
+    }
+    return NULL;
+}
+
+static TapeControlAction tape_control_action_from_status(TapeDeckStatus status) {
+    switch (status) {
+        case TAPE_DECK_STATUS_PLAY:
+            return TAPE_CONTROL_ACTION_PLAY;
+        case TAPE_DECK_STATUS_STOP:
+            return TAPE_CONTROL_ACTION_STOP;
+        case TAPE_DECK_STATUS_REWIND:
+            return TAPE_CONTROL_ACTION_REWIND;
+        case TAPE_DECK_STATUS_RECORD:
+            return TAPE_CONTROL_ACTION_RECORD;
+        case TAPE_DECK_STATUS_IDLE:
+        default:
+            break;
+    }
+    return TAPE_CONTROL_ACTION_NONE;
+}
+
+static void tape_overlay_draw_icon(int origin_x, int origin_y, const TapeControlIcon* icon, int scale, uint32_t color) {
+    if (!icon) {
+        return;
+    }
+
+    for (int row = 0; row < TAPE_CONTROL_ICON_HEIGHT; ++row) {
+        uint8_t bits = icon->rows[row];
+        for (int col = 0; col < TAPE_CONTROL_ICON_WIDTH; ++col) {
+            int bit_index = TAPE_CONTROL_ICON_WIDTH - 1 - col;
+            if (bits & (1u << bit_index)) {
+                for (int dy = 0; dy < scale; ++dy) {
+                    int py = origin_y + row * scale + dy;
+                    if (py < 0 || py >= TOTAL_HEIGHT) {
+                        continue;
+                    }
+                    for (int dx = 0; dx < scale; ++dx) {
+                        int px = origin_x + col * scale + dx;
+                        if (px < 0 || px >= TOTAL_WIDTH) {
+                            continue;
+                        }
+                        pixels[py * TOTAL_WIDTH + px] = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void tape_overlay_draw_control_button(int x,
+                                             int y,
+                                             int size,
+                                             int scale,
+                                             TapeControlAction action,
+                                             int enabled,
+                                             int highlight) {
+    if (tape_control_button_count >= TAPE_CONTROL_BUTTON_MAX) {
+        return;
+    }
+
+    uint32_t border_color = 0xFFFFFFFFu;
+    uint32_t background_color = enabled ? 0x383838FFu : 0x2A2A2AFFu;
+    uint32_t icon_color = enabled ? 0xFFFFFFFFu : 0x7F7F7FFFu;
+
+    if (action == TAPE_CONTROL_ACTION_RECORD) {
+        icon_color = enabled ? 0xFF4444FFu : 0x803030FFu;
+    }
+
+    if (highlight && enabled) {
+        if (action == TAPE_CONTROL_ACTION_RECORD) {
+            background_color = 0x7F1E1EFFu;
+        } else {
+            background_color = 0x2E6F3FFFu;
+        }
+    }
+
+    for (int yy = 0; yy < size; ++yy) {
+        int py = y + yy;
+        if (py < 0 || py >= TOTAL_HEIGHT) {
+            continue;
+        }
+        for (int xx = 0; xx < size; ++xx) {
+            int px = x + xx;
+            if (px < 0 || px >= TOTAL_WIDTH) {
+                continue;
+            }
+            int is_border = (yy == 0 || yy == size - 1 || xx == 0 || xx == size - 1);
+            pixels[py * TOTAL_WIDTH + px] = is_border ? border_color : background_color;
+        }
+    }
+
+    int icon_pixel_width = TAPE_CONTROL_ICON_WIDTH * scale;
+    int icon_pixel_height = TAPE_CONTROL_ICON_HEIGHT * scale;
+    int icon_origin_x = x + (size - icon_pixel_width) / 2;
+    int icon_origin_y = y + (size - icon_pixel_height) / 2;
+    const TapeControlIcon* icon = tape_control_find_icon(action);
+    tape_overlay_draw_icon(icon_origin_x, icon_origin_y, icon, scale, icon_color);
+
+    TapeControlButton* button = &tape_control_buttons[tape_control_button_count++];
+    button->action = action;
+    button->rect.x = x;
+    button->rect.y = y;
+    button->rect.w = size;
+    button->rect.h = size;
+    button->enabled = enabled ? 1 : 0;
+    button->visible = 1;
+}
+
 static void tape_render_overlay(void) {
+    for (int i = 0; i < TAPE_CONTROL_BUTTON_MAX; ++i) {
+        tape_control_buttons[i].action = TAPE_CONTROL_ACTION_NONE;
+        tape_control_buttons[i].rect.x = 0;
+        tape_control_buttons[i].rect.y = 0;
+        tape_control_buttons[i].rect.w = 0;
+        tape_control_buttons[i].rect.h = 0;
+        tape_control_buttons[i].enabled = 0;
+        tape_control_buttons[i].visible = 0;
+    }
+    tape_control_button_count = 0;
+
     if (!tape_input_enabled && !tape_recorder.enabled) {
         return;
     }
@@ -1520,12 +1692,52 @@ static void tape_render_overlay(void) {
     int scale = 2;
     int spacing = scale;
     int padding = 6;
-    int line_gap = scale;
     int line_height = TAPE_OVERLAY_FONT_HEIGHT * scale;
-
+    int line_gap = scale;
     int status_width = tape_overlay_text_width(mode_text, scale, spacing);
     int counter_width = tape_overlay_text_width(counter_text, scale, spacing);
-    int content_width = status_width > counter_width ? status_width : counter_width;
+
+    int button_size = line_height;
+    int button_gap = scale;
+    int button_area_width = 0;
+    int button_count = 0;
+    int show_play = tape_input_enabled ? 1 : 0;
+    int show_stop = (tape_input_enabled || tape_recorder.enabled) ? 1 : 0;
+    int show_rewind = tape_input_enabled ? 1 : 0;
+    int show_record = tape_recorder.enabled ? 1 : 0;
+
+    if (show_play) {
+        if (button_count > 0) {
+            button_area_width += button_gap;
+        }
+        button_area_width += button_size;
+        ++button_count;
+    }
+    if (show_stop) {
+        if (button_count > 0) {
+            button_area_width += button_gap;
+        }
+        button_area_width += button_size;
+        ++button_count;
+    }
+    if (show_rewind) {
+        if (button_count > 0) {
+            button_area_width += button_gap;
+        }
+        button_area_width += button_size;
+        ++button_count;
+    }
+    if (show_record) {
+        if (button_count > 0) {
+            button_area_width += button_gap;
+        }
+        button_area_width += button_size;
+        ++button_count;
+    }
+
+    int counter_button_spacing = button_count > 0 ? scale * 2 : 0;
+    int counter_row_width = counter_width + counter_button_spacing + button_area_width;
+    int content_width = status_width > counter_row_width ? status_width : counter_row_width;
     int panel_width = content_width + padding * 2;
     int panel_height = line_height * 2 + padding * 2 + line_gap;
 
@@ -1567,6 +1779,53 @@ static void tape_render_overlay(void) {
 
     tape_overlay_draw_text(text_x, status_y, mode_text, scale, spacing, status_color);
     tape_overlay_draw_text(text_x, counter_y, counter_text, scale, spacing, counter_color);
+
+    if (button_count > 0) {
+        int button_x = text_x + counter_width + counter_button_spacing;
+        int button_y = counter_y;
+        TapeControlAction highlight_action = tape_control_action_from_status(tape_deck_status);
+
+        if (show_play) {
+            tape_overlay_draw_control_button(button_x,
+                                             button_y,
+                                             button_size,
+                                             scale,
+                                             TAPE_CONTROL_ACTION_PLAY,
+                                             tape_input_enabled,
+                                             highlight_action == TAPE_CONTROL_ACTION_PLAY);
+            button_x += button_size + button_gap;
+        }
+        if (show_stop) {
+            tape_overlay_draw_control_button(button_x,
+                                             button_y,
+                                             button_size,
+                                             scale,
+                                             TAPE_CONTROL_ACTION_STOP,
+                                             show_stop,
+                                             highlight_action == TAPE_CONTROL_ACTION_STOP);
+            button_x += button_size + button_gap;
+        }
+        if (show_rewind) {
+            tape_overlay_draw_control_button(button_x,
+                                             button_y,
+                                             button_size,
+                                             scale,
+                                             TAPE_CONTROL_ACTION_REWIND,
+                                             tape_input_enabled,
+                                             highlight_action == TAPE_CONTROL_ACTION_REWIND);
+            button_x += button_size + button_gap;
+        }
+        if (show_record) {
+            tape_overlay_draw_control_button(button_x,
+                                             button_y,
+                                             button_size,
+                                             scale,
+                                             TAPE_CONTROL_ACTION_RECORD,
+                                             tape_recorder.enabled,
+                                             highlight_action == TAPE_CONTROL_ACTION_RECORD);
+            button_x += button_size + button_gap;
+        }
+    }
 }
 
 static int tape_duration_tolerance(int reference) {
@@ -2466,6 +2725,65 @@ static int tape_handle_control_key(const SDL_Event* event) {
     }
 
     return 1;
+}
+
+static int tape_handle_mouse_button(const SDL_Event* event) {
+    if (!event || event->type != SDL_MOUSEBUTTONDOWN) {
+        return 0;
+    }
+
+    if (event->button.button != SDL_BUTTON_LEFT) {
+        return 0;
+    }
+
+    if (tape_control_button_count <= 0) {
+        return 0;
+    }
+
+    int mouse_x = event->button.x;
+    int mouse_y = event->button.y;
+
+    for (int i = 0; i < tape_control_button_count; ++i) {
+        TapeControlButton* button = &tape_control_buttons[i];
+        if (!button->visible) {
+            continue;
+        }
+
+        int left = button->rect.x;
+        int top = button->rect.y;
+        int right = left + button->rect.w;
+        int bottom = top + button->rect.h;
+
+        if (mouse_x < left || mouse_x >= right || mouse_y < top || mouse_y >= bottom) {
+            continue;
+        }
+
+        if (!button->enabled) {
+            return 1;
+        }
+
+        switch (button->action) {
+            case TAPE_CONTROL_ACTION_PLAY:
+                tape_deck_play(total_t_states);
+                break;
+            case TAPE_CONTROL_ACTION_STOP:
+                tape_deck_stop(total_t_states);
+                break;
+            case TAPE_CONTROL_ACTION_REWIND:
+                tape_deck_rewind(total_t_states);
+                break;
+            case TAPE_CONTROL_ACTION_RECORD:
+                tape_deck_record(total_t_states);
+                break;
+            case TAPE_CONTROL_ACTION_NONE:
+            default:
+                break;
+        }
+
+        return 1;
+    }
+
+    return 0;
 }
 
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
@@ -3497,6 +3815,10 @@ int main(int argc, char *argv[]) {
         while (SDL_PollEvent(&e) != 0) {
             if (e.type == SDL_QUIT) {
                 quit = 1;
+            } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                if (tape_handle_mouse_button(&e)) {
+                    continue;
+                }
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
                 if (tape_handle_control_key(&e)) {
                     continue;
