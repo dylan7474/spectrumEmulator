@@ -4338,14 +4338,21 @@ void cleanup_sdl(void) {
 // --- Render ZX Spectrum Screen ---
 void render_screen(void) {
     uint32_t border_rgba = spectrum_colors[border_color_idx & 7];
+    uint64_t frame_count = total_t_states / T_STATES_PER_FRAME;
+    int flash_phase = (int)((frame_count >> 5) & 1ULL);
     for(int y=0; y<TOTAL_HEIGHT; ++y) { for(int x=0; x<TOTAL_WIDTH; ++x) { if(x<BORDER_SIZE || x>=BORDER_SIZE+SCREEN_WIDTH || y<BORDER_SIZE || y>=BORDER_SIZE+SCREEN_HEIGHT) pixels[y * TOTAL_WIDTH + x] = border_rgba; } }
     for (int y = 0; y < SCREEN_HEIGHT; ++y) {
         for (int x_char = 0; x_char < SCREEN_WIDTH / 8; ++x_char) {
             uint16_t pix_addr = VRAM_START + ((y & 0xC0) << 5) + ((y & 7) << 8) + ((y & 0x38) << 2) + x_char;
             uint16_t attr_addr = ATTR_START + (y / 8 * 32) + x_char;
             uint8_t pix_byte = memory[pix_addr]; uint8_t attr_byte = memory[attr_addr];
-            int ink_idx=attr_byte&7; int pap_idx=(attr_byte>>3)&7; int bright=(attr_byte>>6)&1; int flash=(attr_byte>>7)&1; (void)flash;
+            int ink_idx=attr_byte&7; int pap_idx=(attr_byte>>3)&7; int bright=(attr_byte>>6)&1; int flash=(attr_byte>>7)&1;
             const uint32_t* cmap=bright?spectrum_bright_colors:spectrum_colors; uint32_t ink=cmap[ink_idx]; uint32_t pap=cmap[pap_idx];
+            if (flash && flash_phase) {
+                uint32_t tmp = ink;
+                ink = pap;
+                pap = tmp;
+            }
             for (int bit = 0; bit < 8; ++bit) { int sx=BORDER_SIZE+x_char*8+(7-bit); int sy=BORDER_SIZE+y; pixels[sy*TOTAL_WIDTH+sx]=((pix_byte>>bit)&1)?ink:pap; }
         }
     }
