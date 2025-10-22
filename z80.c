@@ -2790,7 +2790,7 @@ static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_ou
             } else {
                 tape_reset_playback(&tape_playback);
                 tape_wav_seek_playback(&tape_playback, tape_wav_shared_position_tstates);
-                tape_input_enabled = (tape_playback.waveform.count > 0) ? 1 : 0;
+                tape_input_enabled = 1;
             }
         }
     }
@@ -4605,10 +4605,8 @@ int main(int argc, char *argv[]) {
                    (unsigned)tape_playback.waveform.sample_rate);
             if (tape_playback.waveform.count == 0) {
                 fprintf(stderr, "Warning: WAV tape '%s' contains no transitions\n", tape_input_path);
-                tape_input_enabled = 0;
-            } else {
-                tape_input_enabled = 1;
             }
+            tape_input_enabled = 1;
         } else {
             tape_playback.format = tape_input_format;
             tape_waveform_reset(&tape_playback.waveform);
