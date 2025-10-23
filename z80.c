@@ -1334,7 +1334,7 @@ static void tape_reset_playback(TapePlaybackState* state) {
     state->phase = TAPE_PHASE_IDLE;
     state->pilot_pulses_remaining = 0;
     state->data_byte_index = 0;
-    state->data_bit_mask = 0x80u;
+    state->data_bit_mask = 0x01u;
     state->data_pulse_half = 0;
     state->next_transition_tstate = 0;
     state->pause_end_tstate = 0;
@@ -1376,7 +1376,7 @@ static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64
     state->current_block = block_index;
     state->pilot_pulses_remaining = tape_current_block_pilot_count(state);
     state->data_byte_index = 0;
-    state->data_bit_mask = 0x80u;
+    state->data_bit_mask = 0x01u;
     state->data_pulse_half = 0;
     state->phase = TAPE_PHASE_PILOT;
     state->level = 1;
@@ -2199,9 +2199,9 @@ static void tape_update(uint64_t current_t_state) {
                     state->data_pulse_half = 1;
                 } else {
                     state->data_pulse_half = 0;
-                    state->data_bit_mask >>= 1;
+                    state->data_bit_mask <<= 1;
                     if (state->data_bit_mask == 0) {
-                        state->data_bit_mask = 0x80u;
+                        state->data_bit_mask = 0x01u;
                         state->data_byte_index++;
                         if (state->data_byte_index >= block->length) {
                             tape_finish_block_playback(state);
