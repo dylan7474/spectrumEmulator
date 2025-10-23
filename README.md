@@ -105,7 +105,7 @@ infers `.tap`, `.tzx`, and `.wav` formats from positional arguments, so running
 `./z80 digitized.wav` loads the bundled ROM and cues the specified tape at
 startup.
 
-Loaded tapes remain cued at the start. Press **F5** to begin playback when the Spectrum is ready to `LOAD`, use **F6** to pause/stop, and tap **F7** to rewind to the beginning at any time.
+Loaded tapes remain cued at the start. Press **F5** to begin playback when the Spectrum is ready to `LOAD`, use **F6** to pause/stop, and tap **F7** to rewind to the beginning at any time. Playback now resumes from the last head position instead of rewinding automatically, so multi-part programs can continue loading sequential blocks. When the tape reaches the end, press **F7** (or click the on-screen rewind control) before hitting play again to restart from the top.
 
 While a tape source or recording destination is configured, a status panel in the upper border shows the current deck mode and a running counter so you can monitor playback and capture progress without leaving the emulator window. The panel exposes on-screen play, stop, rewind, and record controls so you can drive the deck entirely with the mouse when preferred.
 
