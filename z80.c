@@ -1437,7 +1437,7 @@ static void tape_reset_playback(TapePlaybackState* state) {
     state->phase = TAPE_PHASE_IDLE;
     state->pilot_pulses_remaining = 0;
     state->data_byte_index = 0;
-    state->data_bit_mask = 0x01u;
+    state->data_bit_mask = 0x80u;
     state->data_parity_bit = 0u;
     state->data_sending_parity = 0;
     state->data_pulse_half = 0;
@@ -1487,7 +1487,7 @@ static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64
     }
     state->pilot_pulses_remaining = tape_current_block_pilot_count(state);
     state->data_byte_index = 0;
-    state->data_bit_mask = 0x01u;
+    state->data_bit_mask = 0x80u;
     state->data_parity_bit = 0u;
     state->data_sending_parity = 0;
     state->data_pulse_half = 0;
@@ -2169,7 +2169,7 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
         state->pause_end_tstate = state->next_transition_tstate + pause;
         state->current_block++;
         state->data_sending_parity = 0;
-        state->data_bit_mask = 0x01u;
+        state->data_bit_mask = 0x80u;
         if (pause == 0) {
             uint64_t start_time = state->pause_end_tstate;
             if (state->current_block < state->image.count) {
@@ -2202,15 +2202,12 @@ static uint8_t tape_byte_parity(uint8_t value) {
 }
 
 static int tape_bit_index_from_mask(uint8_t mask) {
-    int index = 0;
-    if (mask == 0u) {
-        return 0;
+    for (int bit = 7; bit >= 0; --bit) {
+        if ((mask >> bit) & 1u) {
+            return bit;
+        }
     }
-    while (mask > 1u) {
-        mask >>= 1;
-        index++;
-    }
-    return index;
+    return 0;
 }
 
 static int tape_current_data_bit(const TapePlaybackState* state, const TapeBlock* block) {
@@ -2398,13 +2395,13 @@ static void tape_update(uint64_t current_t_state) {
                                      state->data_parity_bit);
                         }
                         state->data_sending_parity = 0;
-                        state->data_bit_mask = 0x01u;
+                        state->data_bit_mask = 0x80u;
                         state->data_byte_index++;
                         if (state->data_byte_index >= block->length) {
                             tape_finish_block_playback(state);
                         }
                     } else {
-                        state->data_bit_mask <<= 1;
+                        state->data_bit_mask >>= 1;
                         if (state->data_bit_mask == 0) {
                             state->data_parity_bit = tape_byte_parity(block->data[state->data_byte_index]);
                             state->data_sending_parity = 1;
