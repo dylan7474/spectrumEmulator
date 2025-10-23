@@ -117,6 +117,8 @@ typedef struct {
     int pilot_pulses_remaining;
     size_t data_byte_index;
     uint8_t data_bit_mask;
+    uint8_t data_parity_bit;
+    int data_sending_parity;
     int data_pulse_half;
     uint64_t next_transition_tstate;
     uint64_t pause_end_tstate;
@@ -1335,6 +1337,8 @@ static void tape_reset_playback(TapePlaybackState* state) {
     state->pilot_pulses_remaining = 0;
     state->data_byte_index = 0;
     state->data_bit_mask = 0x01u;
+    state->data_parity_bit = 0u;
+    state->data_sending_parity = 0;
     state->data_pulse_half = 0;
     state->next_transition_tstate = 0;
     state->pause_end_tstate = 0;
@@ -1377,6 +1381,8 @@ static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64
     state->pilot_pulses_remaining = tape_current_block_pilot_count(state);
     state->data_byte_index = 0;
     state->data_bit_mask = 0x01u;
+    state->data_parity_bit = 0u;
+    state->data_sending_parity = 0;
     state->data_pulse_half = 0;
     state->phase = TAPE_PHASE_PILOT;
     state->level = 1;
@@ -2049,6 +2055,8 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
         state->phase = TAPE_PHASE_PAUSE;
         state->pause_end_tstate = state->next_transition_tstate + pause;
         state->current_block++;
+        state->data_sending_parity = 0;
+        state->data_bit_mask = 0x01u;
         if (pause == 0) {
             uint64_t start_time = state->pause_end_tstate;
             if (state->current_block < state->image.count) {
@@ -2068,6 +2076,23 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
         state->playing = 0;
         tape_ear_state = 1;
     }
+}
+
+static uint8_t tape_byte_parity(uint8_t value) {
+    value ^= (uint8_t)(value >> 4);
+    value ^= (uint8_t)(value >> 2);
+    value ^= (uint8_t)(value >> 1);
+    return (uint8_t)(value & 1u);
+}
+
+static int tape_current_data_bit(const TapePlaybackState* state, const TapeBlock* block) {
+    if (!state || !block || state->data_byte_index >= block->length) {
+        return 0;
+    }
+    if (state->data_sending_parity) {
+        return state->data_parity_bit ? 1 : 0;
+    }
+    return (block->data[state->data_byte_index] & state->data_bit_mask) ? 1 : 0;
 }
 
 static void tape_update(uint64_t current_t_state) {
@@ -2174,7 +2199,7 @@ static void tape_update(uint64_t current_t_state) {
                 if (!block || block->length == 0 || !block->data) {
                     tape_finish_block_playback(state);
                 } else {
-                    int bit = (block->data[state->data_byte_index] & state->data_bit_mask) ? 1 : 0;
+                    int bit = tape_current_data_bit(state, block);
                     int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
                     state->next_transition_tstate = transition_time + (uint64_t)duration;
                     state->data_pulse_half = 1;
@@ -2191,7 +2216,7 @@ static void tape_update(uint64_t current_t_state) {
                     break;
                 }
 
-                int bit = (block->data[state->data_byte_index] & state->data_bit_mask) ? 1 : 0;
+                int bit = tape_current_data_bit(state, block);
                 int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
                 state->next_transition_tstate = transition_time + (uint64_t)duration;
 
@@ -2199,12 +2224,18 @@ static void tape_update(uint64_t current_t_state) {
                     state->data_pulse_half = 1;
                 } else {
                     state->data_pulse_half = 0;
-                    state->data_bit_mask <<= 1;
-                    if (state->data_bit_mask == 0) {
+                    if (state->data_sending_parity) {
+                        state->data_sending_parity = 0;
                         state->data_bit_mask = 0x01u;
                         state->data_byte_index++;
                         if (state->data_byte_index >= block->length) {
                             tape_finish_block_playback(state);
+                        }
+                    } else {
+                        state->data_bit_mask <<= 1;
+                        if (state->data_bit_mask == 0) {
+                            state->data_parity_bit = tape_byte_parity(block->data[state->data_byte_index]);
+                            state->data_sending_parity = 1;
                         }
                     }
                 }
@@ -3222,17 +3253,18 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
         return 0;
     }
 
+    const size_t bits_per_byte = 9u;
     size_t bit_pairs = (data_limit - index) / 2u;
-    while (bit_pairs > 0 && (bit_pairs % 8u) != 0u) {
+    while (bit_pairs > 0 && (bit_pairs % bits_per_byte) != 0u) {
         data_limit -= 2u;
         bit_pairs = (data_limit - index) / 2u;
     }
 
-    if (bit_pairs == 0 || (bit_pairs % 8u) != 0u) {
+    if (bit_pairs == 0 || (bit_pairs % bits_per_byte) != 0u) {
         return 0;
     }
 
-    size_t byte_count = bit_pairs / 8u;
+    size_t byte_count = bit_pairs / bits_per_byte;
     uint8_t* data = (uint8_t*)malloc(byte_count ? byte_count : 1u);
     if (!data) {
         return 0;
@@ -3257,7 +3289,7 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
 
     for (size_t byte_index = 0; byte_index < byte_count; ++byte_index) {
         uint8_t value = 0;
-        for (int bit = 7; bit >= 0; --bit) {
+        for (size_t bit = 0; bit < 8; ++bit) {
             if (index >= data_limit) {
                 free(data);
                 return 0;
@@ -3294,6 +3326,27 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
                 value |= (uint8_t)(1u << bit);
             }
         }
+
+        if (index >= data_limit) {
+            free(data);
+            return 0;
+        }
+
+        uint32_t d1 = pulses[index].duration;
+        uint32_t d2 = pulses[index + 1].duration;
+        index += 2;
+        int parity_is_one = tape_duration_matches(d1, bit1_reference, bit1_tolerance) &&
+                            tape_duration_matches(d2, bit1_reference, bit1_tolerance);
+        if (!parity_is_one) {
+            int sum_diff_one = abs((int)(d1 + d2) - bit1_pair_reference);
+            int sum_diff_zero = abs((int)(d1 + d2) - bit0_pair_reference);
+            if (sum_diff_one <= bit1_pair_tolerance && sum_diff_one < sum_diff_zero) {
+                parity_is_one = 1;
+            }
+        }
+
+        (void)parity_is_one; // Parity errors are ignored for now.
+
         data[byte_index] = value;
     }
 
