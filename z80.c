@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <SDL.h>
 
 // --- Z80 Flag Register Bits ---
@@ -182,6 +183,19 @@ typedef enum {
 } TapeDeckStatus;
 
 static TapeDeckStatus tape_deck_status = TAPE_DECK_STATUS_IDLE;
+static int tape_debug_logging = 0;
+
+static void tape_log(const char* fmt, ...) {
+    if (!tape_debug_logging || !fmt) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    fputs("[TAPE] ", stderr);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
 
 static uint64_t tape_wav_shared_position_tstates = 0;
 
@@ -746,6 +760,89 @@ static uint64_t tape_pause_to_tstates(uint32_t pause_ms) {
     return (uint64_t)(tstates + 0.5);
 }
 
+static const char* tape_header_type_name(uint8_t header_type) {
+    switch (header_type) {
+        case 0x00:
+            return "Program";
+        case 0x01:
+            return "Number array";
+        case 0x02:
+            return "Character array";
+        case 0x03:
+            return "Bytes";
+        default:
+            return "Unknown";
+    }
+}
+
+static void tape_log_block_summary(const TapeBlock* block, size_t index) {
+    if (!tape_debug_logging) {
+        return;
+    }
+
+    if (!block) {
+        tape_log("Block %zu: <null>\n", index);
+        return;
+    }
+
+    tape_log("Block %zu: length=%u pause=%u", index, block->length, block->pause_ms);
+    if (!block->data || block->length == 0) {
+        tape_log(" (empty)\n");
+        return;
+    }
+
+    uint8_t flag = block->data[0];
+    tape_log(" flag=0x%02X", flag);
+
+    if (flag == 0x00 && block->length >= 19) {
+        uint8_t header_type = block->data[1];
+        char name[11];
+        size_t copy_len = 10u;
+        size_t available = 0u;
+        if (block->length > 2u) {
+            available = block->length - 2u;
+        }
+        if (available < copy_len) {
+            copy_len = available;
+        }
+        memset(name, '\0', sizeof(name));
+        if (copy_len > 0u) {
+            memcpy(name, &block->data[2], copy_len);
+            for (size_t i = 0; i < copy_len; ++i) {
+                if ((unsigned char)name[i] < 32u || (unsigned char)name[i] > 126u) {
+                    name[i] = '?';
+                }
+            }
+            for (int i = (int)copy_len - 1; i >= 0; --i) {
+                if (name[i] == ' ') {
+                    name[i] = '\0';
+                } else {
+                    break;
+                }
+            }
+        }
+        uint16_t data_length = (uint16_t)block->data[12] | ((uint16_t)block->data[13] << 8);
+        uint16_t param1 = (uint16_t)block->data[14] | ((uint16_t)block->data[15] << 8);
+        uint16_t param2 = (uint16_t)block->data[16] | ((uint16_t)block->data[17] << 8);
+        tape_log(" header=%s name='%s' data_len=%u param1=%u param2=%u\n",
+                 tape_header_type_name(header_type),
+                 name,
+                 data_length,
+                 param1,
+                 param2);
+        return;
+    }
+
+    if (flag == 0xFF && block->length >= 2) {
+        uint32_t payload_length = block->length - 2u;
+        uint8_t checksum = block->data[block->length - 1];
+        tape_log(" data payload_len=%u checksum=0x%02X\n", payload_length, checksum);
+        return;
+    }
+
+    tape_log("\n");
+}
+
 static void tape_free_image(TapeImage* image) {
     if (!image) {
         return;
@@ -790,6 +887,7 @@ static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t 
         memcpy(block->data, data, length);
     }
 
+    tape_log_block_summary(block, image->count);
     image->count++;
     return 1;
 }
@@ -881,6 +979,9 @@ static int tape_load_tap(const char* path, TapeImage* image) {
     }
 
     fclose(tf);
+    if (tape_debug_logging) {
+        tape_log("Loaded TAP '%s' with %zu blocks\n", path, image->count);
+    }
     return 1;
 }
 
@@ -1378,6 +1479,12 @@ static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64
     }
 
     state->current_block = block_index;
+    if (tape_debug_logging) {
+        tape_log("Starting playback of block %zu at t=%llu\n",
+                 block_index,
+                 (unsigned long long)start_time);
+        tape_log_block_summary(&state->image.blocks[block_index], block_index);
+    }
     state->pilot_pulses_remaining = tape_current_block_pilot_count(state);
     state->data_byte_index = 0;
     state->data_bit_mask = 0x01u;
@@ -2051,6 +2158,12 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
     }
     if (state->current_block < state->image.count) {
         const TapeBlock* block = &state->image.blocks[state->current_block];
+        if (tape_debug_logging) {
+            tape_log("Finished playback of block %zu (length=%u pause=%u)\n",
+                     state->current_block,
+                     block ? block->length : 0u,
+                     block ? block->pause_ms : 0u);
+        }
         uint64_t pause = tape_pause_to_tstates(block->pause_ms);
         state->phase = TAPE_PHASE_PAUSE;
         state->pause_end_tstate = state->next_transition_tstate + pause;
@@ -2072,6 +2185,9 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
             }
         }
     } else {
+        if (tape_debug_logging) {
+            tape_log("Playback complete after block %zu\n", state->current_block);
+        }
         state->phase = TAPE_PHASE_DONE;
         state->playing = 0;
         tape_ear_state = 1;
@@ -2083,6 +2199,18 @@ static uint8_t tape_byte_parity(uint8_t value) {
     value ^= (uint8_t)(value >> 2);
     value ^= (uint8_t)(value >> 1);
     return (uint8_t)(value & 1u);
+}
+
+static int tape_bit_index_from_mask(uint8_t mask) {
+    int index = 0;
+    if (mask == 0u) {
+        return 0;
+    }
+    while (mask > 1u) {
+        mask >>= 1;
+        index++;
+    }
+    return index;
 }
 
 static int tape_current_data_bit(const TapePlaybackState* state, const TapeBlock* block) {
@@ -2201,6 +2329,24 @@ static void tape_update(uint64_t current_t_state) {
                 } else {
                     int bit = tape_current_data_bit(state, block);
                     int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
+                    if (tape_debug_logging) {
+                        if (state->data_sending_parity) {
+                            tape_log("Block %zu byte %zu parity bit=%d\n",
+                                     state->current_block,
+                                     state->data_byte_index,
+                                     bit);
+                        } else if (state->data_byte_index < block->length) {
+                            int bit_index = tape_bit_index_from_mask(state->data_bit_mask);
+                            uint8_t byte_value = block->data[state->data_byte_index];
+                            tape_log("Block %zu byte %zu bit[%d]=%d (value=0x%02X mask=0x%02X)\n",
+                                     state->current_block,
+                                     state->data_byte_index,
+                                     bit_index,
+                                     bit,
+                                     byte_value,
+                                     state->data_bit_mask);
+                        }
+                    }
                     state->next_transition_tstate = transition_time + (uint64_t)duration;
                     state->data_pulse_half = 1;
                 }
@@ -2218,6 +2364,24 @@ static void tape_update(uint64_t current_t_state) {
 
                 int bit = tape_current_data_bit(state, block);
                 int duration = bit ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES;
+                if (tape_debug_logging && state->data_pulse_half == 0) {
+                    if (state->data_sending_parity) {
+                        tape_log("Block %zu byte %zu parity bit=%d\n",
+                                 state->current_block,
+                                 state->data_byte_index,
+                                 bit);
+                    } else if (state->data_byte_index < block->length) {
+                        int bit_index = tape_bit_index_from_mask(state->data_bit_mask);
+                        uint8_t byte_value = block->data[state->data_byte_index];
+                        tape_log("Block %zu byte %zu bit[%d]=%d (value=0x%02X mask=0x%02X)\n",
+                                 state->current_block,
+                                 state->data_byte_index,
+                                 bit_index,
+                                 bit,
+                                 byte_value,
+                                 state->data_bit_mask);
+                    }
+                }
                 state->next_transition_tstate = transition_time + (uint64_t)duration;
 
                 if (state->data_pulse_half == 0) {
@@ -2225,6 +2389,14 @@ static void tape_update(uint64_t current_t_state) {
                 } else {
                     state->data_pulse_half = 0;
                     if (state->data_sending_parity) {
+                        if (tape_debug_logging && state->data_byte_index < block->length) {
+                            uint8_t byte_value = block->data[state->data_byte_index];
+                            tape_log("Completed parity for block %zu byte %zu (0x%02X) parity_bit=%u\n",
+                                     state->current_block,
+                                     state->data_byte_index,
+                                     byte_value,
+                                     state->data_parity_bit);
+                        }
                         state->data_sending_parity = 0;
                         state->data_bit_mask = 0x01u;
                         state->data_byte_index++;
@@ -2236,6 +2408,14 @@ static void tape_update(uint64_t current_t_state) {
                         if (state->data_bit_mask == 0) {
                             state->data_parity_bit = tape_byte_parity(block->data[state->data_byte_index]);
                             state->data_sending_parity = 1;
+                            if (tape_debug_logging && state->data_byte_index < block->length) {
+                                uint8_t byte_value = block->data[state->data_byte_index];
+                                tape_log("Prepared parity %u for block %zu byte %zu (0x%02X)\n",
+                                         state->data_parity_bit,
+                                         state->current_block,
+                                         state->data_byte_index,
+                                         byte_value);
+                            }
                         }
                     }
                 }
@@ -4984,7 +5164,7 @@ static int run_cpu_tests(const char* rom_dir) {
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] "
+            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] "
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
             "[--test-rom-dir <dir>] [--run-tests] [rom_file]\n",
@@ -5235,6 +5415,9 @@ int main(int argc, char *argv[]) {
             audio_dump_path = argv[++i];
         } else if (strcmp(argv[i], "--beeper-log") == 0) {
             beeper_logging_enabled = 1;
+        } else if (strcmp(argv[i], "--tape-debug") == 0) {
+            tape_debug_logging = 1;
+            tape_log("Tape debug logging enabled\n");
         } else if (strcmp(argv[i], "--tap") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
