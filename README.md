@@ -125,7 +125,12 @@ Additional host shortcuts:
 - F5 Play, F6 Stop, F7 Rewind, F8 Record (Shift+F8 appends to the current WAV when available).
 
 ## Roadmap
-- Expand tape and snapshot format coverage beyond standard-speed `.tap`/`.tzx` images.
-- Improve CPU accuracy with undocumented opcode coverage and interrupt timing.
-- Add configurable key bindings and joystick emulation.
-- Provide automated tests and continuous integration builds across platforms.
+- **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
+  block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
+  `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
+- **CPU accuracy** – Implement the remaining undocumented Z80 opcodes and refine interrupt timing. Incorporate well-known test
+  suites (e.g. ZEXDOC/ZEXALL or `z80full`) to continually validate the execution core while tightening cycle-level behaviour.
+- **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
+  Interface 2 to broaden controller support for games.
+- **Automation and CI** – Capture the expanded CPU and tape behaviour in automated regression tests and stand up continuous
+  integration builds (Linux, Windows) so the emulator remains stable as new features land.
