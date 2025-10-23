@@ -1435,7 +1435,7 @@ static void tape_reset_playback(TapePlaybackState* state) {
     state->phase = TAPE_PHASE_IDLE;
     state->pilot_pulses_remaining = 0;
     state->data_byte_index = 0;
-    state->data_bit_mask = 0x01u;
+    state->data_bit_mask = 0x80u;
     state->data_pulse_half = 0;
     state->next_transition_tstate = 0;
     state->pause_end_tstate = 0;
@@ -1483,7 +1483,7 @@ static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64
     }
     state->pilot_pulses_remaining = tape_current_block_pilot_count(state);
     state->data_byte_index = 0;
-    state->data_bit_mask = 0x01u;
+    state->data_bit_mask = 0x80u;
     state->data_pulse_half = 0;
     state->phase = TAPE_PHASE_PILOT;
     state->level = 1;
@@ -2162,7 +2162,7 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
         state->phase = TAPE_PHASE_PAUSE;
         state->pause_end_tstate = state->next_transition_tstate + pause;
         state->current_block++;
-        state->data_bit_mask = 0x01u;
+        state->data_bit_mask = 0x80u;
         if (pause == 0) {
             uint64_t start_time = state->pause_end_tstate;
             if (state->current_block < state->image.count) {
@@ -2355,9 +2355,9 @@ static void tape_update(uint64_t current_t_state) {
                     state->data_pulse_half = 1;
                 } else {
                     state->data_pulse_half = 0;
-                    state->data_bit_mask <<= 1;
+                    state->data_bit_mask >>= 1;
                     if (state->data_bit_mask == 0) {
-                        state->data_bit_mask = 0x01u;
+                        state->data_bit_mask = 0x80u;
                         state->data_byte_index++;
                         if (state->data_byte_index >= block->length) {
                             tape_finish_block_playback(state);
@@ -3448,7 +3448,7 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
                 }
             }
             if (is_one) {
-                value |= (uint8_t)(1u << bit);
+                value |= (uint8_t)(1u << (7 - bit));
             }
         }
 

@@ -63,8 +63,8 @@ disabled by default:
 
 For cassette investigations, enable `--tape-debug` to mirror block metadata and
 the individual bits emitted during playback to stderr. The logs include header
-names, payload lengths, and parity pulses so you can confirm that TAP and TZX
-images expose the expected filenames and data ordering:
+names, payload lengths, and MSB-first bit traces so you can confirm that TAP
+and TZX images expose the expected filenames and data ordering:
 
 ```bash
 ./z80 --tap loader.tap --tape-debug
