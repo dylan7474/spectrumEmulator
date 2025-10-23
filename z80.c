@@ -1646,9 +1646,12 @@ static int tape_resume_playback(TapePlaybackState* state, uint64_t current_t_sta
         }
         state->playing = 1;
     } else {
-        if (state->phase == TAPE_PHASE_IDLE || state->phase == TAPE_PHASE_DONE) {
+        if (state->phase == TAPE_PHASE_IDLE) {
             tape_start_playback(state, current_t_state);
             return state->playing;
+        }
+        if (state->phase == TAPE_PHASE_DONE) {
+            return 0;
         }
         uint64_t delay = state->paused_transition_remaining;
         state->next_transition_tstate = current_t_state + delay;
@@ -3721,17 +3724,13 @@ static void tape_deck_play(uint64_t current_t_state) {
             printf("Tape PLAY ignored (empty tape)\n");
             return;
         }
-        if (!tape_resume_playback(state, current_t_state)) {
-            tape_start_playback(state, current_t_state);
-        }
+        (void)tape_resume_playback(state, current_t_state);
     } else {
         if (state->image.count == 0) {
             printf("Tape PLAY ignored (empty tape)\n");
             return;
         }
-        if (!tape_resume_playback(state, current_t_state)) {
-            tape_start_playback(state, current_t_state);
-        }
+        (void)tape_resume_playback(state, current_t_state);
     }
 
     if (state->playing) {
