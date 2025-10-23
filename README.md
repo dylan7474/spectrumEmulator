@@ -61,6 +61,15 @@ disabled by default:
 ./z80 --beeper-log path/to/48k.rom
 ```
 
+For cassette investigations, enable `--tape-debug` to mirror block metadata and
+the individual bits emitted during playback to stderr. The logs include header
+names, payload lengths, and MSB-first bit traces so you can confirm that TAP
+and TZX images expose the expected filenames and data ordering:
+
+```bash
+./z80 --tap loader.tap --tape-debug
+```
+
 ## Testing
 
 The emulator ships with a lightweight CPU regression harness that exercises the undocumented opcode helpers and verifies
