@@ -74,7 +74,7 @@ one of the tape options when launching the emulator and the EAR input will be dr
 
 You can also skip the explicit flags and pass a tape image directly. The emulator
 infers `.tap`, `.tzx`, and `.wav` formats from positional arguments, so running
-`./spectrum digitized.wav` loads the bundled ROM and cues the specified tape at
+`./z80 digitized.wav` loads the bundled ROM and cues the specified tape at
 startup.
 
 Loaded tapes remain cued at the start. Press **F5** to begin playback when the Spectrum is ready to `LOAD`, use **F6** to pause/stop, and tap **F7** to rewind to the beginning at any time.
