@@ -61,6 +61,25 @@ disabled by default:
 ./z80 --beeper-log path/to/48k.rom
 ```
 
+## Testing
+
+The emulator ships with a lightweight CPU regression harness that exercises the undocumented opcode helpers and verifies
+interrupt sequencing. Run it directly from the binary:
+
+```bash
+./z80 --run-tests
+```
+
+The command returns a non-zero exit status if any unit check fails. Optional ZEXDOC/ZEXALL integration is available when the
+corresponding CP/M binaries are present. Place `zexdoc.com` and/or `zexall.com` inside `tests/roms/` (or point the harness at an
+alternate directory via `--test-rom-dir <dir>`), then rerun the test command to execute the suites and record their output.
+
+For convenience a dedicated make target wraps the test invocation:
+
+```bash
+make test
+```
+
 ### Loading and saving tapes
 
 Real-time cassette emulation is available for standard `.tap` dumps, `.tzx` images that use standard speed data blocks, and mono PCM `.wav` captures. Supply
