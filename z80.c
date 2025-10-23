@@ -417,7 +417,8 @@ uint16_t readWord(uint16_t addr); void writeWord(uint16_t addr, uint16_t val);
 uint8_t io_read(uint16_t port); void io_write(uint16_t port, uint8_t value);
 int cpu_step(Z80* cpu); int init_sdl(void); void cleanup_sdl(void); void render_screen(void);
 int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr);
-int cpu_interrupt(Z80* cpu, uint16_t vector_addr);
+int cpu_interrupt(Z80* cpu, uint8_t data_bus);
+int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
 void audio_callback(void* userdata, Uint8* stream, int len);
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
 static void beeper_set_latency_limit(double sample_limit);
@@ -3926,22 +3927,26 @@ static inline uint16_t get_HL(Z80* cpu){return(cpu->reg_H<<8)|cpu->reg_L;} stati
 static inline uint8_t get_IXh(Z80* cpu){return(cpu->reg_IX>>8)&0xFF;} static inline uint8_t get_IXl(Z80* cpu){return cpu->reg_IX&0xFF;} static inline void set_IXh(Z80* cpu,uint8_t v){cpu->reg_IX=(cpu->reg_IX&0x00FF)|(v<<8);} static inline void set_IXl(Z80* cpu,uint8_t v){cpu->reg_IX=(cpu->reg_IX&0xFF00)|v;}
 static inline uint8_t get_IYh(Z80* cpu){return(cpu->reg_IY>>8)&0xFF;} static inline uint8_t get_IYl(Z80* cpu){return cpu->reg_IY&0xFF;} static inline void set_IYh(Z80* cpu,uint8_t v){cpu->reg_IY=(cpu->reg_IY&0x00FF)|(v<<8);} static inline void set_IYl(Z80* cpu,uint8_t v){cpu->reg_IY=(cpu->reg_IY&0xFF00)|v;}
 static inline void set_flag(Z80* cpu,uint8_t f,int c){if(c)cpu->reg_F|=f;else cpu->reg_F&=~f;} static inline uint8_t get_flag(Z80* cpu,uint8_t f){return(cpu->reg_F&f)?1:0;}
-static inline void set_flags_szp(Z80* cpu,uint8_t r){set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);uint8_t p=0;uint8_t t=r;for(int i=0;i<8;i++){if(t&1)p=!p;t>>=1;}set_flag(cpu,FLAG_PV,!p);}
+static inline void set_xy_flags(Z80* cpu, uint8_t value) {
+    cpu->reg_F = (uint8_t)((cpu->reg_F & (uint8_t)~0x28u) | (value & 0x28u));
+}
+
+static inline void set_flags_szp(Z80* cpu,uint8_t r){set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);uint8_t p=0;uint8_t t=r;for(int i=0;i<8;i++){if(t&1)p=!p;t>>=1;}set_flag(cpu,FLAG_PV,!p);set_xy_flags(cpu,r);}
 
 // --- 8-Bit Arithmetic/Logic Helper Functions ---
-void cpu_add(Z80* cpu,uint8_t v){uint16_t r=cpu->reg_A+v;uint8_t hc=((cpu->reg_A&0x0F)+(v&0x0F))>0x0F;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hc);set_flag(cpu,FLAG_PV,((cpu->reg_A^v^0x80)&(r^v)&0x80)!=0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFF);cpu->reg_A=r&0xFF;}
-void cpu_adc(Z80* cpu,uint8_t v){uint8_t c=get_flag(cpu,FLAG_C);uint16_t r=cpu->reg_A+v+c;uint8_t hc=((cpu->reg_A&0x0F)+(v&0x0F)+c)>0x0F;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hc);set_flag(cpu,FLAG_PV,((cpu->reg_A^v^0x80)&(r^v)&0x80)!=0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFF);cpu->reg_A=r&0xFF;}
-void cpu_sub(Z80* cpu,uint8_t v,int s){uint16_t r=cpu->reg_A-v;uint8_t hb=((cpu->reg_A&0x0F)<(v&0x0F));set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hb);set_flag(cpu,FLAG_PV,((cpu->reg_A^v)&(cpu->reg_A^r)&0x80)!=0);set_flag(cpu,FLAG_N,1);set_flag(cpu,FLAG_C,r>0xFF);if(s)cpu->reg_A=r&0xFF;}
-void cpu_sbc(Z80* cpu,uint8_t v){uint8_t c=get_flag(cpu,FLAG_C);uint16_t r=cpu->reg_A-v-c;uint8_t hb=((cpu->reg_A&0x0F)<((v&0x0F)+c));set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hb);set_flag(cpu,FLAG_PV,((cpu->reg_A^v)&(cpu->reg_A^r)&0x80)!=0);set_flag(cpu,FLAG_N,1);set_flag(cpu,FLAG_C,r>0xFF);cpu->reg_A=r&0xFF;}
+void cpu_add(Z80* cpu,uint8_t v){uint16_t r=cpu->reg_A+v;uint8_t hc=((cpu->reg_A&0x0F)+(v&0x0F))>0x0F;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hc);set_flag(cpu,FLAG_PV,((cpu->reg_A^v^0x80)&(r^v)&0x80)!=0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFF);cpu->reg_A=r&0xFF;set_xy_flags(cpu,cpu->reg_A);}
+void cpu_adc(Z80* cpu,uint8_t v){uint8_t c=get_flag(cpu,FLAG_C);uint16_t r=cpu->reg_A+v+c;uint8_t hc=((cpu->reg_A&0x0F)+(v&0x0F)+c)>0x0F;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hc);set_flag(cpu,FLAG_PV,((cpu->reg_A^v^0x80)&(r^v)&0x80)!=0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFF);cpu->reg_A=r&0xFF;set_xy_flags(cpu,cpu->reg_A);}
+void cpu_sub(Z80* cpu,uint8_t v,int s){uint16_t r=cpu->reg_A-v;uint8_t hb=((cpu->reg_A&0x0F)<(v&0x0F));set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hb);set_flag(cpu,FLAG_PV,((cpu->reg_A^v)&(cpu->reg_A^r)&0x80)!=0);set_flag(cpu,FLAG_N,1);set_flag(cpu,FLAG_C,r>0xFF);set_xy_flags(cpu,(uint8_t)r);if(s)cpu->reg_A=r&0xFF;}
+void cpu_sbc(Z80* cpu,uint8_t v){uint8_t c=get_flag(cpu,FLAG_C);uint16_t r=cpu->reg_A-v-c;uint8_t hb=((cpu->reg_A&0x0F)<((v&0x0F)+c));set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,(r&0xFF)==0);set_flag(cpu,FLAG_H,hb);set_flag(cpu,FLAG_PV,((cpu->reg_A^v)&(cpu->reg_A^r)&0x80)!=0);set_flag(cpu,FLAG_N,1);set_flag(cpu,FLAG_C,r>0xFF);cpu->reg_A=r&0xFF;set_xy_flags(cpu,cpu->reg_A);}
 void cpu_and(Z80* cpu,uint8_t v){cpu->reg_A&=v;set_flags_szp(cpu,cpu->reg_A);set_flag(cpu,FLAG_H,1);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,0);}
 void cpu_or(Z80* cpu,uint8_t v){cpu->reg_A|=v;set_flags_szp(cpu,cpu->reg_A);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,0);}
 void cpu_xor(Z80* cpu,uint8_t v){cpu->reg_A^=v;set_flags_szp(cpu,cpu->reg_A);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,0);}
-uint8_t cpu_inc(Z80* cpu,uint8_t v){uint8_t r=v+1;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(v&0x0F)==0x0F);set_flag(cpu,FLAG_PV,v==0x7F);set_flag(cpu,FLAG_N,0);return r;}
-uint8_t cpu_dec(Z80* cpu,uint8_t v){uint8_t r=v-1;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(v&0x0F)==0x00);set_flag(cpu,FLAG_PV,v==0x80);set_flag(cpu,FLAG_N,1);return r;}
-void cpu_add_hl(Z80* cpu,uint16_t v){uint16_t hl=get_HL(cpu);uint32_t r=hl+v;set_flag(cpu,FLAG_H,((hl&0x0FFF)+(v&0x0FFF))>0x0FFF);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFFFF);set_HL(cpu,r&0xFFFF);}
-void cpu_add_ixiy(Z80* cpu,uint16_t* rr,uint16_t v){uint16_t ixy=*rr;uint32_t r=ixy+v;set_flag(cpu,FLAG_H,((ixy&0x0FFF)+(v&0x0FFF))>0x0FFF);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFFFF);*rr=r&0xFFFF;}
-void cpu_adc_hl(Z80* cpu,uint16_t v){uint16_t hl=get_HL(cpu);uint8_t c=get_flag(cpu,FLAG_C);uint32_t r=hl+v+c;set_flag(cpu,FLAG_S,(r&0x8000)!=0);set_flag(cpu,FLAG_Z,(r&0xFFFF)==0);set_flag(cpu,FLAG_H,((hl&0x0FFF)+(v&0x0FFF)+c)>0x0FFF);set_flag(cpu,FLAG_PV,(((hl^v^0x8000)&(r^v)&0x8000))!=0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFFFF);set_HL(cpu,r&0xFFFF);}
-void cpu_sbc_hl(Z80* cpu,uint16_t v){uint16_t hl=get_HL(cpu);uint8_t c=get_flag(cpu,FLAG_C);uint32_t r=hl-v-c;set_flag(cpu,FLAG_S,(r&0x8000)!=0);set_flag(cpu,FLAG_Z,(r&0xFFFF)==0);set_flag(cpu,FLAG_H,((hl&0x0FFF)<((v&0x0FFF)+c)));set_flag(cpu,FLAG_PV,((hl^v)&(hl^(uint16_t)r)&0x8000)!=0);set_flag(cpu,FLAG_N,1);set_flag(cpu,FLAG_C,r>0xFFFF);set_HL(cpu,r&0xFFFF);}
+uint8_t cpu_inc(Z80* cpu,uint8_t v){uint8_t r=v+1;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(v&0x0F)==0x0F);set_flag(cpu,FLAG_PV,v==0x7F);set_flag(cpu,FLAG_N,0);set_xy_flags(cpu,r);return r;}
+uint8_t cpu_dec(Z80* cpu,uint8_t v){uint8_t r=v-1;set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(v&0x0F)==0x00);set_flag(cpu,FLAG_PV,v==0x80);set_flag(cpu,FLAG_N,1);set_xy_flags(cpu,r);return r;}
+void cpu_add_hl(Z80* cpu,uint16_t v){uint16_t hl=get_HL(cpu);uint32_t r=hl+v;set_flag(cpu,FLAG_H,((hl&0x0FFF)+(v&0x0FFF))>0x0FFF);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFFFF);set_HL(cpu,r&0xFFFF);set_xy_flags(cpu,(uint8_t)((r>>8)&0xFF));}
+void cpu_add_ixiy(Z80* cpu,uint16_t* rr,uint16_t v){uint16_t ixy=*rr;uint32_t r=ixy+v;set_flag(cpu,FLAG_H,((ixy&0x0FFF)+(v&0x0FFF))>0x0FFF);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFFFF);*rr=r&0xFFFF;set_xy_flags(cpu,(uint8_t)((r>>8)&0xFF));}
+void cpu_adc_hl(Z80* cpu,uint16_t v){uint16_t hl=get_HL(cpu);uint8_t c=get_flag(cpu,FLAG_C);uint32_t r=hl+v+c;set_flag(cpu,FLAG_S,(r&0x8000)!=0);set_flag(cpu,FLAG_Z,(r&0xFFFF)==0);set_flag(cpu,FLAG_H,((hl&0x0FFF)+(v&0x0FFF)+c)>0x0FFF);set_flag(cpu,FLAG_PV,(((hl^v^0x8000)&(r^v)&0x8000))!=0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,r>0xFFFF);set_HL(cpu,r&0xFFFF);set_xy_flags(cpu,(uint8_t)((r>>8)&0xFF));}
+void cpu_sbc_hl(Z80* cpu,uint16_t v){uint16_t hl=get_HL(cpu);uint8_t c=get_flag(cpu,FLAG_C);uint32_t r=hl-v-c;set_flag(cpu,FLAG_S,(r&0x8000)!=0);set_flag(cpu,FLAG_Z,(r&0xFFFF)==0);set_flag(cpu,FLAG_H,((hl&0x0FFF)<((v&0x0FFF)+c)));set_flag(cpu,FLAG_PV,((hl^v)&(hl^(uint16_t)r)&0x8000)!=0);set_flag(cpu,FLAG_N,1);set_flag(cpu,FLAG_C,r>0xFFFF);set_HL(cpu,r&0xFFFF);set_xy_flags(cpu,(uint8_t)((r>>8)&0xFF));}
 void cpu_push(Z80* cpu,uint16_t v){cpu->reg_SP--;writeByte(cpu->reg_SP,(v>>8)&0xFF);cpu->reg_SP--;writeByte(cpu->reg_SP,v&0xFF);}
 uint16_t cpu_pop(Z80* cpu){uint8_t lo=readByte(cpu->reg_SP);cpu->reg_SP++;uint8_t hi=readByte(cpu->reg_SP);cpu->reg_SP++;return(hi<<8)|lo;}
 uint8_t cpu_rlc(Z80* cpu,uint8_t v){uint8_t c=(v&0x80)?1:0;uint8_t r=(v<<1)|c;set_flags_szp(cpu,r);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,c);return r;}
@@ -3951,43 +3956,259 @@ uint8_t cpu_rr(Z80* cpu,uint8_t v){uint8_t oc=get_flag(cpu,FLAG_C);uint8_t nc=(v
 uint8_t cpu_sla(Z80* cpu,uint8_t v){uint8_t c=(v&0x80)?1:0;uint8_t r=(v<<1);set_flags_szp(cpu,r);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,c);return r;}
 uint8_t cpu_sra(Z80* cpu,uint8_t v){uint8_t c=(v&0x01);uint8_t r=(v>>1)|(v&0x80);set_flags_szp(cpu,r);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,c);return r;}
 uint8_t cpu_srl(Z80* cpu,uint8_t v){uint8_t c=(v&0x01);uint8_t r=(v>>1);set_flags_szp(cpu,r);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,c);return r;}
-void cpu_bit(Z80* cpu,uint8_t v,int b){uint8_t m=(1<<b);set_flag(cpu,FLAG_Z,(v&m)==0);set_flag(cpu,FLAG_PV,(v&m)==0);set_flag(cpu,FLAG_H,1);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_S,(b==7)&&(v&0x80));}
+uint8_t cpu_sll(Z80* cpu,uint8_t v){uint8_t c=(v&0x80)?1:0;uint8_t r=(uint8_t)((v<<1)|0x01);set_flags_szp(cpu,r);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_C,c);return r;}
+void cpu_bit(Z80* cpu,uint8_t v,int b){uint8_t m=(1<<b);set_flag(cpu,FLAG_Z,(v&m)==0);set_flag(cpu,FLAG_PV,(v&m)==0);set_flag(cpu,FLAG_H,1);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_S,(b==7)&&(v&0x80));set_xy_flags(cpu,v);}
 
 // --- 0xCB Prefix CPU Step Function ---
 int cpu_cb_step(Z80* cpu) {
     uint8_t op=readByte(cpu->reg_PC++);uint8_t x=(op>>6)&3;uint8_t y=(op>>3)&7;uint8_t z=op&7;
-    uint8_t operand;uint16_t hl_addr=0;int is_hl=(z==6);
+    uint16_t hl_addr=0;int is_hl=(z==6);
     if(is_hl)hl_addr=get_HL(cpu);
+    uint8_t operand;
     switch(z){case 0:operand=cpu->reg_B;break;case 1:operand=cpu->reg_C;break;case 2:operand=cpu->reg_D;break;case 3:operand=cpu->reg_E;break;case 4:operand=cpu->reg_H;break;case 5:operand=cpu->reg_L;break;case 6:operand=readByte(hl_addr);break;case 7:operand=cpu->reg_A;break;default:operand=0;}
-    uint8_t result=0;
-    switch(x){case 0:switch(y){case 0:result=cpu_rlc(cpu,operand);break;case 1:result=cpu_rrc(cpu,operand);break;case 2:result=cpu_rl(cpu,operand);break;case 3:result=cpu_rr(cpu,operand);break;case 4:result=cpu_sla(cpu,operand);break;case 5:result=cpu_sra(cpu,operand);break;case 6:result=0;/*SLL*/break;case 7:result=cpu_srl(cpu,operand);break;}break;
-               case 1:cpu_bit(cpu,operand,y);return is_hl ? 4 : 0; // 12T/8T total (base 8)
+    uint8_t result=operand;
+    switch(x){case 0:switch(y){case 0:result=cpu_rlc(cpu,operand);break;case 1:result=cpu_rrc(cpu,operand);break;case 2:result=cpu_rl(cpu,operand);break;case 3:result=cpu_rr(cpu,operand);break;case 4:result=cpu_sla(cpu,operand);break;case 5:result=cpu_sra(cpu,operand);break;case 6:result=cpu_sll(cpu,operand);break;case 7:result=cpu_srl(cpu,operand);break;}break;
+               case 1:cpu_bit(cpu,operand,y);return is_hl ? 8 : 4;
                case 2:result=operand&~(1<<y);break;case 3:result=operand|(1<<y);break;}
     switch(z){case 0:cpu->reg_B=result;break;case 1:cpu->reg_C=result;break;case 2:cpu->reg_D=result;break;case 3:cpu->reg_E=result;break;case 4:cpu->reg_H=result;break;case 5:cpu->reg_L=result;break;case 6:writeByte(hl_addr,result);break;case 7:cpu->reg_A=result;break;}
-    return is_hl ? 7 : 0; // 15T/8T total
+    return is_hl ? 11 : 4;
 }
 
 // --- 0xED Prefix CPU Step Function ---
+
 int cpu_ed_step(Z80* cpu) {
-    uint8_t op=readByte(cpu->reg_PC++);
-    switch(op){
-        case 0x4A:cpu_adc_hl(cpu,get_BC(cpu));return 7; case 0x5A:cpu_adc_hl(cpu,get_DE(cpu));return 7; case 0x6A:cpu_adc_hl(cpu,get_HL(cpu));return 7; case 0x7A:cpu_adc_hl(cpu,cpu->reg_SP);return 7;
-        case 0x42:cpu_sbc_hl(cpu,get_BC(cpu));return 7; case 0x52:cpu_sbc_hl(cpu,get_DE(cpu));return 7; case 0x62:cpu_sbc_hl(cpu,get_HL(cpu));return 7; case 0x72:cpu_sbc_hl(cpu,cpu->reg_SP);return 7;
-        case 0x43:writeWord(readWord(cpu->reg_PC),get_BC(cpu));cpu->reg_PC+=2;return 12; case 0x53:writeWord(readWord(cpu->reg_PC),get_DE(cpu));cpu->reg_PC+=2;return 12;
-        case 0x63:writeWord(readWord(cpu->reg_PC),get_HL(cpu));cpu->reg_PC+=2;return 12; case 0x73:writeWord(readWord(cpu->reg_PC),cpu->reg_SP);cpu->reg_PC+=2;return 12;
-        case 0x4B:set_BC(cpu,readWord(readWord(cpu->reg_PC)));cpu->reg_PC+=2;return 12; case 0x5B:set_DE(cpu,readWord(readWord(cpu->reg_PC)));cpu->reg_PC+=2;return 12;
-        case 0x6B:set_HL(cpu,readWord(readWord(cpu->reg_PC)));cpu->reg_PC+=2;return 12; case 0x7B:cpu->reg_SP=readWord(readWord(cpu->reg_PC));cpu->reg_PC+=2;return 12;
-        case 0xA0:{uint8_t v=readByte(get_HL(cpu));writeByte(get_DE(cpu),v);set_DE(cpu,get_DE(cpu)+1);set_HL(cpu,get_HL(cpu)+1);set_BC(cpu,get_BC(cpu)-1);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_PV,get_BC(cpu)!=0);return 8;}
-        case 0xB0:{uint8_t v=readByte(get_HL(cpu));writeByte(get_DE(cpu),v);set_DE(cpu,get_DE(cpu)+1);set_HL(cpu,get_HL(cpu)+1);set_BC(cpu,get_BC(cpu)-1);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);if(get_BC(cpu)!=0){cpu->reg_PC-=2;set_flag(cpu,FLAG_PV,1);return 13;}else{set_flag(cpu,FLAG_PV,0);return 8;}}
-        case 0xA8:{uint8_t v=readByte(get_HL(cpu));writeByte(get_DE(cpu),v);set_DE(cpu,get_DE(cpu)-1);set_HL(cpu,get_HL(cpu)-1);set_BC(cpu,get_BC(cpu)-1);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_PV,get_BC(cpu)!=0);return 8;}
-        case 0xB8:{uint8_t v=readByte(get_HL(cpu));writeByte(get_DE(cpu),v);set_DE(cpu,get_DE(cpu)-1);set_HL(cpu,get_HL(cpu)-1);set_BC(cpu,get_BC(cpu)-1);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);if(get_BC(cpu)!=0){cpu->reg_PC-=2;set_flag(cpu,FLAG_PV,1);return 13;}else{set_flag(cpu,FLAG_PV,0);return 8;}}
-        case 0xA1:{uint8_t v=readByte(get_HL(cpu));uint8_t r=cpu->reg_A-v;uint16_t bc=get_BC(cpu)-1;set_HL(cpu,get_HL(cpu)+1);set_BC(cpu,bc);set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(cpu->reg_A&0x0F)<(v&0x0F));set_flag(cpu,FLAG_PV,bc!=0);set_flag(cpu,FLAG_N,1);return 8;}
-        case 0xB1:{uint8_t v=readByte(get_HL(cpu));uint8_t r=cpu->reg_A-v;uint16_t bc=get_BC(cpu)-1;set_HL(cpu,get_HL(cpu)+1);set_BC(cpu,bc);set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(cpu->reg_A&0x0F)<(v&0x0F));set_flag(cpu,FLAG_PV,bc!=0);set_flag(cpu,FLAG_N,1);if(bc!=0&&r!=0){cpu->reg_PC-=2;return 13;}else{return 8;}}
-        case 0xA9:{uint8_t v=readByte(get_HL(cpu));uint8_t r=cpu->reg_A-v;uint16_t bc=get_BC(cpu)-1;set_HL(cpu,get_HL(cpu)-1);set_BC(cpu,bc);set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(cpu->reg_A&0x0F)<(v&0x0F));set_flag(cpu,FLAG_PV,bc!=0);set_flag(cpu,FLAG_N,1);return 8;}
-        case 0xB9:{uint8_t v=readByte(get_HL(cpu));uint8_t r=cpu->reg_A-v;uint16_t bc=get_BC(cpu)-1;set_HL(cpu,get_HL(cpu)-1);set_BC(cpu,bc);set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);set_flag(cpu,FLAG_H,(cpu->reg_A&0x0F)<(v&0x0F));set_flag(cpu,FLAG_PV,bc!=0);set_flag(cpu,FLAG_N,1);if(bc!=0&&r!=0){cpu->reg_PC-=2;return 13;}else{return 8;}}
-        case 0x44:{uint8_t a=cpu->reg_A;cpu->reg_A=0;cpu_sub(cpu,a,1);return 0;} case 0x47:cpu->reg_I=cpu->reg_A;return 1; case 0x4F:cpu->reg_R=cpu->reg_A;return 1;
-        case 0x57:cpu->reg_A=cpu->reg_I;set_flag(cpu,FLAG_S,cpu->reg_A&0x80);set_flag(cpu,FLAG_Z,cpu->reg_A==0);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_PV,cpu->iff2);set_flag(cpu,FLAG_N,0);return 1;
-        case 0x5F:cpu->reg_A=cpu->reg_R;set_flag(cpu,FLAG_S,cpu->reg_A&0x80);set_flag(cpu,FLAG_Z,cpu->reg_A==0);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_PV,cpu->iff2);set_flag(cpu,FLAG_N,0);return 1;
+    uint8_t op = readByte(cpu->reg_PC++);
+    switch (op) {
+        case 0x4A: cpu_adc_hl(cpu, get_BC(cpu)); return 11;
+        case 0x5A: cpu_adc_hl(cpu, get_DE(cpu)); return 11;
+        case 0x6A: cpu_adc_hl(cpu, get_HL(cpu)); return 11;
+        case 0x7A: cpu_adc_hl(cpu, cpu->reg_SP); return 11;
+        case 0x42: cpu_sbc_hl(cpu, get_BC(cpu)); return 11;
+        case 0x52: cpu_sbc_hl(cpu, get_DE(cpu)); return 11;
+        case 0x62: cpu_sbc_hl(cpu, get_HL(cpu)); return 11;
+        case 0x72: cpu_sbc_hl(cpu, cpu->reg_SP); return 11;
+        case 0x43: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            writeWord(addr, get_BC(cpu));
+            return 16;
+        }
+        case 0x53: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            writeWord(addr, get_DE(cpu));
+            return 16;
+        }
+        case 0x63: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            writeWord(addr, get_HL(cpu));
+            return 16;
+        }
+        case 0x73: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            writeWord(addr, cpu->reg_SP);
+            return 16;
+        }
+        case 0x4B: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            set_BC(cpu, readWord(addr));
+            return 16;
+        }
+        case 0x5B: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            set_DE(cpu, readWord(addr));
+            return 16;
+        }
+        case 0x6B: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            set_HL(cpu, readWord(addr));
+            return 16;
+        }
+        case 0x7B: {
+            uint16_t addr = readWord(cpu->reg_PC);
+            cpu->reg_PC += 2;
+            cpu->reg_SP = readWord(addr);
+            return 16;
+        }
+        case 0xA0: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t de = get_DE(cpu);
+            writeByte(de, value);
+            set_DE(cpu, (uint16_t)(de + 1));
+            set_HL(cpu, (uint16_t)(hl + 1));
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            uint8_t sum = (uint8_t)(cpu->reg_A + value);
+            uint8_t preserved = cpu->reg_F & (uint8_t)(FLAG_S | FLAG_Z | FLAG_C);
+            cpu->reg_F = preserved;
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_xy_flags(cpu, sum);
+            return 12;
+        }
+        case 0xB0: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t de = get_DE(cpu);
+            writeByte(de, value);
+            set_DE(cpu, (uint16_t)(de + 1));
+            set_HL(cpu, (uint16_t)(hl + 1));
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            uint8_t sum = (uint8_t)(cpu->reg_A + value);
+            uint8_t preserved = cpu->reg_F & (uint8_t)(FLAG_S | FLAG_Z | FLAG_C);
+            cpu->reg_F = preserved;
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_xy_flags(cpu, sum);
+            if (bc != 0) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
+        case 0xA8: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t de = get_DE(cpu);
+            writeByte(de, value);
+            set_DE(cpu, (uint16_t)(de - 1));
+            set_HL(cpu, (uint16_t)(hl - 1));
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            uint8_t sum = (uint8_t)(cpu->reg_A + value);
+            uint8_t preserved = cpu->reg_F & (uint8_t)(FLAG_S | FLAG_Z | FLAG_C);
+            cpu->reg_F = preserved;
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_xy_flags(cpu, sum);
+            return 12;
+        }
+        case 0xB8: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t de = get_DE(cpu);
+            writeByte(de, value);
+            set_DE(cpu, (uint16_t)(de - 1));
+            set_HL(cpu, (uint16_t)(hl - 1));
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            uint8_t sum = (uint8_t)(cpu->reg_A + value);
+            uint8_t preserved = cpu->reg_F & (uint8_t)(FLAG_S | FLAG_Z | FLAG_C);
+            cpu->reg_F = preserved;
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_xy_flags(cpu, sum);
+            if (bc != 0) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
+        case 0xA1: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            set_HL(cpu, (uint16_t)(hl + 1));
+            uint8_t diff = (uint8_t)(cpu->reg_A - value);
+            uint8_t half = (uint8_t)((cpu->reg_A & 0x0F) < (value & 0x0F));
+            set_flag(cpu, FLAG_S, diff & 0x80);
+            set_flag(cpu, FLAG_Z, diff == 0);
+            set_flag(cpu, FLAG_H, half);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_flag(cpu, FLAG_N, 1);
+            set_xy_flags(cpu, (uint8_t)(diff - (half ? 1 : 0)));
+            return 12;
+        }
+        case 0xB1: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            set_HL(cpu, (uint16_t)(hl + 1));
+            uint8_t diff = (uint8_t)(cpu->reg_A - value);
+            uint8_t half = (uint8_t)((cpu->reg_A & 0x0F) < (value & 0x0F));
+            set_flag(cpu, FLAG_S, diff & 0x80);
+            set_flag(cpu, FLAG_Z, diff == 0);
+            set_flag(cpu, FLAG_H, half);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_flag(cpu, FLAG_N, 1);
+            set_xy_flags(cpu, (uint8_t)(diff - (half ? 1 : 0)));
+            if (bc != 0 && diff != 0) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
+        case 0xA9: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            set_HL(cpu, (uint16_t)(hl - 1));
+            uint8_t diff = (uint8_t)(cpu->reg_A - value);
+            uint8_t half = (uint8_t)((cpu->reg_A & 0x0F) < (value & 0x0F));
+            set_flag(cpu, FLAG_S, diff & 0x80);
+            set_flag(cpu, FLAG_Z, diff == 0);
+            set_flag(cpu, FLAG_H, half);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_flag(cpu, FLAG_N, 1);
+            set_xy_flags(cpu, (uint8_t)(diff - (half ? 1 : 0)));
+            return 12;
+        }
+        case 0xB9: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            uint16_t bc = (uint16_t)((get_BC(cpu) - 1) & 0xFFFF);
+            set_BC(cpu, bc);
+            set_HL(cpu, (uint16_t)(hl - 1));
+            uint8_t diff = (uint8_t)(cpu->reg_A - value);
+            uint8_t half = (uint8_t)((cpu->reg_A & 0x0F) < (value & 0x0F));
+            set_flag(cpu, FLAG_S, diff & 0x80);
+            set_flag(cpu, FLAG_Z, diff == 0);
+            set_flag(cpu, FLAG_H, half);
+            set_flag(cpu, FLAG_PV, bc != 0);
+            set_flag(cpu, FLAG_N, 1);
+            set_xy_flags(cpu, (uint8_t)(diff - (half ? 1 : 0)));
+            if (bc != 0 && diff != 0) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
+        case 0x44: case 0x4C: case 0x54: case 0x5C: case 0x64: case 0x6C: case 0x74: case 0x7C: {
+            uint8_t a = cpu->reg_A;
+            cpu->reg_A = 0;
+            cpu_sub(cpu, a, 1);
+            return 4;
+        }
+        case 0x47: cpu->reg_I = cpu->reg_A; return 5;
+        case 0x4F: cpu->reg_R = cpu->reg_A; return 5;
+        case 0x57:
+            cpu->reg_A = cpu->reg_I;
+            set_flags_szp(cpu, cpu->reg_A);
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            set_flag(cpu, FLAG_PV, cpu->iff2);
+            return 5;
+        case 0x5F:
+            cpu->reg_A = cpu->reg_R;
+            set_flags_szp(cpu, cpu->reg_A);
+            set_flag(cpu, FLAG_H, 0);
+            set_flag(cpu, FLAG_N, 0);
+            set_flag(cpu, FLAG_PV, cpu->iff2);
+            return 5;
         case 0x67: {
             uint16_t hl_addr = get_HL(cpu);
             uint8_t value = readByte(hl_addr);
@@ -3998,7 +4219,7 @@ int cpu_ed_step(Z80* cpu) {
             set_flags_szp(cpu, cpu->reg_A);
             set_flag(cpu, FLAG_H, 0);
             set_flag(cpu, FLAG_N, 0);
-            return 10;
+            return 14;
         }
         case 0x6F: {
             uint16_t hl_addr = get_HL(cpu);
@@ -4010,50 +4231,163 @@ int cpu_ed_step(Z80* cpu) {
             set_flags_szp(cpu, cpu->reg_A);
             set_flag(cpu, FLAG_H, 0);
             set_flag(cpu, FLAG_N, 0);
-            return 10;
+            return 14;
         }
-        case 0x46:cpu->interruptMode=0;return 0; case 0x56:cpu->interruptMode=1;return 0; case 0x5E:cpu->interruptMode=2;return 0;
-        case 0x45:cpu->reg_PC=cpu_pop(cpu);cpu->iff1=cpu->iff2;return 6; case 0x4D:cpu->reg_PC=cpu_pop(cpu);cpu->iff1=cpu->iff2;return 6;
-        case 0x40:cpu->reg_B=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_B);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4; case 0x48:cpu->reg_C=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_C);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4;
-        case 0x50:cpu->reg_D=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_D);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4; case 0x58:cpu->reg_E=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_E);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4;
-        case 0x60:cpu->reg_H=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_H);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4; case 0x68:cpu->reg_L=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_L);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4;
-        case 0x70:(void)io_read(get_BC(cpu));return 4; case 0x78:cpu->reg_A=io_read(get_BC(cpu));set_flags_szp(cpu,cpu->reg_A);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_N,0);return 4;
-        case 0x41:io_write(get_BC(cpu),cpu->reg_B);return 4; case 0x49:io_write(get_BC(cpu),cpu->reg_C);return 4; case 0x51:io_write(get_BC(cpu),cpu->reg_D);return 4; case 0x59:io_write(get_BC(cpu),cpu->reg_E);return 4;
-        case 0x61:io_write(get_BC(cpu),cpu->reg_H);return 4; case 0x69:io_write(get_BC(cpu),cpu->reg_L);return 4; case 0x71:io_write(get_BC(cpu),0);return 4; case 0x79:io_write(get_BC(cpu),cpu->reg_A);return 4;
-        case 0xA2:writeByte(get_HL(cpu),io_read(get_BC(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)+1);return 8; case 0xB2:writeByte(get_HL(cpu),io_read(get_BC(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)+1);if(cpu->reg_B!=0){cpu->reg_PC-=2;return 13;}return 8;
-        case 0xAA:writeByte(get_HL(cpu),io_read(get_BC(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)-1);return 8; case 0xBA:writeByte(get_HL(cpu),io_read(get_BC(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)-1);if(cpu->reg_B!=0){cpu->reg_PC-=2;return 13;}return 8;
-        case 0xA3:io_write(get_BC(cpu),readByte(get_HL(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)+1);return 8; case 0xB3:io_write(get_BC(cpu),readByte(get_HL(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)+1);if(cpu->reg_B!=0){cpu->reg_PC-=2;return 13;}return 8;
-        case 0xAB:io_write(get_BC(cpu),readByte(get_HL(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)-1);return 8; case 0xBB:io_write(get_BC(cpu),readByte(get_HL(cpu)));cpu->reg_B--;set_HL(cpu,get_HL(cpu)-1);if(cpu->reg_B!=0){cpu->reg_PC-=2;return 13;}return 8;
-        default: printf("Error: Unimplemented 0xED opcode: 0x%02X at 0x%04X\n",op,cpu->reg_PC-2); exit(1);
+        case 0x45: case 0x55: case 0x5D: case 0x65: case 0x6D: case 0x75: case 0x7D:
+            cpu->reg_PC = cpu_pop(cpu);
+            cpu->iff1 = cpu->iff2;
+            return 10;
+        case 0x4D:
+            cpu->reg_PC = cpu_pop(cpu);
+            cpu->iff1 = cpu->iff2;
+            return 10;
+        case 0x46: case 0x4E: case 0x66: case 0x6E:
+            cpu->interruptMode = 0;
+            return 4;
+        case 0x56: case 0x76:
+            cpu->interruptMode = 1;
+            return 4;
+        case 0x5E: case 0x7E:
+            cpu->interruptMode = 2;
+            return 4;
+        case 0x40: {
+            uint8_t value = io_read(get_BC(cpu));
+            cpu->reg_B = value;
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x48: {
+            uint8_t value = io_read(get_BC(cpu));
+            cpu->reg_C = value;
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x50: {
+            uint8_t value = io_read(get_BC(cpu));
+            cpu->reg_D = value;
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x58: {
+            uint8_t value = io_read(get_BC(cpu));
+            cpu->reg_E = value;
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x60: {
+            uint8_t value = io_read(get_BC(cpu));
+            cpu->reg_H = value;
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x68: {
+            uint8_t value = io_read(get_BC(cpu));
+            cpu->reg_L = value;
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x70: {
+            uint8_t value = io_read(get_BC(cpu));
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x78: {
+            uint8_t value = io_read(get_BC(cpu));
+            cpu->reg_A = value;
+            set_flags_szp(cpu, value);
+            set_flag(cpu, FLAG_H, 1);
+            set_flag(cpu, FLAG_N, 1);
+            return 8;
+        }
+        case 0x41: io_write(get_BC(cpu), cpu->reg_B); return 8;
+        case 0x49: io_write(get_BC(cpu), cpu->reg_C); return 8;
+        case 0x51: io_write(get_BC(cpu), cpu->reg_D); return 8;
+        case 0x59: io_write(get_BC(cpu), cpu->reg_E); return 8;
+        case 0x61: io_write(get_BC(cpu), cpu->reg_H); return 8;
+        case 0x69: io_write(get_BC(cpu), cpu->reg_L); return 8;
+        case 0x71: io_write(get_BC(cpu), 0); return 8;
+        case 0x79: io_write(get_BC(cpu), cpu->reg_A); return 8;
+        case 0xA2: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); return 8;
+        case 0xB2: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
+        case 0xAA: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); return 8;
+        case 0xBA: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
+        case 0xA3: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); return 8;
+        case 0xB3: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
+        case 0xAB: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); return 8;
+        case 0xBB: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
+        default:
+            return 4;
     }
 }
 
-// --- 0xDDCB/FDCB Prefix CPU Step Function ---
-int cpu_ddfd_cb_step(Z80* cpu, uint16_t base_addr) {
-    int8_t d=(int8_t)readByte(cpu->reg_PC++); uint8_t op=readByte(cpu->reg_PC++); uint16_t addr=base_addr+d;
+int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix) {
+    int8_t d=(int8_t)readByte(cpu->reg_PC++); uint8_t op=readByte(cpu->reg_PC++);
+    uint16_t addr=(uint16_t)(*index_reg + d);
     uint8_t x=(op>>6)&3; uint8_t y=(op>>3)&7; uint8_t z=op&7;
-    if(z!=6){ printf("Warning: Unimplemented Undocumented DDCB/FDCB variant 0x%02X\n", op); }
-    uint8_t operand=readByte(addr); uint8_t result=0;
+    uint8_t operand=readByte(addr); uint8_t result=operand;
     switch(x){
-        case 0: switch(y){ case 0:result=cpu_rlc(cpu,operand);break; case 1:result=cpu_rrc(cpu,operand);break; case 2:result=cpu_rl(cpu,operand);break; case 3:result=cpu_rr(cpu,operand);break; case 4:result=cpu_sla(cpu,operand);break; case 5:result=cpu_sra(cpu,operand);break; case 6:result=0;/*SLL*/break; case 7:result=cpu_srl(cpu,operand);break; } break;
-        case 1: cpu_bit(cpu,operand,y); return 8; // 4+4+3+5+4 = 20
-        case 2: result=operand&~(1<<y); break; case 3: result=operand|(1<<y); break;
+        case 0: switch(y){ case 0:result=cpu_rlc(cpu,operand);break; case 1:result=cpu_rrc(cpu,operand);break; case 2:result=cpu_rl(cpu,operand);break; case 3:result=cpu_rr(cpu,operand);break; case 4:result=cpu_sla(cpu,operand);break; case 5:result=cpu_sra(cpu,operand);break; case 6:result=cpu_sll(cpu,operand);break; case 7:result=cpu_srl(cpu,operand);break; } break;
+        case 1: cpu_bit(cpu,operand,y); return 12;
+        case 2: result=(uint8_t)(operand&~(1<<y)); break; case 3: result=(uint8_t)(operand|(1<<y)); break;
     }
-    writeByte(addr,result);
-    return 11; // 4+4+3+5+4+3 = 23
+    if (x != 1) {
+        writeByte(addr, result);
+    }
+    if(z==6){ return 15; }
+    switch(z){
+        case 0:cpu->reg_B=result;break; case 1:cpu->reg_C=result;break; case 2:cpu->reg_D=result;break; case 3:cpu->reg_E=result;break;
+        case 4: if(is_ix) set_IXh(cpu,result); else set_IYh(cpu,result); break;
+        case 5: if(is_ix) set_IXl(cpu,result); else set_IYl(cpu,result); break;
+        case 7: cpu->reg_A=result; break;
+        default: break;
+    }
+    return 12;
 }
 
 // --- Handle Maskable Interrupt ---
-int cpu_interrupt(Z80* cpu, uint16_t vector_addr) {
+int cpu_interrupt(Z80* cpu, uint8_t data_bus) {
     if (cpu->halted) {
         cpu->reg_PC++; // Leave HALT state
         cpu->halted = 0;
     }
     cpu->iff1 = cpu->iff2 = 0; // Disable interrupts
     cpu->reg_R = (cpu->reg_R + 1) | (cpu->reg_R & 0x80);
+
+    uint16_t vector;
+    int t_states = 13;
+    switch (cpu->interruptMode) {
+        case 0: // Treat IM 0 like IM 1 for Spectrum ULA
+        case 1:
+            vector = 0x0038;
+            break;
+        case 2: {
+            uint16_t table_addr = (uint16_t)(((uint16_t)cpu->reg_I << 8) | data_bus);
+            vector = readWord(table_addr);
+            t_states = 19;
+            break;
+        }
+        default:
+            vector = 0x0038;
+            break;
+    }
+
     cpu_push(cpu, cpu->reg_PC); // Push current PC
-    cpu->reg_PC = vector_addr;  // Jump to handler
-    return 13; // IM 1 interrupt takes 13 T-states
+    cpu->reg_PC = vector;       // Jump to handler
+    return t_states;
 }
 
 // --- The Main CPU Execution Step ---
@@ -4243,7 +4577,7 @@ int cpu_step(Z80* cpu) { // Returns T-states
         case 0x2F: cpu->reg_A=~cpu->reg_A;set_flag(cpu,FLAG_H,1);set_flag(cpu,FLAG_N,1);break;
         case 0x37: set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_H,0);set_flag(cpu,FLAG_C,1);break;
         case 0x3F: set_flag(cpu,FLAG_N,0);set_flag(cpu,FLAG_H,get_flag(cpu,FLAG_C));set_flag(cpu,FLAG_C,!get_flag(cpu,FLAG_C));break;
-        case 0xCB: t_states += (prefix==1) ? cpu_ddfd_cb_step(cpu,cpu->reg_IX) : (prefix==2 ? cpu_ddfd_cb_step(cpu,cpu->reg_IY) : cpu_cb_step(cpu)); break;
+        case 0xCB: t_states += (prefix==1) ? cpu_ddfd_cb_step(cpu,&cpu->reg_IX,1) : (prefix==2 ? cpu_ddfd_cb_step(cpu,&cpu->reg_IY,0) : cpu_cb_step(cpu)); break;
         case 0xED: t_states += cpu_ed_step(cpu); break;
         case 0xE3: { uint16_t t;uint16_t spv=readWord(cpu->reg_SP);if(prefix==1){t=cpu->reg_IX;cpu->reg_IX=spv;t_states+=19;}else if(prefix==2){t=cpu->reg_IY;cpu->reg_IY=spv;t_states+=19;}else{t=get_HL(cpu);set_HL(cpu,spv);t_states+=15;}writeWord(cpu->reg_SP,t);break; }
         case 0xF9: if(prefix==1)cpu->reg_SP=cpu->reg_IX;else if(prefix==2)cpu->reg_SP=cpu->reg_IY;else cpu->reg_SP=get_HL(cpu); t_states+=(prefix?6:2); break;
@@ -4256,6 +4590,352 @@ int cpu_step(Z80* cpu) { // Returns T-states
     }
     ula_instruction_progress_ptr = NULL;
     return t_states;
+}
+
+// --- Test Harness Utilities ---
+static void cpu_reset_state(Z80* cpu) {
+    memset(cpu, 0, sizeof(*cpu));
+    cpu->interruptMode = 1;
+    cpu->reg_SP = 0xFFFF;
+}
+
+static void memory_clear(void) {
+    memset(memory, 0, sizeof(memory));
+}
+
+static bool append_output_char(char* output, size_t* length, size_t capacity, char ch) {
+    if (*length + 1 >= capacity) {
+        return false;
+    }
+    output[*length] = ch;
+    (*length)++;
+    output[*length] = '\0';
+    return true;
+}
+
+static bool test_cb_sll_register(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.reg_PC = 0x0000;
+    cpu.reg_B = 0x80;
+    memory[0x0000] = 0xCB;
+    memory[0x0001] = 0x30; // SLL B
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+    return cpu.reg_B == 0x01 && get_flag(&cpu, FLAG_C) && !get_flag(&cpu, FLAG_Z) && t_states == 8 && cpu.reg_PC == 0x0002;
+}
+
+static bool test_cb_sll_memory(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0x80;
+    cpu.reg_L = 0x00;
+    memory[0x8000] = 0x02;
+    memory[0x0000] = 0xCB;
+    memory[0x0001] = 0x36; // SLL (HL)
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+    bool ok = memory[0x8000] == 0x05 && !get_flag(&cpu, FLAG_C) && t_states == 15 && cpu.reg_PC == 0x0002;
+    if (!ok) {
+        printf("    (HL) result=0x%02X, C=%d, t=%d, PC=0x%04X\n",
+               memory[0x8000], get_flag(&cpu, FLAG_C), t_states, cpu.reg_PC);
+    }
+    return ok;
+}
+
+static bool test_ddcb_register_result(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.reg_PC = 0x0000;
+    cpu.reg_IX = 0x8000;
+    cpu.reg_B = 0x00;
+    memory[0x8000] = 0x80;
+    memory[0x0000] = 0xDD;
+    memory[0x0001] = 0xCB;
+    memory[0x0002] = 0x00;
+    memory[0x0003] = 0x30; // SLL (IX+0),B
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+    bool ok = cpu.reg_B == 0x01 && memory[0x8000] == 0x01 && get_flag(&cpu, FLAG_C) && t_states == 20;
+    if (!ok) {
+        printf("    (IX+d) result=0x%02X, C=%d, t=%d\n",
+               memory[0x8000], get_flag(&cpu, FLAG_C), t_states);
+    }
+    return ok;
+}
+
+static bool test_ddcb_memory_result(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.reg_PC = 0x0000;
+    cpu.reg_IY = 0x8100;
+    memory[0x8100] = 0x02;
+    memory[0x0000] = 0xFD;
+    memory[0x0001] = 0xCB;
+    memory[0x0002] = 0x00;
+    memory[0x0003] = 0x36; // SLL (IY+0)
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+    bool ok = memory[0x8100] == 0x05 && !get_flag(&cpu, FLAG_C) && t_states == 23;
+    if (!ok) {
+        printf("    (IY+d) result=0x%02X, C=%d, t=%d\n",
+               memory[0x8100], get_flag(&cpu, FLAG_C), t_states);
+    }
+    return ok;
+}
+
+static bool test_neg_duplicates(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.reg_PC = 0x0000;
+    cpu.reg_A = 0x01;
+    memory[0x0000] = 0xED;
+    memory[0x0001] = 0x4C; // NEG duplicate
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+    return cpu.reg_A == 0xFF && get_flag(&cpu, FLAG_C) && get_flag(&cpu, FLAG_N) && t_states == 8;
+}
+
+static bool test_im_modes(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.reg_PC = 0x0000;
+    memory[0x0000] = 0xED; memory[0x0001] = 0x46; // IM 0
+    memory[0x0002] = 0xED; memory[0x0003] = 0x56; // IM 1
+    memory[0x0004] = 0xED; memory[0x0005] = 0x5E; // IM 2
+    total_t_states = 0;
+    (void)cpu_step(&cpu);
+    (void)cpu_step(&cpu);
+    (void)cpu_step(&cpu);
+    return cpu.interruptMode == 2;
+}
+
+static bool test_in_flags(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.reg_PC = 0x0000;
+    cpu.reg_B = 0x00;
+    cpu.reg_C = 0x01; // Non-ULA port
+    memory[0x0000] = 0xED;
+    memory[0x0001] = 0x40; // IN B,(C)
+    total_t_states = 0;
+    (void)cpu_step(&cpu);
+    return cpu.reg_B == 0xFF && get_flag(&cpu, FLAG_H) && get_flag(&cpu, FLAG_N);
+}
+
+static bool test_interrupt_im2(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.interruptMode = 2;
+    cpu.reg_I = 0x80;
+    cpu.reg_SP = 0xFFFE;
+    cpu.reg_PC = 0x1234;
+    memory[0x80FF] = 0x78;
+    memory[0x8100] = 0x56;
+    int t_states = cpu_interrupt(&cpu, 0xFF);
+    bool ok = cpu.reg_PC == 0x5678 && cpu.reg_SP == 0xFFFC && memory[0xFFFC] == 0x34 &&
+              memory[0xFFFD] == 0x12 && t_states == 19;
+    if (!ok) {
+        printf("    IM2 PC=%04X SP=%04X stack=%02X%02X t=%d\n",
+               cpu.reg_PC, cpu.reg_SP, memory[0xFFFD], memory[0xFFFC], t_states);
+    }
+    return ok;
+}
+
+static bool test_interrupt_im1(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    cpu.interruptMode = 1;
+    cpu.reg_SP = 0xFFFE;
+    cpu.reg_PC = 0x2222;
+    int t_states = cpu_interrupt(&cpu, 0xFF);
+    return cpu.reg_PC == 0x0038 && cpu.reg_SP == 0xFFFC && memory[0xFFFC] == 0x22 && memory[0xFFFD] == 0x22 && t_states == 13;
+}
+
+static bool run_unit_tests(void) {
+    struct {
+        const char* name;
+        bool (*fn)(void);
+    } tests[] = {
+        {"CB SLL register", test_cb_sll_register},
+        {"CB SLL (HL)", test_cb_sll_memory},
+        {"DDCB SLL register", test_ddcb_register_result},
+        {"DDCB SLL memory", test_ddcb_memory_result},
+        {"NEG duplicates", test_neg_duplicates},
+        {"IM mode transitions", test_im_modes},
+        {"IN flag behaviour", test_in_flags},
+        {"IM 2 interrupt vector", test_interrupt_im2},
+        {"IM 1 interrupt vector", test_interrupt_im1},
+    };
+
+    bool all_passed = true;
+    printf("Running CPU unit tests...\n");
+    for (size_t i = 0; i < sizeof(tests)/sizeof(tests[0]); ++i) {
+        bool ok = tests[i].fn();
+        printf("  %-28s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            all_passed = false;
+        }
+    }
+    return all_passed;
+}
+
+static bool handle_cpm_bdos(Z80* cpu, char* output, size_t* out_len, size_t out_cap, int* terminated) {
+    uint8_t func = cpu->reg_C;
+    uint16_t ret = cpu_pop(cpu);
+    switch (func) {
+        case 0x00:
+            *terminated = 1;
+            cpu->reg_PC = ret;
+            return true;
+        case 0x02:
+            if (!append_output_char(output, out_len, out_cap, (char)cpu->reg_E)) {
+                return false;
+            }
+            cpu->reg_PC = ret;
+            return true;
+        case 0x09: {
+            uint16_t addr = get_DE(cpu);
+            while (1) {
+                char ch = (char)memory[addr++];
+                if (ch == '$') {
+                    break;
+                }
+                if (!append_output_char(output, out_len, out_cap, ch)) {
+                    return false;
+                }
+            }
+            cpu->reg_PC = ret;
+            return true;
+        }
+        default:
+            cpu->reg_PC = ret;
+            return true;
+    }
+}
+
+static int run_z80_com_test(const char* path, const char* success_marker, char* output, size_t output_cap) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        return -1;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+
+    size_t loaded = fread(memory + 0x0100, 1, sizeof(memory) - 0x0100, f);
+    fclose(f);
+    if (loaded == 0) {
+        return 0;
+    }
+
+    memory[0x0000] = 0xC3; // JP 0x0100
+    memory[0x0001] = 0x00;
+    memory[0x0002] = 0x01;
+    memory[0x0005] = 0xC9; // RET
+
+    cpu.reg_PC = 0x0100;
+    cpu.reg_SP = 0xFFFF;
+    cpu.interruptMode = 1;
+    cpu.iff1 = cpu.iff2 = 0;
+
+    size_t out_len = 0;
+    if (output_cap > 0) {
+        output[0] = '\0';
+    }
+
+    const uint64_t max_cycles = 400000000ULL;
+    uint64_t cycles = 0;
+    int terminated = 0;
+
+    while (!terminated && cycles < max_cycles) {
+        if (cpu.reg_PC == 0x0005) {
+            if (!handle_cpm_bdos(&cpu, output, &out_len, output_cap, &terminated)) {
+                return 0;
+            }
+            continue;
+        }
+
+        int t_states = cpu_step(&cpu);
+        if (t_states <= 0) {
+            return 0;
+        }
+        cycles += (uint64_t)t_states;
+    }
+
+    if (!terminated) {
+        return 0;
+    }
+
+    if (success_marker && strstr(output, success_marker) == NULL) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int run_cpu_tests(const char* rom_dir) {
+    bool unit_pass = run_unit_tests();
+    bool overall = unit_pass;
+
+    const struct {
+        const char* filename;
+        const char* marker;
+        const char* label;
+    } optional_tests[] = {
+        {"zexdoc.com", "ZEXDOC", "ZEXDOC"},
+        {"zexall.com", "ZEXALL", "ZEXALL"},
+    };
+
+    char full_path[512];
+    char output_log[32768];
+
+    for (size_t i = 0; i < sizeof(optional_tests)/sizeof(optional_tests[0]); ++i) {
+        int required = 0;
+        if (rom_dir && rom_dir[0] != '\0') {
+            required = snprintf(full_path, sizeof(full_path), "%s/%s", rom_dir, optional_tests[i].filename);
+        } else {
+            required = snprintf(full_path, sizeof(full_path), "%s", optional_tests[i].filename);
+        }
+        if (required < 0 || (size_t)required >= sizeof(full_path)) {
+            fprintf(stderr, "Skipping %s (path too long)\n", optional_tests[i].label);
+            continue;
+        }
+        int result = run_z80_com_test(full_path, optional_tests[i].marker, output_log, sizeof(output_log));
+        if (result == -1) {
+            printf("Skipping %s (missing %s)\n", optional_tests[i].label, full_path);
+            continue;
+        }
+        if (result == 1) {
+            printf("%s test PASS\n", optional_tests[i].label);
+        } else {
+            printf("%s test FAIL\n", optional_tests[i].label);
+            printf("Output:\n%s\n", output_log);
+            overall = false;
+        }
+    }
+
+    return overall ? 0 : 1;
+}
+
+static void print_usage(const char* prog) {
+    fprintf(stderr,
+            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] "
+            "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
+            "[--save-tap <tap_file> | --save-wav <wav_file>] "
+            "[--test-rom-dir <dir>] [--run-tests] [rom_file]\n",
+            prog);
 }
 
 // --- SDL Initialization ---
@@ -4490,11 +5170,13 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 int main(int argc, char *argv[]) {
     const char* rom_filename = NULL;
     int rom_provided = 0;
+    int run_tests = 0;
+    const char* test_rom_dir = "tests/roms";
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                print_usage(argv[0]);
                 return 1;
             }
             audio_dump_path = argv[++i];
@@ -4502,7 +5184,7 @@ int main(int argc, char *argv[]) {
             beeper_logging_enabled = 1;
         } else if (strcmp(argv[i], "--tap") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                print_usage(argv[0]);
                 return 1;
             }
             if (tape_input_format != TAPE_FORMAT_NONE) {
@@ -4513,7 +5195,7 @@ int main(int argc, char *argv[]) {
             tape_input_path = argv[++i];
         } else if (strcmp(argv[i], "--tzx") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                print_usage(argv[0]);
                 return 1;
             }
             if (tape_input_format != TAPE_FORMAT_NONE) {
@@ -4524,7 +5206,7 @@ int main(int argc, char *argv[]) {
             tape_input_path = argv[++i];
         } else if (strcmp(argv[i], "--wav") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                print_usage(argv[0]);
                 return 1;
             }
             if (tape_input_format != TAPE_FORMAT_NONE) {
@@ -4535,7 +5217,7 @@ int main(int argc, char *argv[]) {
             tape_input_path = argv[++i];
         } else if (strcmp(argv[i], "--save-tap") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                print_usage(argv[0]);
                 return 1;
             }
             if (tape_recorder.enabled) {
@@ -4545,7 +5227,7 @@ int main(int argc, char *argv[]) {
             tape_recorder_enable(argv[++i], TAPE_OUTPUT_TAP);
         } else if (strcmp(argv[i], "--save-wav") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                print_usage(argv[0]);
                 return 1;
             }
             if (tape_recorder.enabled) {
@@ -4553,6 +5235,14 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             tape_recorder_enable(argv[++i], TAPE_OUTPUT_WAV);
+        } else if (strcmp(argv[i], "--test-rom-dir") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            test_rom_dir = argv[++i];
+        } else if (strcmp(argv[i], "--run-tests") == 0) {
+            run_tests = 1;
         } else {
             TapeFormat inferred_format = tape_format_from_extension(argv[i]);
             if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
@@ -4563,10 +5253,14 @@ int main(int argc, char *argv[]) {
                 rom_provided = 1;
             } else {
                 fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-                fprintf(stderr, "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] [--save-tap <tap_file> | --save-wav <wav_file>] [rom_file]\n", argv[0]);
+                print_usage(argv[0]);
                 return 1;
             }
         }
+    }
+
+    if (run_tests) {
+        return run_cpu_tests(test_rom_dir);
     }
 
     if (!rom_filename) {
@@ -4790,7 +5484,7 @@ int main(int argc, char *argv[]) {
 
             while (frame_t_state_accumulator >= T_STATES_PER_FRAME) {
                 if (cpu.iff1) {
-                    int interrupt_t_states = cpu_interrupt(&cpu, 0x0038);
+                    int interrupt_t_states = cpu_interrupt(&cpu, 0xFF);
                     total_t_states += interrupt_t_states;
                     frame_t_state_accumulator += interrupt_t_states;
                 }

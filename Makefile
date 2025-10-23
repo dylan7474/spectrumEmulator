@@ -45,7 +45,10 @@ $(TARGET): $(SRCS)
 run: $(TARGET)
 	./$< 48.rom
 
+test: $(TARGET)
+	./$< --run-tests
+
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all run clean
+.PHONY: all run test clean
