@@ -89,6 +89,13 @@ For convenience a dedicated make target wraps the test invocation:
 make test
 ```
 
+Running `make test` also synthesises a small CP/M COM image that hammers the
+IX/IY-prefixed instruction helpers. The generator
+(`tests/generate_ixiy_prefixed.py`) writes the binary into `tests/roms/` and the
+emulator consumes it via `--test-rom-dir`, allowing CI to catch regressions in
+the indexed opcode table without any external downloads. A Python 3 interpreter
+is required to build the COM image.
+
 ### Loading and saving tapes
 
 Real-time cassette emulation is available for standard `.tap` dumps, `.tzx` images that use standard speed data blocks, and mono PCM `.wav` captures. Supply
