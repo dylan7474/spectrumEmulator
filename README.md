@@ -38,7 +38,7 @@ flags while allowing you to manage dependencies manually.
 3. Build with `make -f Makefile.win` to produce the Windows binary.
 
 ## Running
-Launch the compiled executable from the command line with a 16 KB Spectrum ROM image:
+Launch the compiled executable from the command line with a 48 KB Spectrum ROM image:
 
 ```bash
 ./z80 path/to/48k.rom
