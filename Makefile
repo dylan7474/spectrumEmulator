@@ -1,9 +1,11 @@
 # --- Makefile for Z80 Emulator ---
 CC ?= gcc
 PKG_CONFIG ?= pkg-config
+PYTHON ?= python3
 
 TARGET := z80
 SRCS := z80.c
+CPM_TEST_ROM := tests/roms/ixiy_prefixed.com
 
 # Allow callers to provide custom SDL2 flags via the environment. Otherwise try
 # pkg-config first, then fall back to sdl2-config if available.
@@ -45,8 +47,14 @@ $(TARGET): $(SRCS)
 run: $(TARGET)
 	./$< 48.rom
 
-test: $(TARGET)
-	./$< --run-tests
+test: $(TARGET) $(CPM_TEST_ROM)
+	./$< --run-tests --test-rom-dir tests/roms
+
+$(CPM_TEST_ROM): tests/generate_ixiy_prefixed.py | tests/roms
+	$(PYTHON) $< $@
+
+tests/roms:
+	mkdir -p $@
 
 clean:
 	rm -f $(TARGET)
