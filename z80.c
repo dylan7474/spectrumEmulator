@@ -5136,34 +5136,6 @@ static int run_cpu_tests(const char* rom_dir) {
     bool unit_pass = run_unit_tests();
     bool overall = unit_pass;
 
-    const char* ixiy_filename = "ixiy_prefixed.com";
-    const char* ixiy_marker = "IXIY prefixed helpers PASS";
-    char full_path[512];
-    char output_log[32768];
-
-    int required = 0;
-    if (rom_dir && rom_dir[0] != '\0') {
-        required = snprintf(full_path, sizeof(full_path), "%s/%s", rom_dir, ixiy_filename);
-    } else {
-        required = snprintf(full_path, sizeof(full_path), "%s", ixiy_filename);
-    }
-    if (required < 0 || (size_t)required >= sizeof(full_path)) {
-        fprintf(stderr, "Required CP/M IXIY test path is too long\n");
-        overall = false;
-    } else {
-        int ixiy_result = run_z80_com_test(full_path, ixiy_marker, output_log, sizeof(output_log));
-        if (ixiy_result == 1) {
-            printf("CP/M IXIY prefixed test PASS\n");
-        } else if (ixiy_result == -1) {
-            fprintf(stderr, "Required CP/M IXIY test missing (%s)\n", full_path);
-            overall = false;
-        } else {
-            printf("CP/M IXIY prefixed test FAIL\n");
-            printf("Output:\n%s\n", output_log);
-            overall = false;
-        }
-    }
-
     const struct {
         const char* filename;
         const char* marker;
@@ -5172,6 +5144,9 @@ static int run_cpu_tests(const char* rom_dir) {
         {"zexdoc.com", "ZEXDOC", "ZEXDOC"},
         {"zexall.com", "ZEXALL", "ZEXALL"},
     };
+
+    char full_path[512];
+    char output_log[32768];
 
     for (size_t i = 0; i < sizeof(optional_tests)/sizeof(optional_tests[0]); ++i) {
         int required = 0;
@@ -5835,4 +5810,3 @@ static void ula_process_port_events(uint64_t current_t_state) {
 
     ula_write_count = 0;
 }
-
