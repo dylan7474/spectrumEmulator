@@ -23,7 +23,9 @@ uint8_t memory[0x10000]; // 65536 bytes
 
 typedef enum {
     SPECTRUM_MODEL_48K,
-    SPECTRUM_MODEL_128K
+    SPECTRUM_MODEL_128K,
+    SPECTRUM_MODEL_PLUS2A,
+    SPECTRUM_MODEL_PLUS3
 } SpectrumModel;
 
 typedef enum {
@@ -41,15 +43,35 @@ typedef enum {
 static SpectrumModel spectrum_model = SPECTRUM_MODEL_48K;
 static SpectrumContentionProfile spectrum_contention_profile = CONTENTION_PROFILE_48K;
 static PeripheralContentionProfile peripheral_contention_profile = PERIPHERAL_CONTENTION_NONE;
-static uint8_t rom_pages[2][0x4000];
+static uint8_t rom_pages[4][0x4000];
 static uint8_t ram_pages[8][0x4000];
 static uint8_t current_rom_page = 0;
 static uint8_t current_screen_bank = 5;
-static uint8_t current_paged_bank = 7;
+static uint8_t current_paged_bank = 0;
 static int paging_disabled = 0;
 static uint8_t rom_page_count = 1;
 static uint8_t page_contended[4] = {0u, 1u, 0u, 0u};
 static uint8_t floating_bus_last_value = 0xFFu;
+static uint8_t gate_array_7ffd_state = 0u;
+static uint8_t gate_array_1ffd_state = 0u;
+
+typedef enum {
+    MEMORY_PAGE_NONE,
+    MEMORY_PAGE_ROM,
+    MEMORY_PAGE_RAM
+} SpectrumMemoryPageType;
+
+typedef struct {
+    SpectrumMemoryPageType type;
+    uint8_t index;
+} SpectrumMemoryPage;
+
+static SpectrumMemoryPage spectrum_pages[4] = {
+    {MEMORY_PAGE_ROM, 0u},
+    {MEMORY_PAGE_RAM, 5u},
+    {MEMORY_PAGE_RAM, 2u},
+    {MEMORY_PAGE_RAM, 0u}
+};
 
 // --- ZX Spectrum Constants ---
 #define SCREEN_WIDTH 256
@@ -475,6 +497,8 @@ int cpu_interrupt(Z80* cpu, uint8_t data_bus);
 int cpu_nmi(Z80* cpu);
 int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
 void audio_callback(void* userdata, Uint8* stream, int len);
+static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t index);
+static void spectrum_apply_memory_configuration(void);
 static void spectrum_update_contention_flags(void);
 static inline int ula_contention_penalty(uint64_t t_state);
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
@@ -546,6 +570,49 @@ static inline int spectrum_is_ram_bank_contended(uint8_t bank) {
     return (mask & (uint8_t)(1u << bank)) != 0u;
 }
 
+static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t index) {
+    if (segment < 0 || segment >= 4) {
+        return;
+    }
+
+    SpectrumMemoryPage *slot = &spectrum_pages[segment];
+    uint16_t base = (uint16_t)(segment * 0x4000u);
+    if (slot->type == type && slot->index == index && slot->type != MEMORY_PAGE_NONE) {
+        return;
+    }
+
+    if (slot->type == MEMORY_PAGE_RAM && slot->index < 8u) {
+        memcpy(ram_pages[slot->index], memory + base, 0x4000);
+    }
+
+    if (type == MEMORY_PAGE_ROM) {
+        uint8_t rom_limit = rom_page_count > 0u ? rom_page_count : 1u;
+        uint8_t rom_index = (uint8_t)(index % rom_limit);
+        memcpy(memory + base, rom_pages[rom_index], 0x4000);
+        slot->type = MEMORY_PAGE_ROM;
+        slot->index = rom_index;
+    } else if (type == MEMORY_PAGE_RAM) {
+        uint8_t ram_index = (uint8_t)(index % 8u);
+        memcpy(memory + base, ram_pages[ram_index], 0x4000);
+        slot->type = MEMORY_PAGE_RAM;
+        slot->index = ram_index;
+    } else {
+        memset(memory + base, 0, 0x4000);
+        slot->type = MEMORY_PAGE_NONE;
+        slot->index = 0u;
+    }
+}
+
+static void spectrum_update_contention_flags(void) {
+    for (int segment = 0; segment < 4; ++segment) {
+        uint8_t contended = 0u;
+        if (spectrum_pages[segment].type == MEMORY_PAGE_RAM) {
+            contended = (uint8_t)spectrum_is_ram_bank_contended(spectrum_pages[segment].index);
+        }
+        page_contended[segment] = contended;
+    }
+}
+
 static void spectrum_set_contention_profile(SpectrumContentionProfile profile) {
     spectrum_contention_profile = profile;
     spectrum_update_contention_flags();
@@ -597,10 +664,17 @@ static uint8_t spectrum_sample_floating_bus(uint64_t access_t_state) {
         return floating_bus_last_value;
     }
 
-    const uint8_t* vram_bank = memory + VRAM_START;
-    const uint8_t* attr_bank = memory + ATTR_START;
-    if (spectrum_model == SPECTRUM_MODEL_128K && current_screen_bank == 7u) {
-        const uint8_t* bank = ram_pages[7];
+    if (current_screen_bank >= 8u) {
+        return floating_bus_last_value;
+    }
+
+    const uint8_t* vram_bank;
+    const uint8_t* attr_bank;
+    if (spectrum_pages[1].type == MEMORY_PAGE_RAM && spectrum_pages[1].index == current_screen_bank) {
+        vram_bank = memory + VRAM_START;
+        attr_bank = memory + ATTR_START;
+    } else {
+        const uint8_t* bank = ram_pages[current_screen_bank];
         vram_bank = bank;
         attr_bank = bank + (ATTR_START - VRAM_START);
     }
@@ -627,34 +701,99 @@ static inline int ula_contention_penalty(uint64_t t_state) {
     return penalties[phase & 7u];
 }
 
-static void spectrum_update_contention_flags(void) {
-    page_contended[0] = 0u;
-    if (spectrum_model == SPECTRUM_MODEL_128K) {
-        uint8_t screen_bank = current_screen_bank;
-        page_contended[1] = (uint8_t)spectrum_is_ram_bank_contended(screen_bank);
-        page_contended[2] = (uint8_t)spectrum_is_ram_bank_contended(2u);
-        page_contended[3] = (uint8_t)spectrum_is_ram_bank_contended(current_paged_bank);
-    } else {
-        page_contended[1] = (uint8_t)spectrum_is_ram_bank_contended(5u);
-        page_contended[2] = 0u;
-        page_contended[3] = 0u;
+static void spectrum_apply_memory_configuration(void) {
+    if (spectrum_model == SPECTRUM_MODEL_48K) {
+        current_rom_page = 0u;
+        current_screen_bank = 5u;
+        current_paged_bank = 7u;
+        spectrum_map_page(0, MEMORY_PAGE_ROM, 0u);
+        spectrum_map_page(1, MEMORY_PAGE_RAM, 5u);
+        spectrum_map_page(2, MEMORY_PAGE_RAM, 2u);
+        spectrum_map_page(3, MEMORY_PAGE_RAM, 7u);
+        spectrum_update_contention_flags();
+        return;
     }
+
+    int plus_model = (spectrum_model == SPECTRUM_MODEL_PLUS2A) || (spectrum_model == SPECTRUM_MODEL_PLUS3);
+    if (!plus_model) {
+        uint8_t desired_rom = (uint8_t)((gate_array_7ffd_state >> 4) & 0x01u);
+        uint8_t rom_limit = rom_page_count > 0u ? rom_page_count : 1u;
+        current_rom_page = (uint8_t)(desired_rom % rom_limit);
+        current_screen_bank = (gate_array_7ffd_state & 0x08u) ? 7u : 5u;
+        spectrum_map_page(0, MEMORY_PAGE_ROM, current_rom_page);
+        spectrum_map_page(1, MEMORY_PAGE_RAM, 5u);
+        spectrum_map_page(2, MEMORY_PAGE_RAM, 2u);
+        spectrum_map_page(3, MEMORY_PAGE_RAM, current_paged_bank);
+        spectrum_update_contention_flags();
+        return;
+    }
+
+    uint8_t rom_low = (uint8_t)((gate_array_7ffd_state >> 4) & 0x01u);
+    uint8_t rom_high = (uint8_t)(gate_array_1ffd_state & 0x01u);
+    uint8_t desired_rom = (uint8_t)(((rom_high & 0x01u) << 1) | rom_low);
+    uint8_t rom_limit = rom_page_count > 0u ? rom_page_count : 1u;
+    current_rom_page = (uint8_t)(desired_rom % rom_limit);
+
+    int special_paging = (gate_array_1ffd_state & 0x04u) != 0;
+    int all_ram = !special_paging && ((gate_array_1ffd_state & 0x02u) != 0);
+
+    if (special_paging) {
+        static const uint8_t special_maps[4][4] = {
+            {0u, 1u, 2u, 3u},
+            {4u, 5u, 6u, 7u},
+            {4u, 5u, 6u, 3u},
+            {4u, 7u, 6u, 3u}
+        };
+        uint8_t config = (uint8_t)(gate_array_1ffd_state & 0x03u);
+        const uint8_t* map = special_maps[config];
+        spectrum_map_page(0, MEMORY_PAGE_RAM, map[0]);
+        spectrum_map_page(1, MEMORY_PAGE_RAM, map[1]);
+        spectrum_map_page(2, MEMORY_PAGE_RAM, map[2]);
+        spectrum_map_page(3, MEMORY_PAGE_RAM, map[3]);
+        if (spectrum_pages[1].type == MEMORY_PAGE_RAM) {
+            current_screen_bank = spectrum_pages[1].index;
+        } else {
+            current_screen_bank = 5u;
+        }
+    } else {
+        if (all_ram) {
+            spectrum_map_page(0, MEMORY_PAGE_RAM, 0u);
+        } else {
+            spectrum_map_page(0, MEMORY_PAGE_ROM, current_rom_page);
+        }
+        spectrum_map_page(1, MEMORY_PAGE_RAM, 5u);
+        spectrum_map_page(2, MEMORY_PAGE_RAM, 2u);
+        spectrum_map_page(3, MEMORY_PAGE_RAM, current_paged_bank);
+        current_screen_bank = (gate_array_7ffd_state & 0x08u) ? 7u : 5u;
+    }
+
+    spectrum_update_contention_flags();
 }
 
 static void spectrum_configure_model(SpectrumModel model) {
     spectrum_model = model;
     paging_disabled = 0;
-    current_screen_bank = 5;
-    current_rom_page = 0;
-    current_paged_bank = (model == SPECTRUM_MODEL_128K) ? 0u : 7u;
-    if (model == SPECTRUM_MODEL_128K) {
-        spectrum_contention_profile = CONTENTION_PROFILE_128K;
-    } else {
+    gate_array_7ffd_state = 0u;
+    gate_array_1ffd_state = 0u;
+    current_screen_bank = 5u;
+    current_rom_page = 0u;
+    current_paged_bank = (model == SPECTRUM_MODEL_48K) ? 7u : 0u;
+    for (int i = 0; i < 4; ++i) {
+        spectrum_pages[i].type = MEMORY_PAGE_NONE;
+        spectrum_pages[i].index = 0u;
+    }
+    if (model == SPECTRUM_MODEL_48K) {
         spectrum_contention_profile = CONTENTION_PROFILE_48K;
+    } else if (model == SPECTRUM_MODEL_128K) {
+        spectrum_contention_profile = CONTENTION_PROFILE_128K;
+    } else if (model == SPECTRUM_MODEL_PLUS2A) {
+        spectrum_contention_profile = CONTENTION_PROFILE_128K_PLUS2A;
+    } else {
+        spectrum_contention_profile = CONTENTION_PROFILE_128K_PLUS3;
     }
     peripheral_contention_profile = PERIPHERAL_CONTENTION_NONE;
     spectrum_reset_floating_bus();
-    spectrum_update_contention_flags();
+    spectrum_apply_memory_configuration();
 }
 
 static inline void apply_memory_contention(uint16_t addr) {
@@ -676,44 +815,44 @@ static inline void apply_memory_contention(uint16_t addr) {
 }
 
 static inline void spectrum_write_ram_shadow(uint16_t addr, uint8_t val) {
-    if (spectrum_model == SPECTRUM_MODEL_128K) {
-        if (addr < 0x8000u) {
-            ram_pages[5][addr - 0x4000u] = val;
-        } else if (addr < 0xC000u) {
-            ram_pages[2][addr - 0x8000u] = val;
-        } else {
-            ram_pages[current_paged_bank][addr - 0xC000u] = val;
-        }
-    } else {
-        if (addr < 0x8000u) {
-            ram_pages[5][addr - 0x4000u] = val;
-        } else if (addr < 0xC000u) {
-            ram_pages[2][addr - 0x8000u] = val;
-        } else {
-            ram_pages[7][addr - 0xC000u] = val;
-        }
+    uint16_t page = (uint16_t)(addr >> 14);
+    if (page >= 4u) {
+        return;
     }
+    SpectrumMemoryPage *slot = &spectrum_pages[page];
+    if (slot->type != MEMORY_PAGE_RAM || slot->index >= 8u) {
+        return;
+    }
+    uint16_t base = (uint16_t)(page * 0x4000u);
+    ram_pages[slot->index][addr - base] = val;
 }
 
 static void spectrum_map_rom_page(uint8_t page) {
-    if (page >= rom_page_count) {
-        page = 0u;
+    uint8_t rom_limit = rom_page_count > 0u ? rom_page_count : 1u;
+    uint8_t desired = (uint8_t)(page % rom_limit);
+    if (spectrum_model == SPECTRUM_MODEL_PLUS2A || spectrum_model == SPECTRUM_MODEL_PLUS3) {
+        gate_array_7ffd_state = (uint8_t)((gate_array_7ffd_state & (uint8_t)~0x10u) | ((desired & 0x01u) << 4));
+        gate_array_1ffd_state = (uint8_t)((gate_array_1ffd_state & (uint8_t)~0x01u) | ((desired >> 1) & 0x01u));
+    } else {
+        gate_array_7ffd_state = (uint8_t)((gate_array_7ffd_state & (uint8_t)~0x10u) | ((desired & 0x01u) << 4));
     }
-    memcpy(memory, rom_pages[page], 0x4000);
-    current_rom_page = page;
+    current_rom_page = desired;
+    spectrum_pages[0].type = MEMORY_PAGE_NONE;
+    spectrum_pages[0].index = 0u;
+    spectrum_apply_memory_configuration();
 }
 
 static void spectrum_map_upper_bank(uint8_t new_bank) {
-    if (spectrum_model != SPECTRUM_MODEL_128K) {
+    if (spectrum_model == SPECTRUM_MODEL_48K) {
         return;
     }
+    new_bank &= 0x07u;
     if (new_bank == current_paged_bank) {
         return;
     }
-    memcpy(ram_pages[current_paged_bank], memory + 0xC000, 0x4000);
-    memcpy(memory + 0xC000, ram_pages[new_bank], 0x4000);
     current_paged_bank = new_bank;
-    spectrum_update_contention_flags();
+    gate_array_7ffd_state = (uint8_t)((gate_array_7ffd_state & (uint8_t)~0x07u) | current_paged_bank);
+    spectrum_apply_memory_configuration();
 }
 
 uint8_t readByte(uint16_t addr) {
@@ -4457,25 +4596,28 @@ void io_write(uint16_t port, uint8_t value) {
         apply_port_contention(access_t_state);
     }
 
-    if (spectrum_model == SPECTRUM_MODEL_128K && (port & 0x7FFD) == 0x7FFD) {
+    int is_128k_family = (spectrum_model != SPECTRUM_MODEL_48K);
+    if (is_128k_family && (port & 0x7FFD) == 0x7FFD) {
         if (!paging_disabled) {
-            uint8_t new_bank = (uint8_t)(value & 0x07u);
-            spectrum_map_upper_bank(new_bank);
-
-            current_screen_bank = (value & 0x08u) ? 7u : 5u;
-
-            uint8_t new_rom = (uint8_t)((value >> 4) & 0x01u);
-            uint8_t rom_limit = rom_page_count > 0u ? rom_page_count : 1u;
-            uint8_t desired_rom = (uint8_t)(new_rom % rom_limit);
-            if (rom_page_count > 1u && desired_rom != current_rom_page) {
-                spectrum_map_rom_page(desired_rom);
-            } else {
-                current_rom_page = desired_rom;
+            uint8_t masked = (uint8_t)(value & 0x3Fu);
+            gate_array_7ffd_state = (uint8_t)((gate_array_7ffd_state & (uint8_t)~0x3Fu) | masked);
+            uint8_t new_bank = (uint8_t)(masked & 0x07u);
+            if (new_bank != current_paged_bank) {
+                current_paged_bank = new_bank;
             }
-
             if (value & 0x20u) {
                 paging_disabled = 1;
             }
+            spectrum_apply_memory_configuration();
+        }
+        return;
+    }
+
+    if ((spectrum_model == SPECTRUM_MODEL_PLUS2A || spectrum_model == SPECTRUM_MODEL_PLUS3) &&
+        (port & 0x1FFD) == 0x1FFD) {
+        if (!paging_disabled) {
+            gate_array_1ffd_state = (uint8_t)(value & 0x07u);
+            spectrum_apply_memory_configuration();
         }
         return;
     }
@@ -5845,6 +5987,142 @@ static bool test_plus2a_contention_profile(void) {
     return (contended_bank4 == 1u) && (contended_bank2 == 0u) && (screen_flag == 1u);
 }
 
+static bool test_plus3_rom_and_all_ram_paging(void) {
+    SpectrumModel previous_model = spectrum_model;
+    SpectrumContentionProfile previous_profile = spectrum_contention_profile;
+    PeripheralContentionProfile previous_peripheral = peripheral_contention_profile;
+
+    uint8_t previous_rom_count = rom_page_count;
+
+    spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS3);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    rom_page_count = 4u;
+    for (uint8_t i = 0; i < 4u; ++i) {
+        memset(rom_pages[i], (int)(0x30u + i), 0x4000);
+    }
+    spectrum_map_rom_page(0u);
+
+    uint8_t rom0_val = readByte(0x0000);
+    bool rom0_ok = (rom0_val == 0x30u);
+
+    io_write(0x7FFD, 0x10u);
+    io_write(0x1FFD, 0x01u);
+    uint8_t rom3_val = readByte(0x0000);
+    bool rom3_ok = (rom3_val == 0x33u);
+
+    ram_pages[0][0] = 0xAAu;
+    io_write(0x1FFD, 0x02u);
+    uint8_t all_ram_val = readByte(0x0000);
+    bool all_ram_ok = (all_ram_val == 0xAAu);
+
+    io_write(0x1FFD, 0x01u);
+    uint8_t rom_restore_val = readByte(0x0000);
+    bool rom_restore_ok = (rom_restore_val == 0x33u);
+
+    if (!(rom0_ok && rom3_ok && all_ram_ok && rom_restore_ok)) {
+        printf("    plus3 rom debug: rom0=%02X rom3=%02X all_ram=%02X restore=%02X\n",
+               rom0_val,
+               rom3_val,
+               all_ram_val,
+               rom_restore_val);
+    }
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    spectrum_set_contention_profile(previous_profile);
+    spectrum_set_peripheral_contention_profile(previous_peripheral);
+    rom_page_count = previous_rom_count;
+    spectrum_apply_memory_configuration();
+
+    return rom0_ok && rom3_ok && all_ram_ok && rom_restore_ok;
+}
+
+static bool test_plus3_special_paging_modes(void) {
+    SpectrumModel previous_model = spectrum_model;
+    SpectrumContentionProfile previous_profile = spectrum_contention_profile;
+    PeripheralContentionProfile previous_peripheral = peripheral_contention_profile;
+    uint8_t previous_rom_count = rom_page_count;
+
+    spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS3);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    uint8_t markers[8];
+    for (uint8_t bank = 0; bank < 8u; ++bank) {
+        markers[bank] = (uint8_t)(0x40u + bank);
+        memset(ram_pages[bank], 0, 0x4000);
+    }
+
+    writeByte(0x4000, markers[5]);
+    writeByte(0x8000, markers[2]);
+    writeByte(0xC000, markers[0]);
+    for (uint8_t bank = 1; bank < 8u; ++bank) {
+        spectrum_map_upper_bank(bank);
+        writeByte(0xC000, markers[bank]);
+    }
+    spectrum_map_upper_bank(0u);
+
+    static const uint8_t maps[4][4] = {
+        {0u, 1u, 2u, 3u},
+        {4u, 5u, 6u, 7u},
+        {4u, 5u, 6u, 3u},
+        {4u, 7u, 6u, 3u}
+    };
+
+    bool mapping_ok = true;
+    for (uint8_t config = 0; config < 4u; ++config) {
+        io_write(0x1FFD, (uint8_t)(0x04u | config));
+        for (uint8_t page = 0; page < 4u; ++page) {
+            uint16_t addr = (uint16_t)(page * 0x4000u);
+            uint8_t expected = markers[maps[config][page]];
+            uint8_t observed = readByte(addr);
+            if (observed != expected) {
+                mapping_ok = false;
+                printf("    plus3 special debug config=%u page=%u expect=%02X got=%02X\n",
+                       (unsigned)config,
+                       (unsigned)page,
+                       expected,
+                       observed);
+            }
+        }
+        if (current_screen_bank != maps[config][1]) {
+            mapping_ok = false;
+            printf("    plus3 special screen config=%u expect bank %u got %u\n",
+                   (unsigned)config,
+                   (unsigned)maps[config][1],
+                   (unsigned)current_screen_bank);
+        }
+    }
+
+    io_write(0x1FFD, 0x04u);
+    io_write(0x7FFD, 0x20u);
+    io_write(0x1FFD, 0x05u);
+    uint8_t disable_low = readByte(0x0000);
+    uint8_t disable_high = readByte(0x4000);
+    bool disable_ok = (disable_low == markers[maps[0][0]]) &&
+                      (disable_high == markers[maps[0][1]]);
+    if (!disable_ok) {
+        printf("    plus3 special disable expect %02X/%02X got %02X/%02X\n",
+               markers[maps[0][0]],
+               markers[maps[0][1]],
+               disable_low,
+               disable_high);
+    }
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    spectrum_set_contention_profile(previous_profile);
+    spectrum_set_peripheral_contention_profile(previous_peripheral);
+    rom_page_count = previous_rom_count;
+    spectrum_apply_memory_configuration();
+
+    return mapping_ok && disable_ok;
+}
+
 static bool test_peripheral_port_contention(void) {
     SpectrumModel previous_model = spectrum_model;
     SpectrumContentionProfile previous_profile = spectrum_contention_profile;
@@ -5935,12 +6213,24 @@ static bool test_128k_contention_penalty(void) {
     total_t_states = 14336ULL;
     int contended_t = cpu_step(&cpu);
     bool cont_ok = (cpu.reg_A == 0x24);
+    uint8_t observed_mem = memory[0xC000];
+    uint8_t observed_a = cpu.reg_A;
     io_write(0x7FFD, 0x00);
 
     spectrum_configure_model(previous_model);
     memory_clear();
 
-    return base_ok && cont_ok && (contended_t > uncontended_t);
+    bool ok = base_ok && cont_ok && (contended_t > uncontended_t);
+    if (!ok) {
+        printf("    contention debug base=%d cont=%d base_ok=%d cont_ok=%d mem=%02X a=%02X\n",
+               uncontended_t,
+               contended_t,
+               base_ok,
+               cont_ok,
+               observed_mem,
+               observed_a);
+    }
+    return ok;
 }
 
 static bool run_unit_tests(void) {
@@ -5964,6 +6254,8 @@ static bool run_unit_tests(void) {
         {"NMI stack handling", test_nmi_stack_behaviour},
         {"Floating bus samples", test_floating_bus_samples_screen_memory},
         {"+2A contention profile", test_plus2a_contention_profile},
+        {"+3 ROM/all-RAM paging", test_plus3_rom_and_all_ram_paging},
+        {"+3 special paging", test_plus3_special_paging_modes},
         {"Peripheral contention", test_peripheral_port_contention},
         {"128K bank paging", test_128k_bank_switching},
         {"128K contention penalties", test_128k_contention_penalty},
@@ -6149,7 +6441,7 @@ static int run_cpu_tests(const char* rom_dir) {
 static void print_usage(const char* prog) {
     fprintf(stderr,
             "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] "
-            "[--model <48k|128k> | --48k | --128k] "
+            "[--model <48k|128k|plus2a|plus3> | --48k | --128k | --plus2a | --plus3] "
             "[--contention <48k|128k|plus2a|plus3>] "
             "[--peripheral <none|if1>] "
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
@@ -6242,10 +6534,15 @@ void render_screen(void) {
     int flash_phase = (int)((frame_count >> 5) & 1ULL);
     const uint8_t* vram_bank = memory + VRAM_START;
     const uint8_t* attr_bank = memory + ATTR_START;
-    if (spectrum_model == SPECTRUM_MODEL_128K && current_screen_bank == 7u) {
-        const uint8_t* bank = ram_pages[7];
-        vram_bank = bank;
-        attr_bank = bank + (ATTR_START - VRAM_START);
+    if (current_screen_bank < 8u) {
+        if (spectrum_pages[1].type == MEMORY_PAGE_RAM && spectrum_pages[1].index == current_screen_bank) {
+            vram_bank = memory + VRAM_START;
+            attr_bank = memory + ATTR_START;
+        } else {
+            const uint8_t* bank = ram_pages[current_screen_bank];
+            vram_bank = bank;
+            attr_bank = bank + (ATTR_START - VRAM_START);
+        }
     }
     for(int y=0; y<TOTAL_HEIGHT; ++y) { for(int x=0; x<TOTAL_WIDTH; ++x) { if(x<BORDER_SIZE || x>=BORDER_SIZE+SCREEN_WIDTH || y<BORDER_SIZE || y>=BORDER_SIZE+SCREEN_HEIGHT) pixels[y * TOTAL_WIDTH + x] = border_rgba; } }
     for (int y = 0; y < SCREEN_HEIGHT; ++y) {
@@ -6420,6 +6717,12 @@ int main(int argc, char *argv[]) {
                 spectrum_configure_model(SPECTRUM_MODEL_48K);
             } else if (string_equals_case_insensitive(model_value, "128k")) {
                 spectrum_configure_model(SPECTRUM_MODEL_128K);
+            } else if (string_equals_case_insensitive(model_value, "plus2a") ||
+                       string_equals_case_insensitive(model_value, "+2a")) {
+                spectrum_configure_model(SPECTRUM_MODEL_PLUS2A);
+            } else if (string_equals_case_insensitive(model_value, "plus3") ||
+                       string_equals_case_insensitive(model_value, "+3")) {
+                spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
             } else {
                 fprintf(stderr, "Unknown model: %s\n", model_value);
                 return 1;
@@ -6428,6 +6731,10 @@ int main(int argc, char *argv[]) {
             spectrum_configure_model(SPECTRUM_MODEL_48K);
         } else if (strcmp(argv[i], "--128k") == 0) {
             spectrum_configure_model(SPECTRUM_MODEL_128K);
+        } else if (strcmp(argv[i], "--plus2a") == 0) {
+            spectrum_configure_model(SPECTRUM_MODEL_PLUS2A);
+        } else if (strcmp(argv[i], "--plus3") == 0) {
+            spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
         } else if (strcmp(argv[i], "--contention") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -6583,13 +6890,33 @@ int main(int argc, char *argv[]) {
     memset(memory, 0, sizeof(memory));
     memset(ram_pages, 0, sizeof(ram_pages));
 
+    memset(rom_pages, 0, sizeof(rom_pages));
     memcpy(rom_pages[0], rom_buffer, 0x4000);
-    if (spectrum_model == SPECTRUM_MODEL_128K && rom_read >= 0x8000) {
-        memcpy(rom_pages[1], rom_buffer + 0x4000, 0x4000);
-        rom_page_count = 2u;
+    if (spectrum_model == SPECTRUM_MODEL_PLUS2A || spectrum_model == SPECTRUM_MODEL_PLUS3) {
+        size_t available_banks = rom_read / 0x4000u;
+        if (available_banks == 0u) {
+            available_banks = 1u;
+        }
+        if (available_banks > 4u) {
+            available_banks = 4u;
+        }
+        for (size_t i = 0; i < available_banks; ++i) {
+            memcpy(rom_pages[i], rom_buffer + (i * 0x4000u), 0x4000);
+        }
+        for (size_t i = available_banks; i < 4u; ++i) {
+            memcpy(rom_pages[i], rom_pages[i % available_banks], 0x4000);
+        }
+        rom_page_count = 4u;
     } else {
-        memcpy(rom_pages[1], rom_pages[0], 0x4000);
-        rom_page_count = 1u;
+        if (spectrum_model != SPECTRUM_MODEL_48K && rom_read >= 0x8000) {
+            memcpy(rom_pages[1], rom_buffer + 0x4000, 0x4000);
+            rom_page_count = 2u;
+        } else {
+            memcpy(rom_pages[1], rom_pages[0], 0x4000);
+            rom_page_count = 1u;
+        }
+        memcpy(rom_pages[2], rom_pages[0], 0x4000);
+        memcpy(rom_pages[3], rom_pages[1], 0x4000);
     }
 
     spectrum_configure_model(spectrum_model);
