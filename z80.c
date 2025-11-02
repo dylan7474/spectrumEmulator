@@ -37,7 +37,8 @@ typedef enum {
 
 typedef enum {
     PERIPHERAL_CONTENTION_NONE,
-    PERIPHERAL_CONTENTION_IF1
+    PERIPHERAL_CONTENTION_IF1,
+    PERIPHERAL_CONTENTION_PLUS3
 } PeripheralContentionProfile;
 
 static SpectrumModel spectrum_model = SPECTRUM_MODEL_48K;
@@ -551,6 +552,13 @@ static const uint8_t spectrum_contended_bank_masks[] = {
     [CONTENTION_PROFILE_128K_PLUS3] = (uint8_t)((1u << 4) | (1u << 5) | (1u << 6) | (1u << 7))
 };
 
+static const int spectrum_contention_penalties[][8] = {
+    [CONTENTION_PROFILE_48K]         = {6, 5, 4, 3, 2, 1, 0, 0},
+    [CONTENTION_PROFILE_128K]        = {6, 5, 4, 3, 2, 1, 0, 0},
+    [CONTENTION_PROFILE_128K_PLUS2A] = {0, 6, 5, 4, 3, 2, 1, 0},
+    [CONTENTION_PROFILE_128K_PLUS3]  = {0, 6, 5, 4, 3, 2, 1, 0}
+};
+
 static inline void spectrum_reset_floating_bus(void) {
     floating_bus_last_value = 0xFFu;
 }
@@ -623,13 +631,22 @@ static void spectrum_set_peripheral_contention_profile(PeripheralContentionProfi
 }
 
 static inline void apply_port_contention(uint64_t access_t_state) {
-    if (peripheral_contention_profile == PERIPHERAL_CONTENTION_NONE) {
-        return;
-    }
     if (!ula_instruction_progress_ptr) {
         return;
     }
-    int penalty = ula_contention_penalty(access_t_state);
+
+    int penalty = 0;
+    switch (peripheral_contention_profile) {
+        case PERIPHERAL_CONTENTION_NONE:
+            return;
+        case PERIPHERAL_CONTENTION_IF1:
+            penalty = ula_contention_penalty(access_t_state);
+            break;
+        case PERIPHERAL_CONTENTION_PLUS3:
+            penalty = ula_contention_penalty(access_t_state) + 3;
+            break;
+    }
+
     if (penalty > 0) {
         *ula_instruction_progress_ptr += penalty;
     }
@@ -697,7 +714,7 @@ static inline int ula_contention_penalty(uint64_t t_state) {
     if (phase < 14336u || phase >= 57344u) {
         return 0;
     }
-    static const int penalties[8] = {6, 5, 4, 3, 2, 1, 0, 0};
+    const int* penalties = spectrum_contention_penalties[spectrum_contention_profile];
     return penalties[phase & 7u];
 }
 
@@ -791,7 +808,12 @@ static void spectrum_configure_model(SpectrumModel model) {
     } else {
         spectrum_contention_profile = CONTENTION_PROFILE_128K_PLUS3;
     }
-    peripheral_contention_profile = PERIPHERAL_CONTENTION_NONE;
+
+    if (model == SPECTRUM_MODEL_PLUS3) {
+        peripheral_contention_profile = PERIPHERAL_CONTENTION_PLUS3;
+    } else {
+        peripheral_contention_profile = PERIPHERAL_CONTENTION_NONE;
+    }
     spectrum_reset_floating_bus();
     spectrum_apply_memory_configuration();
 }
@@ -6162,6 +6184,140 @@ static bool test_peripheral_port_contention(void) {
     return contention_effective;
 }
 
+static bool test_plus3_contention_penalty_shift(void) {
+    SpectrumModel previous_model = spectrum_model;
+    SpectrumContentionProfile previous_profile = spectrum_contention_profile;
+    PeripheralContentionProfile previous_peripheral = peripheral_contention_profile;
+
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_48K);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0x7E; // LD A,(HL)
+    memory[0x4000] = 0x11;
+
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0x40;
+    cpu.reg_L = 0x00;
+    total_t_states = 0;
+    int base_48k = cpu_step(&cpu);
+
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0x7E;
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0x40;
+    cpu.reg_L = 0x00;
+    total_t_states = 14336ULL;
+    int contended_48k = cpu_step(&cpu);
+
+    spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS3);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0x7E;
+    memory[0x4000] = 0x22;
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0x40;
+    cpu.reg_L = 0x00;
+    total_t_states = 0;
+    int base_plus3 = cpu_step(&cpu);
+
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0x7E;
+    memory[0x4000] = 0x33;
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0x40;
+    cpu.reg_L = 0x00;
+    total_t_states = 14336ULL;
+    int plus3_phase0 = cpu_step(&cpu);
+
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0x7E;
+    memory[0x4000] = 0x44;
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0x40;
+    cpu.reg_L = 0x00;
+    total_t_states = 14337ULL;
+    int plus3_phase1 = cpu_step(&cpu);
+
+    int early_penalty = contended_48k - base_48k;
+    int plus3_penalty0 = plus3_phase0 - base_plus3;
+    int plus3_penalty1 = plus3_phase1 - base_plus3;
+
+    bool base_matches = (base_plus3 == base_48k);
+    bool early_profile_penalises = (early_penalty > 0);
+    bool late_profile_offsets = base_matches &&
+                                (plus3_penalty0 == early_penalty + 1) &&
+                                (plus3_penalty1 == early_penalty) &&
+                                (plus3_phase0 > plus3_phase1);
+
+    if (!early_profile_penalises || !late_profile_offsets) {
+        printf("    late gate-array debug 48k=%d/%d(+%d) plus3=%d/%d/%d(+%d/+%d) base_match=%d\n",
+               contended_48k,
+               base_48k,
+               early_penalty,
+               base_plus3,
+               plus3_phase0,
+               plus3_phase1,
+               plus3_penalty0,
+               plus3_penalty1,
+               base_matches);
+    }
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    spectrum_set_contention_profile(previous_profile);
+    spectrum_set_peripheral_contention_profile(previous_peripheral);
+
+    return early_profile_penalises && late_profile_offsets;
+}
+
+static bool test_plus3_peripheral_wait_states(void) {
+    SpectrumModel previous_model = spectrum_model;
+    SpectrumContentionProfile previous_profile = spectrum_contention_profile;
+    PeripheralContentionProfile previous_peripheral = peripheral_contention_profile;
+
+    spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS3);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0xDB; // IN A,(n)
+    memory[0x0001] = 0xFF;
+    cpu.reg_A = 0x00;
+    cpu.reg_PC = 0x0000;
+    total_t_states = 0;
+    int base_t = cpu_step(&cpu);
+
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0xDB;
+    memory[0x0001] = 0xFF;
+    cpu.reg_A = 0x00;
+    cpu.reg_PC = 0x0000;
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_PLUS3);
+    total_t_states = 0;
+    int plus3_t = cpu_step(&cpu);
+
+    bool wait_states_ok = (plus3_t == base_t + 3);
+    if (!wait_states_ok) {
+        printf("    plus3 peripheral wait debug base=%d wait=%d\n", base_t, plus3_t);
+    }
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    spectrum_set_contention_profile(previous_profile);
+    spectrum_set_peripheral_contention_profile(previous_peripheral);
+
+    return wait_states_ok;
+}
+
 static bool test_128k_bank_switching(void) {
     SpectrumModel previous_model = spectrum_model;
     spectrum_configure_model(SPECTRUM_MODEL_128K);
@@ -6257,6 +6413,8 @@ static bool run_unit_tests(void) {
         {"+3 ROM/all-RAM paging", test_plus3_rom_and_all_ram_paging},
         {"+3 special paging", test_plus3_special_paging_modes},
         {"Peripheral contention", test_peripheral_port_contention},
+        {"Late GA contention timing", test_plus3_contention_penalty_shift},
+        {"+3 peripheral wait-states", test_plus3_peripheral_wait_states},
         {"128K bank paging", test_128k_bank_switching},
         {"128K contention penalties", test_128k_contention_penalty},
     };
@@ -6443,7 +6601,7 @@ static void print_usage(const char* prog) {
             "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] "
             "[--model <48k|128k|plus2a|plus3> | --48k | --128k | --plus2a | --plus3] "
             "[--contention <48k|128k|plus2a|plus3>] "
-            "[--peripheral <none|if1>] "
+            "[--peripheral <none|if1|plus3>] "
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
             "[--test-rom-dir <dir>] [--run-tests] [rom_file]\n",
@@ -6766,6 +6924,9 @@ int main(int argc, char *argv[]) {
             } else if (string_equals_case_insensitive(peripheral_value, "if1") ||
                        string_equals_case_insensitive(peripheral_value, "interface1")) {
                 spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_IF1);
+            } else if (string_equals_case_insensitive(peripheral_value, "plus3") ||
+                       string_equals_case_insensitive(peripheral_value, "+3")) {
+                spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_PLUS3);
             } else {
                 fprintf(stderr, "Unknown peripheral contention profile: %s\n", peripheral_value);
                 return 1;
