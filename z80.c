@@ -4241,6 +4241,24 @@ static inline void set_xy_flags(Z80* cpu, uint8_t value) {
     cpu->reg_F = (uint8_t)((cpu->reg_F & (uint8_t)~0x28u) | (value & 0x28u));
 }
 
+static inline int parity_even(uint8_t value) {
+    value ^= (uint8_t)(value >> 4);
+    value ^= (uint8_t)(value >> 2);
+    value ^= (uint8_t)(value >> 1);
+    return (value & 1u) == 0u;
+}
+
+static inline void set_block_io_flags(Z80* cpu, uint8_t value, uint8_t offset, uint8_t new_b) {
+    uint8_t sum8 = (uint8_t)(value + offset);
+    uint16_t half = (uint16_t)(value & 0x0Fu) + (uint16_t)(offset & 0x0Fu);
+    set_flag(cpu, FLAG_S, new_b & 0x80u);
+    set_flag(cpu, FLAG_Z, new_b == 0u);
+    set_flag(cpu, FLAG_H, half > 0x0Fu);
+    set_flag(cpu, FLAG_N, value & 0x80u);
+    set_flag(cpu, FLAG_PV, parity_even((uint8_t)(((sum8 & 0x07u) ^ new_b))));
+    set_xy_flags(cpu, sum8);
+}
+
 static inline void set_flags_szp(Z80* cpu,uint8_t r){set_flag(cpu,FLAG_S,r&0x80);set_flag(cpu,FLAG_Z,r==0);uint8_t p=0;uint8_t t=r;for(int i=0;i<8;i++){if(t&1)p=!p;t>>=1;}set_flag(cpu,FLAG_PV,!p);set_xy_flags(cpu,r);}
 
 // --- 8-Bit Arithmetic/Logic Helper Functions ---
@@ -4631,14 +4649,122 @@ int cpu_ed_step(Z80* cpu) {
         case 0x69: io_write(get_BC(cpu), cpu->reg_L); return 8;
         case 0x71: io_write(get_BC(cpu), 0); return 8;
         case 0x79: io_write(get_BC(cpu), cpu->reg_A); return 8;
-        case 0xA2: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); return 8;
-        case 0xB2: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
-        case 0xAA: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); return 8;
-        case 0xBA: writeByte(get_HL(cpu), io_read(get_BC(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
-        case 0xA3: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); return 8;
-        case 0xB3: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) + 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
-        case 0xAB: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); return 8;
-        case 0xBB: io_write(get_BC(cpu), readByte(get_HL(cpu))); cpu->reg_B--; set_HL(cpu, get_HL(cpu) - 1); if (cpu->reg_B != 0) { cpu->reg_PC -= 2; return 13; } return 8;
+        case 0xA2: {
+            uint16_t bc = get_BC(cpu);
+            uint8_t value = io_read(bc);
+            uint16_t hl = get_HL(cpu);
+            writeByte(hl, value);
+            uint16_t new_hl = (uint16_t)(hl + 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = (uint8_t)(cpu->reg_C + 1u);
+            set_block_io_flags(cpu, value, offset, new_b);
+            return 8;
+        }
+        case 0xB2: {
+            uint16_t bc = get_BC(cpu);
+            uint8_t value = io_read(bc);
+            uint16_t hl = get_HL(cpu);
+            writeByte(hl, value);
+            uint16_t new_hl = (uint16_t)(hl + 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = (uint8_t)(cpu->reg_C + 1u);
+            set_block_io_flags(cpu, value, offset, new_b);
+            if (new_b != 0u) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
+        case 0xAA: {
+            uint16_t bc = get_BC(cpu);
+            uint8_t value = io_read(bc);
+            uint16_t hl = get_HL(cpu);
+            writeByte(hl, value);
+            uint16_t new_hl = (uint16_t)(hl - 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = (uint8_t)(cpu->reg_C - 1u);
+            set_block_io_flags(cpu, value, offset, new_b);
+            return 8;
+        }
+        case 0xBA: {
+            uint16_t bc = get_BC(cpu);
+            uint8_t value = io_read(bc);
+            uint16_t hl = get_HL(cpu);
+            writeByte(hl, value);
+            uint16_t new_hl = (uint16_t)(hl - 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = (uint8_t)(cpu->reg_C - 1u);
+            set_block_io_flags(cpu, value, offset, new_b);
+            if (new_b != 0u) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
+        case 0xA3: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            io_write(get_BC(cpu), value);
+            uint16_t new_hl = (uint16_t)(hl + 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = cpu->reg_L;
+            set_block_io_flags(cpu, value, offset, new_b);
+            return 8;
+        }
+        case 0xB3: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            io_write(get_BC(cpu), value);
+            uint16_t new_hl = (uint16_t)(hl + 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = cpu->reg_L;
+            set_block_io_flags(cpu, value, offset, new_b);
+            if (new_b != 0u) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
+        case 0xAB: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            io_write(get_BC(cpu), value);
+            uint16_t new_hl = (uint16_t)(hl - 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = cpu->reg_L;
+            set_block_io_flags(cpu, value, offset, new_b);
+            return 8;
+        }
+        case 0xBB: {
+            uint16_t hl = get_HL(cpu);
+            uint8_t value = readByte(hl);
+            io_write(get_BC(cpu), value);
+            uint16_t new_hl = (uint16_t)(hl - 1u);
+            set_HL(cpu, new_hl);
+            uint8_t new_b = (uint8_t)(cpu->reg_B - 1u);
+            cpu->reg_B = new_b;
+            uint8_t offset = cpu->reg_L;
+            set_block_io_flags(cpu, value, offset, new_b);
+            if (new_b != 0u) {
+                cpu->reg_PC -= 2;
+                return 17;
+            }
+            return 12;
+        }
         default:
             return 4;
     }
@@ -5041,6 +5167,143 @@ static bool test_in_flags(void) {
     return cpu.reg_B == 0xFF && get_flag(&cpu, FLAG_H) && get_flag(&cpu, FLAG_N);
 }
 
+static bool test_ini_flags(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    for (int i = 0; i < 8; ++i) {
+        keyboard_matrix[i] = 0xFF;
+    }
+    keyboard_matrix[0] = 0x12;
+
+    cpu.reg_PC = 0x0000;
+    cpu.reg_B = 0x02;
+    cpu.reg_C = 0x34;
+    cpu.reg_H = 0x40;
+    cpu.reg_L = 0x00;
+    cpu.reg_F = FLAG_C;
+    memory[0x0000] = 0xED;
+    memory[0x0001] = 0xA2; // INI
+
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+
+    uint8_t stored = memory[0x4000];
+    bool ok = (t_states == 12) &&
+              (cpu.reg_B == 0x01) &&
+              (get_HL(&cpu) == 0x4001) &&
+              (stored == 0xF2) &&
+              !get_flag(&cpu, FLAG_S) &&
+              !get_flag(&cpu, FLAG_Z) &&
+              !get_flag(&cpu, FLAG_H) &&
+              get_flag(&cpu, FLAG_N) &&
+              get_flag(&cpu, FLAG_PV) &&
+              (cpu.reg_F & FLAG_C) &&
+              ((cpu.reg_F & 0x28u) == 0x20u);
+    keyboard_matrix[0] = 0xFF;
+    if (!ok) {
+        printf("    INI t=%d B=%02X HL=%04X stored=%02X F=%02X\n",
+               t_states, cpu.reg_B, get_HL(&cpu), stored, cpu.reg_F);
+    }
+    return ok;
+}
+
+static bool test_outd_flags(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    for (int i = 0; i < 8; ++i) {
+        keyboard_matrix[i] = 0xFF;
+    }
+
+    cpu.reg_PC = 0x0000;
+    cpu.reg_B = 0x02;
+    cpu.reg_C = 0x01;
+    cpu.reg_H = 0x20;
+    cpu.reg_L = 0x01;
+    cpu.reg_F = FLAG_C;
+    memory[0x0000] = 0xED;
+    memory[0x0001] = 0xAB; // OUTD
+    memory[0x2001] = 0x40;
+
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+
+    bool ok = (t_states == 12) &&
+              (cpu.reg_B == 0x01) &&
+              (get_HL(&cpu) == 0x2000) &&
+              !get_flag(&cpu, FLAG_S) &&
+              !get_flag(&cpu, FLAG_Z) &&
+              !get_flag(&cpu, FLAG_H) &&
+              !get_flag(&cpu, FLAG_N) &&
+              !get_flag(&cpu, FLAG_PV) &&
+              (cpu.reg_F & FLAG_C) &&
+              ((cpu.reg_F & 0x28u) == 0x00u);
+    if (!ok) {
+        printf("    OUTD t=%d B=%02X HL=%04X F=%02X\n",
+               t_states, cpu.reg_B, get_HL(&cpu), cpu.reg_F);
+    }
+    return ok;
+}
+
+static bool test_inir_repeat(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+    for (int i = 0; i < 8; ++i) {
+        keyboard_matrix[i] = 0xFF;
+    }
+
+    cpu.reg_PC = 0x0000;
+    cpu.reg_B = 0x02;
+    cpu.reg_C = 0x00;
+    cpu.reg_H = 0x40;
+    cpu.reg_L = 0x00;
+    memory[0x0000] = 0xED;
+    memory[0x0001] = 0xB2; // INIR
+
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+
+    bool ok = (t_states == 21) &&
+              (cpu.reg_B == 0x01) &&
+              (get_HL(&cpu) == 0x4001) &&
+              (cpu.reg_PC == 0x0000);
+    if (!ok) {
+        printf("    INIR t=%d B=%02X HL=%04X PC=%04X\n",
+               t_states, cpu.reg_B, get_HL(&cpu), cpu.reg_PC);
+    }
+    return ok;
+}
+
+static bool test_otdr_repeat(void) {
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory_clear();
+
+    cpu.reg_PC = 0x0000;
+    cpu.reg_B = 0x02;
+    cpu.reg_C = 0x01;
+    cpu.reg_H = 0x20;
+    cpu.reg_L = 0x01;
+    memory[0x0000] = 0xED;
+    memory[0x0001] = 0xBB; // OTDR
+    memory[0x2001] = 0x7F;
+
+    total_t_states = 0;
+    int t_states = cpu_step(&cpu);
+
+    bool ok = (t_states == 21) &&
+              (cpu.reg_B == 0x01) &&
+              (get_HL(&cpu) == 0x2000) &&
+              (cpu.reg_PC == 0x0000);
+    if (!ok) {
+        printf("    OTDR t=%d B=%02X HL=%04X PC=%04X\n",
+               t_states, cpu.reg_B, get_HL(&cpu), cpu.reg_PC);
+    }
+    return ok;
+}
+
 static bool test_interrupt_im2(void) {
     Z80 cpu;
     cpu_reset_state(&cpu);
@@ -5084,6 +5347,10 @@ static bool run_unit_tests(void) {
         {"NEG duplicates", test_neg_duplicates},
         {"IM mode transitions", test_im_modes},
         {"IN flag behaviour", test_in_flags},
+        {"INI flag behaviour", test_ini_flags},
+        {"OUTD flag behaviour", test_outd_flags},
+        {"INIR repeat timing", test_inir_repeat},
+        {"OTDR repeat timing", test_otdr_repeat},
         {"IM 2 interrupt vector", test_interrupt_im2},
         {"IM 1 interrupt vector", test_interrupt_im1},
     };
