@@ -26,7 +26,21 @@ typedef enum {
     SPECTRUM_MODEL_128K
 } SpectrumModel;
 
+typedef enum {
+    CONTENTION_PROFILE_48K,
+    CONTENTION_PROFILE_128K,
+    CONTENTION_PROFILE_128K_PLUS2A,
+    CONTENTION_PROFILE_128K_PLUS3
+} SpectrumContentionProfile;
+
+typedef enum {
+    PERIPHERAL_CONTENTION_NONE,
+    PERIPHERAL_CONTENTION_IF1
+} PeripheralContentionProfile;
+
 static SpectrumModel spectrum_model = SPECTRUM_MODEL_48K;
+static SpectrumContentionProfile spectrum_contention_profile = CONTENTION_PROFILE_48K;
+static PeripheralContentionProfile peripheral_contention_profile = PERIPHERAL_CONTENTION_NONE;
 static uint8_t rom_pages[2][0x4000];
 static uint8_t ram_pages[8][0x4000];
 static uint8_t current_rom_page = 0;
@@ -35,6 +49,7 @@ static uint8_t current_paged_bank = 7;
 static int paging_disabled = 0;
 static uint8_t rom_page_count = 1;
 static uint8_t page_contended[4] = {0u, 1u, 0u, 0u};
+static uint8_t floating_bus_last_value = 0xFFu;
 
 // --- ZX Spectrum Constants ---
 #define SCREEN_WIDTH 256
@@ -460,6 +475,8 @@ int cpu_interrupt(Z80* cpu, uint8_t data_bus);
 int cpu_nmi(Z80* cpu);
 int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
 void audio_callback(void* userdata, Uint8* stream, int len);
+static void spectrum_update_contention_flags(void);
+static inline int ula_contention_penalty(uint64_t t_state);
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
 static void beeper_set_latency_limit(double sample_limit);
 static void beeper_push_event(uint64_t t_state, int level);
@@ -503,6 +520,104 @@ static char *build_executable_relative_path(const char *executable_path, const c
 
 
 // --- Memory Access Helpers ---
+static const uint8_t spectrum_contended_bank_masks[] = {
+    [CONTENTION_PROFILE_48K] = (uint8_t)(1u << 5),
+    [CONTENTION_PROFILE_128K] = (uint8_t)((1u << 1) | (1u << 3) | (1u << 5) | (1u << 7)),
+    [CONTENTION_PROFILE_128K_PLUS2A] = (uint8_t)((1u << 4) | (1u << 5) | (1u << 6) | (1u << 7)),
+    [CONTENTION_PROFILE_128K_PLUS3] = (uint8_t)((1u << 4) | (1u << 5) | (1u << 6) | (1u << 7))
+};
+
+static inline void spectrum_reset_floating_bus(void) {
+    floating_bus_last_value = 0xFFu;
+}
+
+static inline uint64_t spectrum_current_access_tstate(void) {
+    if (ula_instruction_progress_ptr) {
+        return ula_instruction_base_tstate + (uint64_t)(*ula_instruction_progress_ptr);
+    }
+    return total_t_states;
+}
+
+static inline int spectrum_is_ram_bank_contended(uint8_t bank) {
+    if (bank >= 8u) {
+        return 0;
+    }
+    uint8_t mask = spectrum_contended_bank_masks[spectrum_contention_profile];
+    return (mask & (uint8_t)(1u << bank)) != 0u;
+}
+
+static void spectrum_set_contention_profile(SpectrumContentionProfile profile) {
+    spectrum_contention_profile = profile;
+    spectrum_update_contention_flags();
+}
+
+static void spectrum_set_peripheral_contention_profile(PeripheralContentionProfile profile) {
+    peripheral_contention_profile = profile;
+}
+
+static inline void apply_port_contention(uint64_t access_t_state) {
+    if (peripheral_contention_profile == PERIPHERAL_CONTENTION_NONE) {
+        return;
+    }
+    if (!ula_instruction_progress_ptr) {
+        return;
+    }
+    int penalty = ula_contention_penalty(access_t_state);
+    if (penalty > 0) {
+        *ula_instruction_progress_ptr += penalty;
+    }
+}
+
+static inline uint16_t spectrum_screen_pixel_offset(uint32_t y, uint32_t x_char) {
+    return (uint16_t)(((y & 0xC0u) << 5) | ((y & 0x07u) << 8) | ((y & 0x38u) << 2) | x_char);
+}
+
+static inline uint16_t spectrum_screen_attr_offset(uint32_t y, uint32_t x_char) {
+    return (uint16_t)(((y >> 3) * 32u) + x_char);
+}
+
+static uint8_t spectrum_sample_floating_bus(uint64_t access_t_state) {
+    uint32_t phase = (uint32_t)(access_t_state % T_STATES_PER_FRAME);
+    if (phase < 14336u || phase >= 57344u) {
+        return floating_bus_last_value;
+    }
+
+    uint32_t display_phase = phase - 14336u;
+    uint32_t line = display_phase / 224u;
+    uint32_t line_phase = display_phase % 224u;
+
+    if (line_phase < 48u || line_phase >= 176u) {
+        return floating_bus_last_value;
+    }
+
+    uint32_t column_phase = line_phase - 48u;
+    uint32_t sub_phase = column_phase & 3u;
+    uint32_t x_char = column_phase >> 2;
+    if (x_char >= 32u) {
+        return floating_bus_last_value;
+    }
+
+    const uint8_t* vram_bank = memory + VRAM_START;
+    const uint8_t* attr_bank = memory + ATTR_START;
+    if (spectrum_model == SPECTRUM_MODEL_128K && current_screen_bank == 7u) {
+        const uint8_t* bank = ram_pages[7];
+        vram_bank = bank;
+        attr_bank = bank + (ATTR_START - VRAM_START);
+    }
+
+    uint8_t value;
+    if ((sub_phase & 2u) == 0u) {
+        uint16_t offset = spectrum_screen_pixel_offset(line, x_char);
+        value = vram_bank[offset];
+    } else {
+        uint16_t offset = spectrum_screen_attr_offset(line, x_char);
+        value = attr_bank[offset];
+    }
+
+    floating_bus_last_value = value;
+    return value;
+}
+
 static inline int ula_contention_penalty(uint64_t t_state) {
     uint32_t phase = (uint32_t)(t_state % T_STATES_PER_FRAME);
     if (phase < 14336u || phase >= 57344u) {
@@ -512,18 +627,15 @@ static inline int ula_contention_penalty(uint64_t t_state) {
     return penalties[phase & 7u];
 }
 
-static inline int is_ram_bank_contended(uint8_t bank) {
-    return (bank & 1u) != 0u;
-}
-
 static void spectrum_update_contention_flags(void) {
     page_contended[0] = 0u;
     if (spectrum_model == SPECTRUM_MODEL_128K) {
-        page_contended[1] = (uint8_t)is_ram_bank_contended(5u);
-        page_contended[2] = (uint8_t)is_ram_bank_contended(2u);
-        page_contended[3] = (uint8_t)is_ram_bank_contended(current_paged_bank);
+        uint8_t screen_bank = current_screen_bank;
+        page_contended[1] = (uint8_t)spectrum_is_ram_bank_contended(screen_bank);
+        page_contended[2] = (uint8_t)spectrum_is_ram_bank_contended(2u);
+        page_contended[3] = (uint8_t)spectrum_is_ram_bank_contended(current_paged_bank);
     } else {
-        page_contended[1] = 1u;
+        page_contended[1] = (uint8_t)spectrum_is_ram_bank_contended(5u);
         page_contended[2] = 0u;
         page_contended[3] = 0u;
     }
@@ -535,6 +647,13 @@ static void spectrum_configure_model(SpectrumModel model) {
     current_screen_bank = 5;
     current_rom_page = 0;
     current_paged_bank = (model == SPECTRUM_MODEL_128K) ? 0u : 7u;
+    if (model == SPECTRUM_MODEL_128K) {
+        spectrum_contention_profile = CONTENTION_PROFILE_128K;
+    } else {
+        spectrum_contention_profile = CONTENTION_PROFILE_48K;
+    }
+    peripheral_contention_profile = PERIPHERAL_CONTENTION_NONE;
+    spectrum_reset_floating_bus();
     spectrum_update_contention_flags();
 }
 
@@ -549,7 +668,7 @@ static inline void apply_memory_contention(uint16_t addr) {
     if (!page_contended[page]) {
         return;
     }
-    uint64_t access_t_state = ula_instruction_base_tstate + (uint64_t)(*ula_instruction_progress_ptr);
+    uint64_t access_t_state = spectrum_current_access_tstate();
     int penalty = ula_contention_penalty(access_t_state);
     if (penalty > 0) {
         *ula_instruction_progress_ptr += penalty;
@@ -4333,6 +4452,11 @@ void io_write(uint16_t port, uint8_t value) {
         ula_queue_port_value(value);
     }
 
+    if ((port & 1) != 0) {
+        uint64_t access_t_state = spectrum_current_access_tstate();
+        apply_port_contention(access_t_state);
+    }
+
     if (spectrum_model == SPECTRUM_MODEL_128K && (port & 0x7FFD) == 0x7FFD) {
         if (!paging_disabled) {
             uint8_t new_bank = (uint8_t)(value & 0x07u);
@@ -4376,7 +4500,9 @@ uint8_t io_read(uint16_t port) {
         // printf("IO Read Port 0x%04X (ULA/Keyboard): AddrHi=0x%02X -> Result=0x%02X\n", port, high_byte, result); // DEBUG
         return result;
     }
-    return 0xFF;
+    uint64_t access_t_state = spectrum_current_access_tstate();
+    apply_port_contention(access_t_state);
+    return spectrum_sample_floating_bus(access_t_state);
 }
 
 // --- 16-bit Register Pair Helpers ---
@@ -5284,6 +5410,20 @@ static int contains_case_insensitive(const char* haystack, const char* needle) {
     return 0;
 }
 
+static int string_equals_case_insensitive(const char* a, const char* b) {
+    if (!a || !b) {
+        return 0;
+    }
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return 0;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 static bool test_cb_sll_register(void) {
     Z80 cpu;
     cpu_reset_state(&cpu);
@@ -5623,6 +5763,127 @@ static bool test_nmi_stack_behaviour(void) {
     return ok;
 }
 
+static bool test_floating_bus_samples_screen_memory(void) {
+    SpectrumModel previous_model = spectrum_model;
+    SpectrumContentionProfile previous_profile = spectrum_contention_profile;
+    PeripheralContentionProfile previous_peripheral = peripheral_contention_profile;
+
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_48K);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    memory[VRAM_START] = 0x3Cu;
+    memory[ATTR_START] = 0x5Au;
+    spectrum_reset_floating_bus();
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0xDB; // IN A,(n)
+    memory[0x0001] = 0xFF; // Port 0xFF (floating bus)
+
+    const uint64_t pixel_target = 14336u + 48u;
+    total_t_states = pixel_target - 4u;
+    cpu.reg_PC = 0x0000;
+    int pixel_t = cpu_step(&cpu);
+    uint8_t pixel_sample = cpu.reg_A;
+
+    cpu_reset_state(&cpu);
+    spectrum_reset_floating_bus();
+    memory[0x0000] = 0xDB;
+    memory[0x0001] = 0xFF;
+    const uint64_t attr_target = 14336u + 50u;
+    total_t_states = attr_target - 4u;
+    cpu.reg_PC = 0x0000;
+    int attr_t = cpu_step(&cpu);
+    uint8_t attr_sample = cpu.reg_A;
+
+    bool timings_ok = (pixel_t >= 11) && (attr_t >= 11);
+    bool samples_ok = (pixel_sample == 0x3Cu) && (attr_sample == 0x5Au);
+
+    if (!(timings_ok && samples_ok)) {
+        printf("    floating bus debug pixel=%02X attr=%02X t_pix=%d t_attr=%d\n",
+               pixel_sample,
+               attr_sample,
+               pixel_t,
+               attr_t);
+    }
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    spectrum_set_contention_profile(previous_profile);
+    spectrum_set_peripheral_contention_profile(previous_peripheral);
+
+    return timings_ok && samples_ok;
+}
+
+static bool test_plus2a_contention_profile(void) {
+    SpectrumModel previous_model = spectrum_model;
+    SpectrumContentionProfile previous_profile = spectrum_contention_profile;
+    PeripheralContentionProfile previous_peripheral = peripheral_contention_profile;
+
+    spectrum_configure_model(SPECTRUM_MODEL_128K);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS2A);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    spectrum_map_upper_bank(4u);
+    spectrum_update_contention_flags();
+    uint8_t contended_bank4 = page_contended[3];
+
+    spectrum_map_upper_bank(2u);
+    spectrum_update_contention_flags();
+    uint8_t contended_bank2 = page_contended[3];
+
+    uint8_t screen_flag = page_contended[1];
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    spectrum_set_contention_profile(previous_profile);
+    spectrum_set_peripheral_contention_profile(previous_peripheral);
+
+    return (contended_bank4 == 1u) && (contended_bank2 == 0u) && (screen_flag == 1u);
+}
+
+static bool test_peripheral_port_contention(void) {
+    SpectrumModel previous_model = spectrum_model;
+    SpectrumContentionProfile previous_profile = spectrum_contention_profile;
+    PeripheralContentionProfile previous_peripheral = peripheral_contention_profile;
+
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    spectrum_set_contention_profile(CONTENTION_PROFILE_48K);
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+
+    memory[VRAM_START] = 0x66u;
+    memory[0x0000] = 0xDB;
+    memory[0x0001] = 0xFF;
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    total_t_states = (14336u + 48u) - 4u;
+    cpu.reg_PC = 0x0000;
+    int base_t = cpu_step(&cpu);
+
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0xDB;
+    memory[0x0001] = 0xFF;
+    spectrum_reset_floating_bus();
+    spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_IF1);
+    total_t_states = (14336u + 48u) - 4u;
+    cpu.reg_PC = 0x0000;
+    int contended_t = cpu_step(&cpu);
+
+    bool contention_effective = contended_t > base_t;
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    spectrum_set_contention_profile(previous_profile);
+    spectrum_set_peripheral_contention_profile(previous_peripheral);
+
+    return contention_effective;
+}
+
 static bool test_128k_bank_switching(void) {
     SpectrumModel previous_model = spectrum_model;
     spectrum_configure_model(SPECTRUM_MODEL_128K);
@@ -5701,6 +5962,9 @@ static bool run_unit_tests(void) {
         {"IM 2 interrupt vector", test_interrupt_im2},
         {"IM 1 interrupt vector", test_interrupt_im1},
         {"NMI stack handling", test_nmi_stack_behaviour},
+        {"Floating bus samples", test_floating_bus_samples_screen_memory},
+        {"+2A contention profile", test_plus2a_contention_profile},
+        {"Peripheral contention", test_peripheral_port_contention},
         {"128K bank paging", test_128k_bank_switching},
         {"128K contention penalties", test_128k_contention_penalty},
     };
@@ -5886,6 +6150,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr,
             "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] "
             "[--model <48k|128k> | --48k | --128k] "
+            "[--contention <48k|128k|plus2a|plus3>] "
+            "[--peripheral <none|if1>] "
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
             "[--test-rom-dir <dir>] [--run-tests] [rom_file]\n",
@@ -6150,9 +6416,9 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             const char* model_value = argv[++i];
-            if (strcmp(model_value, "48k") == 0 || strcmp(model_value, "48K") == 0) {
+            if (string_equals_case_insensitive(model_value, "48k")) {
                 spectrum_configure_model(SPECTRUM_MODEL_48K);
-            } else if (strcmp(model_value, "128k") == 0 || strcmp(model_value, "128K") == 0) {
+            } else if (string_equals_case_insensitive(model_value, "128k")) {
                 spectrum_configure_model(SPECTRUM_MODEL_128K);
             } else {
                 fprintf(stderr, "Unknown model: %s\n", model_value);
@@ -6162,6 +6428,41 @@ int main(int argc, char *argv[]) {
             spectrum_configure_model(SPECTRUM_MODEL_48K);
         } else if (strcmp(argv[i], "--128k") == 0) {
             spectrum_configure_model(SPECTRUM_MODEL_128K);
+        } else if (strcmp(argv[i], "--contention") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            const char* profile_value = argv[++i];
+            if (string_equals_case_insensitive(profile_value, "48k")) {
+                spectrum_set_contention_profile(CONTENTION_PROFILE_48K);
+            } else if (string_equals_case_insensitive(profile_value, "128k")) {
+                spectrum_set_contention_profile(CONTENTION_PROFILE_128K);
+            } else if (string_equals_case_insensitive(profile_value, "plus2a") ||
+                       string_equals_case_insensitive(profile_value, "+2a")) {
+                spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS2A);
+            } else if (string_equals_case_insensitive(profile_value, "plus3") ||
+                       string_equals_case_insensitive(profile_value, "+3")) {
+                spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS3);
+            } else {
+                fprintf(stderr, "Unknown contention profile: %s\n", profile_value);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--peripheral") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            const char* peripheral_value = argv[++i];
+            if (string_equals_case_insensitive(peripheral_value, "none")) {
+                spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
+            } else if (string_equals_case_insensitive(peripheral_value, "if1") ||
+                       string_equals_case_insensitive(peripheral_value, "interface1")) {
+                spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_IF1);
+            } else {
+                fprintf(stderr, "Unknown peripheral contention profile: %s\n", peripheral_value);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--beeper-log") == 0) {
             beeper_logging_enabled = 1;
         } else if (strcmp(argv[i], "--tape-debug") == 0) {
