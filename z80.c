@@ -487,11 +487,36 @@ static char *build_executable_relative_path(const char *executable_path, const c
 
 
 // --- Memory Access Helpers ---
+static inline int ula_contention_penalty(uint64_t t_state) {
+    uint32_t phase = (uint32_t)(t_state % T_STATES_PER_FRAME);
+    if (phase < 14336u || phase >= 57344u) {
+        return 0;
+    }
+    static const int penalties[8] = {6, 5, 4, 3, 2, 1, 0, 0};
+    return penalties[phase & 7u];
+}
+
+static inline void apply_memory_contention(uint16_t addr) {
+    if (addr < 0x4000u || addr >= 0x8000u) {
+        return;
+    }
+    if (!ula_instruction_progress_ptr) {
+        return;
+    }
+    uint64_t access_t_state = ula_instruction_base_tstate + (uint64_t)(*ula_instruction_progress_ptr);
+    int penalty = ula_contention_penalty(access_t_state);
+    if (penalty > 0) {
+        *ula_instruction_progress_ptr += penalty;
+    }
+}
+
 uint8_t readByte(uint16_t addr) {
+    apply_memory_contention(addr);
     if (addr < 0x4000) { return memory[addr]; } // ROM Read
     return memory[addr];                        // RAM Read
 }
 void writeByte(uint16_t addr, uint8_t val) {
+    apply_memory_contention(addr);
     if (addr < 0x4000) { return; } // No Write to ROM
     memory[addr] = val;            // RAM Write
 }
@@ -4583,7 +4608,7 @@ int cpu_ed_step(Z80* cpu) {
             cpu->reg_B = value;
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x48: {
@@ -4591,7 +4616,7 @@ int cpu_ed_step(Z80* cpu) {
             cpu->reg_C = value;
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x50: {
@@ -4599,7 +4624,7 @@ int cpu_ed_step(Z80* cpu) {
             cpu->reg_D = value;
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x58: {
@@ -4607,7 +4632,7 @@ int cpu_ed_step(Z80* cpu) {
             cpu->reg_E = value;
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x60: {
@@ -4615,7 +4640,7 @@ int cpu_ed_step(Z80* cpu) {
             cpu->reg_H = value;
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x68: {
@@ -4623,14 +4648,14 @@ int cpu_ed_step(Z80* cpu) {
             cpu->reg_L = value;
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x70: {
             uint8_t value = io_read(get_BC(cpu));
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x78: {
@@ -4638,7 +4663,7 @@ int cpu_ed_step(Z80* cpu) {
             cpu->reg_A = value;
             set_flags_szp(cpu, value);
             set_flag(cpu, FLAG_H, 1);
-            set_flag(cpu, FLAG_N, 1);
+            set_flag(cpu, FLAG_N, 0);
             return 8;
         }
         case 0x41: io_write(get_BC(cpu), cpu->reg_B); return 8;
@@ -4796,33 +4821,57 @@ int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix) {
 
 // --- Handle Maskable Interrupt ---
 int cpu_interrupt(Z80* cpu, uint8_t data_bus) {
+    int* previous_progress_ptr = ula_instruction_progress_ptr;
+    uint64_t previous_base_tstate = ula_instruction_base_tstate;
+    int t_states = 0;
+
+    ula_instruction_base_tstate = total_t_states;
+    ula_instruction_progress_ptr = &t_states;
+
     if (cpu->halted) {
-        cpu->reg_PC++; // Leave HALT state
+        cpu->reg_PC++;
         cpu->halted = 0;
+        t_states += 4;
     }
-    cpu->iff1 = cpu->iff2 = 0; // Disable interrupts
+
+    cpu->iff1 = cpu->iff2 = 0;
     cpu->reg_R = (cpu->reg_R + 1) | (cpu->reg_R & 0x80);
 
-    uint16_t vector;
-    int t_states = 13;
+    t_states += 7;
+
+    uint16_t vector = 0x0038;
     switch (cpu->interruptMode) {
-        case 0: // Treat IM 0 like IM 1 for Spectrum ULA
+        case 0:
         case 1:
-            vector = 0x0038;
             break;
         case 2: {
             uint16_t table_addr = (uint16_t)(((uint16_t)cpu->reg_I << 8) | data_bus);
-            vector = readWord(table_addr);
-            t_states = 19;
+            uint8_t low = readByte(table_addr);
+            t_states += 3;
+            uint8_t high = readByte((uint16_t)(table_addr + 1));
+            t_states += 3;
+            vector = (uint16_t)(((uint16_t)high << 8) | low);
             break;
         }
         default:
-            vector = 0x0038;
             break;
     }
 
-    cpu_push(cpu, cpu->reg_PC); // Push current PC
-    cpu->reg_PC = vector;       // Jump to handler
+    uint8_t pc_high = (uint8_t)(cpu->reg_PC >> 8);
+    uint8_t pc_low = (uint8_t)(cpu->reg_PC & 0xFF);
+
+    cpu->reg_SP = (uint16_t)(cpu->reg_SP - 1);
+    writeByte(cpu->reg_SP, pc_high);
+    t_states += 3;
+    cpu->reg_SP = (uint16_t)(cpu->reg_SP - 1);
+    writeByte(cpu->reg_SP, pc_low);
+    t_states += 3;
+
+    cpu->reg_PC = vector;
+
+    ula_instruction_progress_ptr = previous_progress_ptr;
+    ula_instruction_base_tstate = previous_base_tstate;
+
     return t_states;
 }
 
@@ -5049,6 +5098,24 @@ static bool append_output_char(char* output, size_t* length, size_t capacity, ch
     return true;
 }
 
+static int contains_case_insensitive(const char* haystack, const char* needle) {
+    if (!haystack || !needle || needle[0] == '\0') {
+        return 0;
+    }
+    size_t needle_len = strlen(needle);
+    for (const char* h = haystack; *h; ++h) {
+        size_t matched = 0;
+        while (matched < needle_len && h[matched] &&
+               tolower((unsigned char)h[matched]) == tolower((unsigned char)needle[matched])) {
+            matched++;
+        }
+        if (matched == needle_len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static bool test_cb_sll_register(void) {
     Z80 cpu;
     cpu_reset_state(&cpu);
@@ -5163,8 +5230,9 @@ static bool test_in_flags(void) {
     memory[0x0000] = 0xED;
     memory[0x0001] = 0x40; // IN B,(C)
     total_t_states = 0;
-    (void)cpu_step(&cpu);
-    return cpu.reg_B == 0xFF && get_flag(&cpu, FLAG_H) && get_flag(&cpu, FLAG_N);
+    int t_states = cpu_step(&cpu);
+    total_t_states += t_states;
+    return cpu.reg_B == 0xFF && get_flag(&cpu, FLAG_H) && !get_flag(&cpu, FLAG_N);
 }
 
 static bool test_ini_flags(void) {
@@ -5436,6 +5504,8 @@ static int run_z80_com_test(const char* path, const char* success_marker, char* 
     uint64_t cycles = 0;
     int terminated = 0;
 
+    total_t_states = 0;
+
     while (!terminated && cycles < max_cycles) {
         if (cpu.reg_PC == 0x0005) {
             if (!handle_cpm_bdos(&cpu, output, &out_len, output_cap, &terminated)) {
@@ -5449,14 +5519,22 @@ static int run_z80_com_test(const char* path, const char* success_marker, char* 
             return 0;
         }
         cycles += (uint64_t)t_states;
+        total_t_states += (uint64_t)t_states;
     }
 
     if (!terminated) {
         return 0;
     }
 
-    if (success_marker && strstr(output, success_marker) == NULL) {
-        return 0;
+    if (success_marker) {
+        if (!output || strstr(output, success_marker) == NULL) {
+            return 0;
+        }
+    } else {
+        if (output && (contains_case_insensitive(output, "fail") ||
+                       contains_case_insensitive(output, "error"))) {
+            return 0;
+        }
     }
 
     return 1;
@@ -5488,6 +5566,7 @@ static int run_cpu_tests(const char* rom_dir) {
     } optional_tests[] = {
         {"zexdoc.com", "ZEXDOC", "ZEXDOC"},
         {"zexall.com", "ZEXALL", "ZEXALL"},
+        {"z80full.com", NULL, "Z80FULL"},
     };
 
     char full_path[512];

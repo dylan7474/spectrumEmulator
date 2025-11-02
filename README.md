@@ -80,9 +80,11 @@ full opcode matrix still matches the hardware. Run it directly from the binary:
 ./z80 --run-tests
 ```
 
-The command returns a non-zero exit status if any unit check fails. Optional ZEXDOC/ZEXALL integration is available when the
-corresponding CP/M binaries are present. Place `zexdoc.com` and/or `zexall.com` inside `tests/roms/` (or point the harness at an
-alternate directory via `--test-rom-dir <dir>`), then rerun the test command to execute the suites and record their output.
+The command returns a non-zero exit status if any unit check fails. Optional CPU exercisers are available when their CP/M binaries
+are present. Place `zexdoc.com`, `zexall.com`, and/or `z80full.com` inside `tests/roms/` (or point the harness at an alternate
+directory via `--test-rom-dir <dir>`), then rerun the test command to execute the suites and record their output. `z80full.com` is
+treated as a smoke test that fails only when it reports errors, letting the harness run the more exhaustive checks without
+requiring string updates for every upstream release.
 
 For convenience a dedicated make target wraps the test invocation:
 
@@ -160,8 +162,8 @@ Additional host shortcuts:
 - **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
   block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
   `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
-- **CPU accuracy** – Refine interrupt timing, undocumented flag nuances, and contention modelling now that the opcode matrix is complete. Incorporate well-known test
-  suites (e.g. ZEXDOC/ZEXALL or `z80full`) to continually validate the execution core while tightening cycle-level behaviour.
+- **CPU accuracy** – Extend the new interrupt/ULA contention model to the 128K machines, capture NMI edge cases, and fold the
+  expanded regression harness into continuous integration so timing regressions are caught automatically.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
 - **Automation and CI** – Capture the expanded CPU and tape behaviour in automated regression tests and stand up continuous
