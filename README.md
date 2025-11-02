@@ -57,13 +57,13 @@ The new memory mapper also understands the full 128 KB family. Provide the paire
 When a 32 KB image is supplied for the early 128K machines the loader automatically populates both ROM banks; otherwise the first bank is mirrored. The +2A/+3 models accept a 64 KB dump and split it into all four 16 KB ROMs so the DOS pair can be paged in through port `0x1FFD`. The late gate-array emulation also honours the all-RAM and special paging modes, bringing the bank-switching quirks used by CP/M and +3DOS utilities in line with the real hardware. You can force the classic configuration at any time with `--model 48k` or `--48k`.
 The extended models share the revised ULA contention and interrupt handling code with the 48 KB machines, so bank paging, screen switching, and NMIs now follow the 128K timing quirks expected by diagnostics suites.
 
-Contention timing can be tuned without changing the core model. Pass `--contention <profile>` to pick from the original 48K bus sharing, the 128K "toastrack/+2" pattern, or the later +2A/+3 gate array behaviour:
+Contention timing can be tuned without changing the core model. Pass `--contention <profile>` to pick from the original 48K bus sharing, the 128K "toastrack/+2" pattern, or the later +2A/+3 gate array behaviour. The late gate-array timings now honour the diagnostic-verified one-tick offset used by the +2A/+3 family, so screen fetch contention lines up with hardware-level tests:
 
 ```bash
 ./z80 --model 128k --contention plus2a path/to/128k.rom
 ```
 
-For software that expects Interface 1 style bus delays, enable the shared peripheral wait-state generator with `--peripheral if1`. Reads from otherwise unclaimed ports now return the floating bus value captured from the ULA, so keyboard scanners and Kempston autodetection routines observe the same byte stream as on the real hardware.
+For software that expects Interface 1 style bus delays, enable the shared peripheral wait-state generator with `--peripheral if1`. Late gate-array models now install the +3 peripheral wait-states by default so AY, disk, and other port-heavy routines see the hardware's extra 3T delays. Override the behaviour explicitly with `--peripheral plus3` or `--peripheral none`. Reads from otherwise unclaimed ports still return the floating bus value captured from the ULA, so keyboard scanners and Kempston autodetection routines observe the same byte stream as on the real hardware.
 
 For audio debugging you can mirror the generated beeper samples to a WAV file with the optional dump flag:
 
@@ -111,7 +111,7 @@ For convenience a dedicated make target wraps the test invocation:
 make test
 ```
 
-The harness now checks NMI stack semantics alongside the 128K paging and contention paths, keeping the shared interrupt model honest as the emulator evolves. Recent additions exercise the floating bus sampler, the +2A/+3 contention masks, the late gate-array ROM pager, and the optional Interface 1 wait-state emulation so future timing tweaks remain compatible. A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `make` and `make test` on every push and pull request so timing regressions are flagged automatically.
+The harness now checks NMI stack semantics alongside the 128K paging and contention paths, keeping the shared interrupt model honest as the emulator evolves. Recent additions exercise the floating bus sampler, the +2A/+3 contention masks, the late gate-array ROM pager, the calibrated +2A/+3 contention slot offset, and both Interface 1 and +3 peripheral wait-state emulations so future timing tweaks remain compatible. A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `make` and `make test` on every push and pull request so timing regressions are flagged automatically.
 
 ### Loading and saving tapes
 
@@ -183,7 +183,6 @@ Additional host shortcuts:
 - **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
   block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
   `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
-- **CPU accuracy** – Calibrate the late gate-array timings against diagnostics and extend the model with +3 peripheral wait-states so disk, AY, and contention-heavy software behave identically to the original hardware.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
 - **Automation and CI** – Expand the new Linux CI pipeline with Windows builds and long-running cassette regressions so audio,
