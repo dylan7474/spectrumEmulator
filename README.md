@@ -38,13 +38,22 @@ flags while allowing you to manage dependencies manually.
 3. Build with `make -f Makefile.win` to produce the Windows binary.
 
 ## Running
-Launch the compiled executable from the command line with a 48 KB Spectrum ROM image:
+Launch the compiled executable from the command line. By default the emulator powers up as a 48 KB Spectrum when provided with a standard ROM dump:
 
 ```bash
 ./z80 path/to/48k.rom
 ```
 
 If no ROM is specified the bundled `48.rom` image in the project root is used automatically. The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
+
+The new memory mapper also understands the 128 KB machines. Provide the paired 16 KB ROM image and select the model explicitly (the `--128k` shorthand works the same way):
+
+```bash
+./z80 --model 128k path/to/128k.rom
+```
+
+When a 32 KB ROM is supplied the loader automatically populates both ROM banks; otherwise the first bank is mirrored. You can force the classic configuration at any time with `--model 48k` or `--48k`.
+The extended model shares the revised ULA contention and interrupt handling code with the 48 KB machines, so bank paging, screen switching, and NMIs now follow the 128K timing quirks expected by diagnostics suites.
 
 For audio debugging you can mirror the generated beeper samples to a WAV file with the optional dump flag:
 
@@ -91,6 +100,8 @@ For convenience a dedicated make target wraps the test invocation:
 ```bash
 make test
 ```
+
+The harness now checks NMI stack semantics alongside the 128K paging and contention paths, keeping the shared interrupt model honest as the emulator evolves. A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `make` and `make test` on every push and pull request so timing regressions are flagged automatically.
 
 ### Loading and saving tapes
 
@@ -162,9 +173,9 @@ Additional host shortcuts:
 - **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
   block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
   `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
-- **CPU accuracy** – Extend the new interrupt/ULA contention model to the 128K machines, capture NMI edge cases, and fold the
-  expanded regression harness into continuous integration so timing regressions are caught automatically.
+- **CPU accuracy** – Validate the floating bus behaviour and extend contention modelling to later 128K derivatives (such as the
+  +2A/+3) and popular peripheral contention patterns.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
-- **Automation and CI** – Capture the expanded CPU and tape behaviour in automated regression tests and stand up continuous
-  integration builds (Linux, Windows) so the emulator remains stable as new features land.
+- **Automation and CI** – Expand the new Linux CI pipeline with Windows builds and long-running cassette regressions so audio,
+  timing, and tape decoding stay stable as new features land.

@@ -21,6 +21,21 @@
 // --- Global Memory ---
 uint8_t memory[0x10000]; // 65536 bytes
 
+typedef enum {
+    SPECTRUM_MODEL_48K,
+    SPECTRUM_MODEL_128K
+} SpectrumModel;
+
+static SpectrumModel spectrum_model = SPECTRUM_MODEL_48K;
+static uint8_t rom_pages[2][0x4000];
+static uint8_t ram_pages[8][0x4000];
+static uint8_t current_rom_page = 0;
+static uint8_t current_screen_bank = 5;
+static uint8_t current_paged_bank = 7;
+static int paging_disabled = 0;
+static uint8_t rom_page_count = 1;
+static uint8_t page_contended[4] = {0u, 1u, 0u, 0u};
+
 // --- ZX Spectrum Constants ---
 #define SCREEN_WIDTH 256
 #define SCREEN_HEIGHT 192
@@ -442,6 +457,7 @@ uint8_t io_read(uint16_t port); void io_write(uint16_t port, uint8_t value);
 int cpu_step(Z80* cpu); int init_sdl(void); void cleanup_sdl(void); void render_screen(void);
 int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr);
 int cpu_interrupt(Z80* cpu, uint8_t data_bus);
+int cpu_nmi(Z80* cpu);
 int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
 void audio_callback(void* userdata, Uint8* stream, int len);
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
@@ -496,11 +512,41 @@ static inline int ula_contention_penalty(uint64_t t_state) {
     return penalties[phase & 7u];
 }
 
+static inline int is_ram_bank_contended(uint8_t bank) {
+    return (bank & 1u) != 0u;
+}
+
+static void spectrum_update_contention_flags(void) {
+    page_contended[0] = 0u;
+    if (spectrum_model == SPECTRUM_MODEL_128K) {
+        page_contended[1] = (uint8_t)is_ram_bank_contended(5u);
+        page_contended[2] = (uint8_t)is_ram_bank_contended(2u);
+        page_contended[3] = (uint8_t)is_ram_bank_contended(current_paged_bank);
+    } else {
+        page_contended[1] = 1u;
+        page_contended[2] = 0u;
+        page_contended[3] = 0u;
+    }
+}
+
+static void spectrum_configure_model(SpectrumModel model) {
+    spectrum_model = model;
+    paging_disabled = 0;
+    current_screen_bank = 5;
+    current_rom_page = 0;
+    current_paged_bank = (model == SPECTRUM_MODEL_128K) ? 0u : 7u;
+    spectrum_update_contention_flags();
+}
+
 static inline void apply_memory_contention(uint16_t addr) {
-    if (addr < 0x4000u || addr >= 0x8000u) {
+    if (!ula_instruction_progress_ptr) {
         return;
     }
-    if (!ula_instruction_progress_ptr) {
+    uint16_t page = (uint16_t)(addr >> 14);
+    if (page > 3u) {
+        return;
+    }
+    if (!page_contended[page]) {
         return;
     }
     uint64_t access_t_state = ula_instruction_base_tstate + (uint64_t)(*ula_instruction_progress_ptr);
@@ -510,18 +556,73 @@ static inline void apply_memory_contention(uint16_t addr) {
     }
 }
 
+static inline void spectrum_write_ram_shadow(uint16_t addr, uint8_t val) {
+    if (spectrum_model == SPECTRUM_MODEL_128K) {
+        if (addr < 0x8000u) {
+            ram_pages[5][addr - 0x4000u] = val;
+        } else if (addr < 0xC000u) {
+            ram_pages[2][addr - 0x8000u] = val;
+        } else {
+            ram_pages[current_paged_bank][addr - 0xC000u] = val;
+        }
+    } else {
+        if (addr < 0x8000u) {
+            ram_pages[5][addr - 0x4000u] = val;
+        } else if (addr < 0xC000u) {
+            ram_pages[2][addr - 0x8000u] = val;
+        } else {
+            ram_pages[7][addr - 0xC000u] = val;
+        }
+    }
+}
+
+static void spectrum_map_rom_page(uint8_t page) {
+    if (page >= rom_page_count) {
+        page = 0u;
+    }
+    memcpy(memory, rom_pages[page], 0x4000);
+    current_rom_page = page;
+}
+
+static void spectrum_map_upper_bank(uint8_t new_bank) {
+    if (spectrum_model != SPECTRUM_MODEL_128K) {
+        return;
+    }
+    if (new_bank == current_paged_bank) {
+        return;
+    }
+    memcpy(ram_pages[current_paged_bank], memory + 0xC000, 0x4000);
+    memcpy(memory + 0xC000, ram_pages[new_bank], 0x4000);
+    current_paged_bank = new_bank;
+    spectrum_update_contention_flags();
+}
+
 uint8_t readByte(uint16_t addr) {
     apply_memory_contention(addr);
-    if (addr < 0x4000) { return memory[addr]; } // ROM Read
-    return memory[addr];                        // RAM Read
+    return memory[addr];
 }
+
 void writeByte(uint16_t addr, uint8_t val) {
     apply_memory_contention(addr);
-    if (addr < 0x4000) { return; } // No Write to ROM
-    memory[addr] = val;            // RAM Write
+    if (addr < 0x4000u) {
+        return;
+    }
+    memory[addr] = val;
+    spectrum_write_ram_shadow(addr, val);
 }
-uint16_t readWord(uint16_t addr) { uint8_t lo = readByte(addr); uint8_t hi = readByte(addr+1); return (hi << 8) | lo; }
-void writeWord(uint16_t addr, uint16_t val) { uint8_t lo=val&0xFF; uint8_t hi=(val>>8)&0xFF; writeByte(addr, lo); writeByte(addr+1, hi); }
+
+uint16_t readWord(uint16_t addr) {
+    uint8_t lo = readByte(addr);
+    uint8_t hi = readByte((uint16_t)(addr + 1u));
+    return (uint16_t)((hi << 8) | lo);
+}
+
+void writeWord(uint16_t addr, uint16_t val) {
+    uint8_t lo = (uint8_t)(val & 0xFFu);
+    uint8_t hi = (uint8_t)((val >> 8) & 0xFFu);
+    writeByte(addr, lo);
+    writeByte((uint16_t)(addr + 1u), hi);
+}
 
 // --- I/O Port Access Helpers ---
 uint8_t border_color_idx = 0;
@@ -4231,6 +4332,30 @@ void io_write(uint16_t port, uint8_t value) {
     if ((port & 1) == 0) { // ULA Port FE
         ula_queue_port_value(value);
     }
+
+    if (spectrum_model == SPECTRUM_MODEL_128K && (port & 0x7FFD) == 0x7FFD) {
+        if (!paging_disabled) {
+            uint8_t new_bank = (uint8_t)(value & 0x07u);
+            spectrum_map_upper_bank(new_bank);
+
+            current_screen_bank = (value & 0x08u) ? 7u : 5u;
+
+            uint8_t new_rom = (uint8_t)((value >> 4) & 0x01u);
+            uint8_t rom_limit = rom_page_count > 0u ? rom_page_count : 1u;
+            uint8_t desired_rom = (uint8_t)(new_rom % rom_limit);
+            if (rom_page_count > 1u && desired_rom != current_rom_page) {
+                spectrum_map_rom_page(desired_rom);
+            } else {
+                current_rom_page = desired_rom;
+            }
+
+            if (value & 0x20u) {
+                paging_disabled = 1;
+            }
+        }
+        return;
+    }
+
     (void)port;
     (void)value;
 }
@@ -4820,6 +4945,44 @@ int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix) {
 }
 
 // --- Handle Maskable Interrupt ---
+int cpu_nmi(Z80* cpu) {
+    int* previous_progress_ptr = ula_instruction_progress_ptr;
+    uint64_t previous_base_tstate = ula_instruction_base_tstate;
+    int t_states = 0;
+
+    ula_instruction_base_tstate = total_t_states;
+    ula_instruction_progress_ptr = &t_states;
+
+    if (cpu->halted) {
+        cpu->reg_PC++;
+        cpu->halted = 0;
+        t_states += 4;
+    }
+
+    cpu->iff2 = cpu->iff1;
+    cpu->iff1 = 0;
+
+    cpu->reg_R = (cpu->reg_R + 1) | (cpu->reg_R & 0x80);
+    t_states += 5;
+
+    uint8_t pc_high = (uint8_t)(cpu->reg_PC >> 8);
+    uint8_t pc_low = (uint8_t)(cpu->reg_PC & 0xFF);
+
+    cpu->reg_SP = (uint16_t)(cpu->reg_SP - 1);
+    writeByte(cpu->reg_SP, pc_high);
+    t_states += 3;
+    cpu->reg_SP = (uint16_t)(cpu->reg_SP - 1);
+    writeByte(cpu->reg_SP, pc_low);
+    t_states += 3;
+
+    cpu->reg_PC = 0x0066;
+
+    ula_instruction_progress_ptr = previous_progress_ptr;
+    ula_instruction_base_tstate = previous_base_tstate;
+
+    return t_states;
+}
+
 int cpu_interrupt(Z80* cpu, uint8_t data_bus) {
     int* previous_progress_ptr = ula_instruction_progress_ptr;
     uint64_t previous_base_tstate = ula_instruction_base_tstate;
@@ -5086,6 +5249,11 @@ static void cpu_reset_state(Z80* cpu) {
 
 static void memory_clear(void) {
     memset(memory, 0, sizeof(memory));
+    memset(ram_pages, 0, sizeof(ram_pages));
+    if (rom_page_count == 0u) {
+        rom_page_count = 1u;
+    }
+    spectrum_configure_model(spectrum_model);
 }
 
 static bool append_output_char(char* output, size_t* length, size_t capacity, char ch) {
@@ -5403,6 +5571,117 @@ static bool test_interrupt_im1(void) {
     return cpu.reg_PC == 0x0038 && cpu.reg_SP == 0xFFFC && memory[0xFFFC] == 0x22 && memory[0xFFFD] == 0x22 && t_states == 13;
 }
 
+static bool test_nmi_stack_behaviour(void) {
+    SpectrumModel previous_model = spectrum_model;
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    cpu.reg_PC = 0x1234;
+    cpu.reg_SP = 0xC100;
+    cpu.iff1 = 1;
+    cpu.iff2 = 0;
+
+    memory[0x0066] = 0xED;
+    memory[0x0067] = 0x45; // RETN
+
+    total_t_states = 0;
+    int nmi_t = cpu_nmi(&cpu);
+    bool ok = (nmi_t == 11) &&
+              (cpu.reg_PC == 0x0066) &&
+              (cpu.reg_SP == 0xC0FE) &&
+              (cpu.iff1 == 0) &&
+              (cpu.iff2 == 1) &&
+              (memory[0xC0FF] == 0x12) &&
+              (memory[0xC0FE] == 0x34);
+
+    int retn_t = 0;
+    if (ok) {
+        retn_t = cpu_step(&cpu);
+        ok = (retn_t == 14) &&
+             (cpu.reg_PC == 0x1234) &&
+             (cpu.reg_SP == 0xC100) &&
+             (cpu.iff1 == 1) &&
+             (cpu.iff2 == 1);
+    }
+
+    if (!ok) {
+        printf("    NMI state PC=%04X SP=%04X IFF1=%d IFF2=%d stack=%02X%02X nmi_t=%d retn_t=%d\n",
+               cpu.reg_PC,
+               cpu.reg_SP,
+               cpu.iff1,
+               cpu.iff2,
+               memory[0xC0FF],
+               memory[0xC0FE],
+               nmi_t,
+               retn_t);
+    }
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+    return ok;
+}
+
+static bool test_128k_bank_switching(void) {
+    SpectrumModel previous_model = spectrum_model;
+    spectrum_configure_model(SPECTRUM_MODEL_128K);
+    memory_clear();
+
+    writeByte(0xC000, 0x12);
+    uint8_t before_flag = page_contended[3];
+
+    io_write(0x7FFD, 0x01); // Page bank 1 into 0xC000
+    uint8_t during_flag = page_contended[3];
+    bool saved_bank0 = (ram_pages[0][0] == 0x12) && (memory[0xC000] == 0x00);
+
+    writeByte(0xC000, 0x77);
+    bool bank1_written = (ram_pages[1][0] == 0x77);
+
+    io_write(0x7FFD, 0x00); // Restore bank 0
+    uint8_t after_flag = page_contended[3];
+    bool restored = (memory[0xC000] == 0x12);
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+
+    return (before_flag == 0u) && (during_flag == 1u) && (after_flag == 0u) && saved_bank0 && bank1_written && restored;
+}
+
+static bool test_128k_contention_penalty(void) {
+    SpectrumModel previous_model = spectrum_model;
+    spectrum_configure_model(SPECTRUM_MODEL_128K);
+    memory_clear();
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    memory[0x0000] = 0x7E; // LD A,(HL)
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0xC0;
+    cpu.reg_L = 0x00;
+    writeByte(0xC000, 0x42); // Bank 0 (uncontended)
+    total_t_states = 14336ULL;
+    int uncontended_t = cpu_step(&cpu);
+    bool base_ok = (cpu.reg_A == 0x42);
+
+    cpu_reset_state(&cpu);
+    cpu.reg_PC = 0x0000;
+    cpu.reg_H = 0xC0;
+    cpu.reg_L = 0x00;
+    memory[0x0000] = 0x7E;
+    io_write(0x7FFD, 0x01); // Switch to contended bank 1
+    writeByte(0xC000, 0x24);
+    total_t_states = 14336ULL;
+    int contended_t = cpu_step(&cpu);
+    bool cont_ok = (cpu.reg_A == 0x24);
+    io_write(0x7FFD, 0x00);
+
+    spectrum_configure_model(previous_model);
+    memory_clear();
+
+    return base_ok && cont_ok && (contended_t > uncontended_t);
+}
+
 static bool run_unit_tests(void) {
     struct {
         const char* name;
@@ -5421,6 +5700,9 @@ static bool run_unit_tests(void) {
         {"OTDR repeat timing", test_otdr_repeat},
         {"IM 2 interrupt vector", test_interrupt_im2},
         {"IM 1 interrupt vector", test_interrupt_im1},
+        {"NMI stack handling", test_nmi_stack_behaviour},
+        {"128K bank paging", test_128k_bank_switching},
+        {"128K contention penalties", test_128k_contention_penalty},
     };
 
     bool all_passed = true;
@@ -5603,6 +5885,7 @@ static int run_cpu_tests(const char* rom_dir) {
 static void print_usage(const char* prog) {
     fprintf(stderr,
             "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] "
+            "[--model <48k|128k> | --48k | --128k] "
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
             "[--test-rom-dir <dir>] [--run-tests] [rom_file]\n",
@@ -5691,12 +5974,22 @@ void render_screen(void) {
     uint32_t border_rgba = spectrum_colors[border_color_idx & 7];
     uint64_t frame_count = total_t_states / T_STATES_PER_FRAME;
     int flash_phase = (int)((frame_count >> 5) & 1ULL);
+    const uint8_t* vram_bank = memory + VRAM_START;
+    const uint8_t* attr_bank = memory + ATTR_START;
+    if (spectrum_model == SPECTRUM_MODEL_128K && current_screen_bank == 7u) {
+        const uint8_t* bank = ram_pages[7];
+        vram_bank = bank;
+        attr_bank = bank + (ATTR_START - VRAM_START);
+    }
     for(int y=0; y<TOTAL_HEIGHT; ++y) { for(int x=0; x<TOTAL_WIDTH; ++x) { if(x<BORDER_SIZE || x>=BORDER_SIZE+SCREEN_WIDTH || y<BORDER_SIZE || y>=BORDER_SIZE+SCREEN_HEIGHT) pixels[y * TOTAL_WIDTH + x] = border_rgba; } }
     for (int y = 0; y < SCREEN_HEIGHT; ++y) {
         for (int x_char = 0; x_char < SCREEN_WIDTH / 8; ++x_char) {
             uint16_t pix_addr = VRAM_START + ((y & 0xC0) << 5) + ((y & 7) << 8) + ((y & 0x38) << 2) + x_char;
             uint16_t attr_addr = ATTR_START + (y / 8 * 32) + x_char;
-            uint8_t pix_byte = memory[pix_addr]; uint8_t attr_byte = memory[attr_addr];
+            uint16_t pix_offset = (uint16_t)(pix_addr - VRAM_START);
+            uint16_t attr_offset = (uint16_t)(attr_addr - ATTR_START);
+            uint8_t pix_byte = vram_bank[pix_offset];
+            uint8_t attr_byte = attr_bank[attr_offset];
             int ink_idx=attr_byte&7; int pap_idx=(attr_byte>>3)&7; int bright=(attr_byte>>6)&1; int flash=(attr_byte>>7)&1;
             const uint32_t* cmap=bright?spectrum_bright_colors:spectrum_colors; uint32_t ink=cmap[ink_idx]; uint32_t pap=cmap[pap_idx];
             if (flash && flash_phase) {
@@ -5851,6 +6144,24 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             audio_dump_path = argv[++i];
+        } else if (strcmp(argv[i], "--model") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            const char* model_value = argv[++i];
+            if (strcmp(model_value, "48k") == 0 || strcmp(model_value, "48K") == 0) {
+                spectrum_configure_model(SPECTRUM_MODEL_48K);
+            } else if (strcmp(model_value, "128k") == 0 || strcmp(model_value, "128K") == 0) {
+                spectrum_configure_model(SPECTRUM_MODEL_128K);
+            } else {
+                fprintf(stderr, "Unknown model: %s\n", model_value);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--48k") == 0) {
+            spectrum_configure_model(SPECTRUM_MODEL_48K);
+        } else if (strcmp(argv[i], "--128k") == 0) {
+            spectrum_configure_model(SPECTRUM_MODEL_128K);
         } else if (strcmp(argv[i], "--beeper-log") == 0) {
             beeper_logging_enabled = 1;
         } else if (strcmp(argv[i], "--tape-debug") == 0) {
@@ -5959,15 +6270,31 @@ int main(int argc, char *argv[]) {
         free(rom_fallback_path);
         return 1;
     }
-    size_t br = fread(memory, 1, 0x4000, rf);
-    if (br != 0x4000) {
-        fprintf(stderr, "ROM read error(%zu)\n", br);
-        fclose(rf);
+    uint8_t rom_buffer[0x8000];
+    size_t rom_read = fread(rom_buffer, 1, sizeof(rom_buffer), rf);
+    fclose(rf);
+    if (rom_read < 0x4000) {
+        fprintf(stderr, "ROM read error (%zu bytes)\n", rom_read);
         free(rom_fallback_path);
         return 1;
     }
-    fclose(rf);
-    printf("Loaded %zu bytes from %s\n", br, rom_log_path);
+
+    memset(memory, 0, sizeof(memory));
+    memset(ram_pages, 0, sizeof(ram_pages));
+
+    memcpy(rom_pages[0], rom_buffer, 0x4000);
+    if (spectrum_model == SPECTRUM_MODEL_128K && rom_read >= 0x8000) {
+        memcpy(rom_pages[1], rom_buffer + 0x4000, 0x4000);
+        rom_page_count = 2u;
+    } else {
+        memcpy(rom_pages[1], rom_pages[0], 0x4000);
+        rom_page_count = 1u;
+    }
+
+    spectrum_configure_model(spectrum_model);
+    spectrum_map_rom_page(0u);
+
+    printf("Loaded %zu bytes from %s\n", rom_read, rom_log_path);
     free(rom_fallback_path);
 
     tape_playback.use_waveform_playback = 0;
