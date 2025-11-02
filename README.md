@@ -1,7 +1,7 @@
 # Spectrum Emulator
 
 ## Overview
-This project is a homebrew ZX Spectrum emulator written in C with SDL2 for video, audio, and input. It focuses on accurately modelling the original hardware's Z80 CPU, display timing, and keyboard matrix while remaining small enough to hack on for learning and experimentation.
+This project is a homebrew ZX Spectrum emulator written in C with SDL2 for video, audio, and input. It focuses on accurately modelling the original hardware's Z80 CPU, display timing, and keyboard matrix while remaining small enough to hack on for learning and experimentation. The execution core now implements the entire documented and undocumented Z80 opcode space, including all prefixed tables.
 
 ## Prerequisites
 Before building, make sure the following tools and development headers are available:
@@ -73,7 +73,8 @@ and TZX images expose the expected filenames and data ordering:
 ## Testing
 
 The emulator ships with a lightweight CPU regression harness that exercises the undocumented opcode helpers and verifies
-interrupt sequencing. Run it directly from the binary:
+interrupt sequencing. With the remaining undocumented instructions now implemented, the suite gives quick confidence that the
+full opcode matrix still matches the hardware. Run it directly from the binary:
 
 ```bash
 ./z80 --run-tests
@@ -159,7 +160,7 @@ Additional host shortcuts:
 - **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
   block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
   `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
-- **CPU accuracy** – Implement the remaining undocumented Z80 opcodes and refine interrupt timing. Incorporate well-known test
+- **CPU accuracy** – Refine interrupt timing, undocumented flag nuances, and contention modelling now that the opcode matrix is complete. Incorporate well-known test
   suites (e.g. ZEXDOC/ZEXALL or `z80full`) to continually validate the execution core while tightening cycle-level behaviour.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
