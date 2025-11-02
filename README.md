@@ -55,6 +55,14 @@ The new memory mapper also understands the 128 KB machines. Provide the paired 1
 When a 32 KB ROM is supplied the loader automatically populates both ROM banks; otherwise the first bank is mirrored. You can force the classic configuration at any time with `--model 48k` or `--48k`.
 The extended model shares the revised ULA contention and interrupt handling code with the 48 KB machines, so bank paging, screen switching, and NMIs now follow the 128K timing quirks expected by diagnostics suites.
 
+Contention timing can be tuned without changing the core model. Pass `--contention <profile>` to pick from the original 48K bus sharing, the 128K "toastrack/+2" pattern, or the later +2A/+3 gate array behaviour:
+
+```bash
+./z80 --model 128k --contention plus2a path/to/128k.rom
+```
+
+For software that expects Interface 1 style bus delays, enable the shared peripheral wait-state generator with `--peripheral if1`. Reads from otherwise unclaimed ports now return the floating bus value captured from the ULA, so keyboard scanners and Kempston autodetection routines observe the same byte stream as on the real hardware.
+
 For audio debugging you can mirror the generated beeper samples to a WAV file with the optional dump flag:
 
 ```bash
@@ -101,7 +109,7 @@ For convenience a dedicated make target wraps the test invocation:
 make test
 ```
 
-The harness now checks NMI stack semantics alongside the 128K paging and contention paths, keeping the shared interrupt model honest as the emulator evolves. A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `make` and `make test` on every push and pull request so timing regressions are flagged automatically.
+The harness now checks NMI stack semantics alongside the 128K paging and contention paths, keeping the shared interrupt model honest as the emulator evolves. Recent additions exercise the floating bus sampler, the +2A/+3 contention masks, and the optional Interface 1 wait-state emulation so future timing tweaks remain compatible. A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `make` and `make test` on every push and pull request so timing regressions are flagged automatically.
 
 ### Loading and saving tapes
 
@@ -173,8 +181,7 @@ Additional host shortcuts:
 - **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
   block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
   `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
-- **CPU accuracy** – Validate the floating bus behaviour and extend contention modelling to later 128K derivatives (such as the
-  +2A/+3) and popular peripheral contention patterns.
+- **CPU accuracy** – Extend the +2A/+3 memory paging hardware, rounding out the bank-switch ports and late gate-array quirks that remain after the new contention and floating bus support.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
 - **Automation and CI** – Expand the new Linux CI pipeline with Windows builds and long-running cassette regressions so audio,
