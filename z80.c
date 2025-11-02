@@ -39,6 +39,7 @@ SDL_Window* window = NULL;
 SDL_Renderer* renderer = NULL;
 SDL_Texture* texture = NULL;
 uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
+static int window_fullscreen = 0;
 
 // --- Audio Globals ---
 volatile int beeper_state = 0; // 0 = low, 1 = high
@@ -57,6 +58,10 @@ static const double BEEPER_HP_ALPHA = 0.995;
 static const char* audio_dump_path = NULL;
 
 static const int16_t TAPE_WAV_AMPLITUDE = 20000;
+
+static int speaker_tape_playback_level = 1;
+static int speaker_tape_record_level = 1;
+static int speaker_output_level = 1;
 
 // --- Tape Constants ---
 static const int TAPE_PILOT_PULSE_TSTATES = 2168;
@@ -339,6 +344,9 @@ static uint64_t tape_playback_elapsed_tstates(const TapePlaybackState* state, ui
 static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
 static void tape_render_overlay(void);
 static void tape_wav_seek_playback(TapePlaybackState* state, uint64_t position_tstates);
+static int speaker_calculate_output_level(void);
+static void speaker_update_output(uint64_t t_state, int emit_event);
+static void toggle_fullscreen(void);
 static void ula_queue_port_value(uint8_t value);
 static void ula_process_port_events(uint64_t current_t_state);
 
@@ -349,7 +357,7 @@ static uint32_t audio_dump_data_bytes = 0;
 
 typedef struct {
     uint64_t t_state;
-    uint8_t level;
+    int8_t level;
 } BeeperEvent;
 
 static BeeperEvent beeper_events[BEEPER_EVENT_CAPACITY];
@@ -499,16 +507,15 @@ static void beeper_reset_audio_state(uint64_t current_t_state, int current_level
     beeper_last_event_t_state = current_t_state;
     beeper_playback_position = (double)current_t_state;
     beeper_writer_cursor = (double)current_t_state;
-    beeper_playback_level = current_level ? 1 : 0;
-    double baseline = (current_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+    beeper_playback_level = current_level;
+    double baseline = (double)current_level * (double)AUDIO_AMPLITUDE;
     beeper_hp_last_input = baseline;
     beeper_hp_last_output = 0.0;
-    beeper_state = current_level ? 1 : 0;
     beeper_idle_log_active = 0;
 }
 
 static void beeper_force_resync(uint64_t sync_t_state) {
-    double baseline = (beeper_playback_level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+    double baseline = (double)beeper_playback_level * (double)AUDIO_AMPLITUDE;
     beeper_event_head = 0;
     beeper_event_tail = 0;
     beeper_playback_position = (double)sync_t_state;
@@ -1503,6 +1510,27 @@ static int tape_load_image(const char* path, TapeFormat format, TapeImage* image
     return 0;
 }
 
+static int speaker_component_amplitude(int level) {
+    return level ? 1 : -1;
+}
+
+static int speaker_calculate_output_level(void) {
+    int combined = speaker_component_amplitude(beeper_state);
+    combined += speaker_component_amplitude(speaker_tape_playback_level);
+    combined += speaker_component_amplitude(speaker_tape_record_level);
+    return combined;
+}
+
+static void speaker_update_output(uint64_t t_state, int emit_event) {
+    int new_level = speaker_calculate_output_level();
+    if (new_level != speaker_output_level) {
+        speaker_output_level = new_level;
+        if (emit_event) {
+            beeper_push_event(t_state, new_level);
+        }
+    }
+}
+
 static void tape_reset_playback(TapePlaybackState* state) {
     if (!state) {
         return;
@@ -1533,6 +1561,8 @@ static void tape_reset_playback(TapePlaybackState* state) {
         state->level = 1;
         tape_ear_state = 1;
     }
+    speaker_tape_playback_level = tape_ear_state;
+    speaker_update_output(total_t_states, 0);
 }
 
 static int tape_current_block_pilot_count(const TapePlaybackState* state) {
@@ -1565,6 +1595,8 @@ static int tape_begin_block(TapePlaybackState* state, size_t block_index, uint64
     state->phase = TAPE_PHASE_PILOT;
     state->level = 1;
     tape_ear_state = state->level;
+    speaker_tape_playback_level = tape_ear_state;
+    speaker_update_output(start_time, 1);
     state->next_transition_tstate = start_time + (uint64_t)TAPE_PILOT_PULSE_TSTATES;
     state->playing = 1;
     state->last_transition_tstate = start_time;
@@ -1589,6 +1621,8 @@ static void tape_start_playback(TapePlaybackState* state, uint64_t start_time) {
         state->waveform_index = 0;
         state->level = state->waveform.initial_level ? 1 : 0;
         tape_ear_state = state->level;
+        speaker_tape_playback_level = tape_ear_state;
+        speaker_update_output(start_time, 1);
         state->playing = 1;
         state->next_transition_tstate = start_time + (uint64_t)state->waveform.pulses[0].duration;
         state->paused_transition_remaining = 0;
@@ -1676,6 +1710,8 @@ static int tape_resume_playback(TapePlaybackState* state, uint64_t current_t_sta
     state->paused_transition_remaining = 0;
     state->paused_pause_remaining = 0;
     tape_ear_state = state->level;
+    speaker_tape_playback_level = tape_ear_state;
+    speaker_update_output(current_t_state, 1);
     return 1;
 }
 
@@ -1703,6 +1739,8 @@ static void tape_wav_seek_playback(TapePlaybackState* state, uint64_t position_t
     int initial_level = state->waveform.initial_level ? 1 : 0;
     state->level = initial_level;
     tape_ear_state = state->level;
+    speaker_tape_playback_level = tape_ear_state;
+    speaker_update_output(total_t_states, 0);
 
     if (state->waveform.count == 0) {
         tape_wav_shared_position_tstates = 0;
@@ -1738,6 +1776,8 @@ static void tape_wav_seek_playback(TapePlaybackState* state, uint64_t position_t
     if ((index & 1u) != 0u) {
         state->level = initial_level ? 0 : 1;
         tape_ear_state = state->level;
+        speaker_tape_playback_level = tape_ear_state;
+        speaker_update_output(total_t_states, 0);
     }
 
     state->position_tstates = target;
@@ -1756,6 +1796,8 @@ static void tape_wav_seek_playback(TapePlaybackState* state, uint64_t position_t
             state->waveform_index = index + 1;
             state->level = state->level ? 0 : 1;
             tape_ear_state = state->level;
+            speaker_tape_playback_level = tape_ear_state;
+            speaker_update_output(total_t_states, 0);
             if (state->waveform_index < state->waveform.count) {
                 state->paused_transition_remaining = (uint64_t)state->waveform.pulses[state->waveform_index].duration;
             } else {
@@ -2259,11 +2301,15 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
                     state->phase = TAPE_PHASE_DONE;
                     state->playing = 0;
                     tape_ear_state = 1;
+                    speaker_tape_playback_level = tape_ear_state;
+                    speaker_update_output(start_time, 1);
                 }
             } else {
                 state->phase = TAPE_PHASE_DONE;
                 state->playing = 0;
                 tape_ear_state = 1;
+                speaker_tape_playback_level = tape_ear_state;
+                speaker_update_output(start_time, 1);
             }
         }
     } else {
@@ -2273,6 +2319,8 @@ static void tape_finish_block_playback(TapePlaybackState* state) {
         state->phase = TAPE_PHASE_DONE;
         state->playing = 0;
         tape_ear_state = 1;
+        speaker_tape_playback_level = tape_ear_state;
+        speaker_update_output(state->next_transition_tstate, 1);
     }
 }
 
@@ -2309,6 +2357,8 @@ static void tape_update(uint64_t current_t_state) {
             }
             state->level = state->level ? 0 : 1;
             tape_ear_state = state->level;
+            speaker_tape_playback_level = tape_ear_state;
+            speaker_update_output(transition_time, 1);
             state->waveform_index++;
             state->last_transition_tstate = transition_time;
             if (state->waveform_index < state->waveform.count) {
@@ -2334,6 +2384,8 @@ static void tape_update(uint64_t current_t_state) {
                     state->phase = TAPE_PHASE_DONE;
                     state->playing = 0;
                     tape_ear_state = 1;
+                    speaker_tape_playback_level = tape_ear_state;
+                    speaker_update_output(state->pause_end_tstate, 1);
                     tape_playback_accumulate_elapsed(state, state->pause_end_tstate);
                     state->last_transition_tstate = state->pause_end_tstate;
                     if (state == &tape_playback && state->format == TAPE_FORMAT_WAV) {
@@ -2346,6 +2398,8 @@ static void tape_update(uint64_t current_t_state) {
                     state->phase = TAPE_PHASE_DONE;
                     state->playing = 0;
                     tape_ear_state = 1;
+                    speaker_tape_playback_level = tape_ear_state;
+                    speaker_update_output(state->pause_end_tstate, 1);
                     tape_playback_accumulate_elapsed(state, state->pause_end_tstate);
                     state->last_transition_tstate = state->pause_end_tstate;
                     if (state == &tape_playback && state->format == TAPE_FORMAT_WAV) {
@@ -2374,6 +2428,8 @@ static void tape_update(uint64_t current_t_state) {
 
         state->level = state->level ? 0 : 1;
         tape_ear_state = state->level;
+        speaker_tape_playback_level = tape_ear_state;
+        speaker_update_output(transition_time, 1);
         state->last_transition_tstate = transition_time;
 
         switch (state->phase) {
@@ -3022,6 +3078,9 @@ static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_ou
         tape_recorder.position_start_tstate = current_t_state;
     }
 
+    speaker_tape_record_level = 1;
+    speaker_update_output(current_t_state, 1);
+
     if (finalize_output && tape_recorder.session_dirty) {
         if (!tape_recorder_write_output()) {
             fprintf(stderr, "Failed to save tape recording\n");
@@ -3612,6 +3671,8 @@ static void tape_recorder_handle_mic(uint64_t t_state, int level) {
         tape_recorder.last_transition_tstate = t_state;
         tape_recorder.last_level = level;
         tape_recorder.block_start_level = level ? 1 : 0;
+        speaker_tape_record_level = level ? 1 : 0;
+        speaker_update_output(t_state, 1);
         return;
     }
 
@@ -3628,6 +3689,8 @@ static void tape_recorder_handle_mic(uint64_t t_state, int level) {
     }
     tape_recorder.last_transition_tstate = t_state;
     tape_recorder.last_level = level;
+    speaker_tape_record_level = level ? 1 : 0;
+    speaker_update_output(t_state, 1);
 }
 
 static void tape_recorder_update(uint64_t current_t_state, int force_flush) {
@@ -3915,12 +3978,12 @@ static size_t beeper_catch_up_to(double catch_up_position, double playback_posit
 
         while (head != beeper_event_tail &&
                (double)beeper_events[head].t_state <= target_position) {
-            level = beeper_events[head].level ? 1 : 0;
+            level = beeper_events[head].level;
             head = (head + 1) % BEEPER_EVENT_CAPACITY;
             ++consumed;
         }
 
-        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double raw_sample = (double)level * (double)AUDIO_AMPLITUDE;
         double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
         last_input = raw_sample;
         last_output = filtered_sample;
@@ -3933,12 +3996,12 @@ static size_t beeper_catch_up_to(double catch_up_position, double playback_posit
 
         while (head != beeper_event_tail &&
                (double)beeper_events[head].t_state <= target_position) {
-            level = beeper_events[head].level ? 1 : 0;
+            level = beeper_events[head].level;
             head = (head + 1) % BEEPER_EVENT_CAPACITY;
             ++consumed;
         }
 
-        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double raw_sample = (double)level * (double)AUDIO_AMPLITUDE;
         double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
         last_input = raw_sample;
         last_output = filtered_sample;
@@ -3948,7 +4011,7 @@ static size_t beeper_catch_up_to(double catch_up_position, double playback_posit
 
     while (head != beeper_event_tail &&
            (double)beeper_events[head].t_state <= catch_up_position) {
-        level = beeper_events[head].level ? 1 : 0;
+        level = beeper_events[head].level;
         head = (head + 1) % BEEPER_EVENT_CAPACITY;
         ++consumed;
     }
@@ -4131,7 +4194,7 @@ static void beeper_push_event(uint64_t t_state, int level) {
     }
 
     beeper_events[beeper_event_tail].t_state = t_state;
-    beeper_events[beeper_event_tail].level = (uint8_t)(level ? 1 : 0);
+    beeper_events[beeper_event_tail].level = (int8_t)level;
     beeper_event_tail = next_tail;
 
     if (locked_audio) {
@@ -5132,6 +5195,21 @@ static int run_z80_com_test(const char* path, const char* success_marker, char* 
     return 1;
 }
 
+static void toggle_fullscreen(void) {
+    if (!window) {
+        return;
+    }
+
+    Uint32 flags = window_fullscreen ? 0u : SDL_WINDOW_FULLSCREEN_DESKTOP;
+    if (SDL_SetWindowFullscreen(window, flags) != 0) {
+        fprintf(stderr, "Failed to toggle fullscreen: %s\n", SDL_GetError());
+        return;
+    }
+
+    window_fullscreen = window_fullscreen ? 0 : 1;
+    SDL_ShowCursor(window_fullscreen ? SDL_DISABLE : SDL_ENABLE);
+}
+
 static int run_cpu_tests(const char* rom_dir) {
     bool unit_pass = run_unit_tests();
     bool overall = unit_pass;
@@ -5230,7 +5308,7 @@ int init_sdl(void) {
                 have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples,
                 beeper_latency_threshold(),
                 beeper_latency_trim_samples);
-            beeper_reset_audio_state(total_t_states, beeper_state);
+            beeper_reset_audio_state(total_t_states, speaker_output_level);
             if (audio_dump_path && !audio_dump_file) {
                 if (!audio_dump_start(audio_dump_path, (uint32_t)audio_sample_rate)) {
                     audio_dump_path = NULL;
@@ -5349,7 +5427,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
                     }
                 }
 
-                double baseline = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+                double baseline = (double)level * (double)AUDIO_AMPLITUDE;
                 last_input = baseline;
                 last_output = 0.0;
 
@@ -5380,12 +5458,12 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
 
         while (beeper_event_head != beeper_event_tail &&
                (double)beeper_events[beeper_event_head].t_state <= target_position) {
-            level = beeper_events[beeper_event_head].level ? 1 : 0;
+            level = beeper_events[beeper_event_head].level;
             playback_position = (double)beeper_events[beeper_event_head].t_state;
             beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
         }
 
-        double raw_sample = (level ? 1.0 : -1.0) * (double)AUDIO_AMPLITUDE;
+        double raw_sample = (double)level * (double)AUDIO_AMPLITUDE;
         double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
         last_input = raw_sample;
         last_output = filtered_sample;
@@ -5587,6 +5665,8 @@ int main(int argc, char *argv[]) {
         tape_input_enabled = 0;
     }
 
+    speaker_output_level = speaker_calculate_output_level();
+
     if(!init_sdl()){tape_shutdown();cleanup_sdl();return 1;}
 
     Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
@@ -5612,10 +5692,10 @@ int main(int argc, char *argv[]) {
 
     if (audio_available) {
         SDL_LockAudio();
-        beeper_reset_audio_state(total_t_states, beeper_state);
+        beeper_reset_audio_state(total_t_states, speaker_output_level);
         SDL_UnlockAudio();
     } else {
-        beeper_reset_audio_state(total_t_states, beeper_state);
+        beeper_reset_audio_state(total_t_states, speaker_output_level);
     }
 
     printf("Starting Z80 emulation...\n");
@@ -5636,6 +5716,14 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
+                if (e.type == SDL_KEYDOWN && !e.key.repeat) {
+                    SDL_Keycode sym = e.key.keysym.sym;
+                    SDL_Keymod mods = e.key.keysym.mod;
+                    if (sym == SDLK_F11 || (sym == SDLK_RETURN && (mods & KMOD_ALT))) {
+                        toggle_fullscreen();
+                        continue;
+                    }
+                }
                 if (tape_handle_control_key(&e)) {
                     continue;
                 }
@@ -5801,7 +5889,7 @@ static void ula_process_port_events(uint64_t current_t_state) {
         int new_beeper_state = (value >> 4) & 0x01;
         if (new_beeper_state != beeper_state) {
             beeper_state = new_beeper_state;
-            beeper_push_event(event_t_state, beeper_state);
+            speaker_update_output(event_t_state, 1);
         }
 
         int mic_level = (value >> 3) & 0x01;
