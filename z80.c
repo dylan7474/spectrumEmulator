@@ -2207,7 +2207,7 @@ static int z80_decompress_block_buffer(const uint8_t* src,
         }
 
         src_index++;
-        if (src_index + 1 >= src_len) {
+        if (src_index + 2 > src_len) {
             return 0;
         }
         uint8_t count_byte = src[src_index++];
@@ -2396,7 +2396,9 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
     uint16_t pc = (uint16_t)header[6] | ((uint16_t)header[7] << 8);
     uint16_t sp = (uint16_t)header[8] | ((uint16_t)header[9] << 8);
     uint8_t flags = header[12];
-    uint8_t compressed_flag = header[13];
+    uint8_t compressed_flag = (flags & 0x20u) ? 1u : 0u;
+    uint8_t r_bit_7 = (flags & 0x01u) ? 0x80u : 0u;
+    border_color_idx = (flags >> 1) & 0x07u;
 
     spectrum_configure_model(SPECTRUM_MODEL_48K);
 
@@ -2408,26 +2410,28 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
     cpu->reg_H = header[5];
     cpu->reg_SP = sp;
     cpu->reg_I = header[10];
-    cpu->reg_R = (uint8_t)((header[11] & 0x7Fu) | ((flags & 0x80u) ? 0x80u : 0u));
-    cpu->reg_E = header[14];
-    cpu->reg_D = header[15];
-    cpu->alt_reg_C = header[16];
-    cpu->alt_reg_B = header[17];
-    cpu->alt_reg_E = header[18];
-    cpu->alt_reg_D = header[19];
-    cpu->alt_reg_L = header[20];
-    cpu->alt_reg_H = header[21];
-    cpu->alt_reg_A = header[22];
-    cpu->alt_reg_F = header[23];
-    cpu->reg_IY = (uint16_t)header[24] | ((uint16_t)header[25] << 8);
-    cpu->reg_IX = (uint16_t)header[26] | ((uint16_t)header[27] << 8);
-    cpu->iff1 = (header[28] & 0x01u) ? 1 : 0;
-    cpu->iff2 = (header[29] & 0x01u) ? 1 : cpu->iff1;
-    cpu->interruptMode = 1;
+    cpu->reg_R = (uint8_t)((header[11] & 0x7Fu) | r_bit_7);
+
+    cpu->reg_E = header[13];
+    cpu->reg_D = header[14];
+    cpu->alt_reg_C = header[15];
+    cpu->alt_reg_B = header[16];
+    cpu->alt_reg_E = header[17];
+    cpu->alt_reg_D = header[18];
+    cpu->alt_reg_L = header[19];
+    cpu->alt_reg_H = header[20];
+    cpu->alt_reg_A = header[21];
+    cpu->alt_reg_F = header[22];
+    cpu->reg_IY = (uint16_t)header[23] | ((uint16_t)header[24] << 8);
+    cpu->reg_IX = (uint16_t)header[25] | ((uint16_t)header[26] << 8);
+    cpu->iff1 = (header[27] & 0x01u) ? 1 : 0;
+    cpu->iff2 = (header[28] & 0x01u) ? 1 : 0;
+
+    uint8_t interrupt_mode = header[29];
+    cpu->interruptMode = (int)(interrupt_mode & 0x03u);
+
     cpu->ei_delay = 0;
     cpu->halted = 0;
-
-    border_color_idx = flags & 0x07u;
 
     uint8_t* ram_buffer = (uint8_t*)malloc(0xC000u);
     if (!ram_buffer) {
@@ -2439,14 +2443,14 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
     if (pc != 0) {
         if (compressed_flag) {
             if (!z80_decompress_stream(sf, ram_buffer, 0xC000u)) {
-                fprintf(stderr, "Failed to decompress Z80 snapshot '%s'\n", path);
+                fprintf(stderr, "Failed to decompress V1 Z80 snapshot '%s'\n", path);
                 free(ram_buffer);
                 fclose(sf);
                 return 0;
             }
         } else {
             if (fread(ram_buffer, 0xC000u, 1, sf) != 1) {
-                fprintf(stderr, "Failed to read Z80 RAM image from '%s'\n", path);
+                fprintf(stderr, "Failed to read V1 Z80 RAM image from '%s'\n", path);
                 free(ram_buffer);
                 fclose(sf);
                 return 0;
@@ -2496,6 +2500,9 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
         while (loaded_mask != 0x07u) {
             uint8_t len_bytes[2];
             if (fread(len_bytes, sizeof(len_bytes), 1, sf) != 1) {
+                if (feof(sf) && loaded_mask != 0u) {
+                    break;
+                }
                 fprintf(stderr, "Truncated Z80 memory block in '%s'\n", path);
                 free(ram_buffer);
                 fclose(sf);
@@ -2514,15 +2521,23 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
             uint8_t mask_bit = 0u;
             if (!z80_map_page_id_to_offset(page_id, &segment_offset, &mask_bit)) {
                 fprintf(stderr, "Z80 snapshot '%s' contains unsupported memory page id %d\n", path, page_id);
-                free(ram_buffer);
-                fclose(sf);
-                return 0;
+                if (fseek(sf, block_len, SEEK_CUR) != 0) {
+                    fprintf(stderr, "Failed to seek past unsupported block in '%s'\n", path);
+                    free(ram_buffer);
+                    fclose(sf);
+                    return 0;
+                }
+                continue;
             }
             if ((loaded_mask & mask_bit) != 0u) {
                 fprintf(stderr, "Z80 snapshot '%s' repeats memory page id %d\n", path, page_id);
-                free(ram_buffer);
-                fclose(sf);
-                return 0;
+                if (fseek(sf, block_len, SEEK_CUR) != 0) {
+                    fprintf(stderr, "Failed to seek past repeated block in '%s'\n", path);
+                    free(ram_buffer);
+                    fclose(sf);
+                    return 0;
+                }
+                continue;
             }
 
             uint8_t* segment = ram_buffer + segment_offset;
