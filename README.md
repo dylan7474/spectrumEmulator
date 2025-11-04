@@ -155,10 +155,35 @@ Loading and saving can be combined, allowing you to simultaneously play an input
 ./z80 --wav digitized.wav --save-tap restore.tap
 ```
 
-The WAV loader expects mono 8- or 16-bit PCM streams and derives tape transitions by tracking zero-crossings, making it suitable for replaying the emulator's own `--save-wav` output or other digitized cassette recordings.
+The WAV loader expects mono 8- or 16-bit PCM streams and derives tape
+transitions by tracking zero-crossings, making it suitable for replaying the
+emulator's own `--save-wav` output or other digitized cassette recordings.
 
-At present the TZX reader accepts standard speed blocks (`0x10`). Future updates may broaden support for additional block types
-and direct snapshot formats.
+Snapshot containers (`.sna`, `.z80`) follow the same rules. Pass them explicitly
+with `--snapshot path/to/state.z80` to boot straight into a frozen machine, or
+provide one as the positional argument and the loader will detect it
+automatically.
+
+The TZX parser now understands the turbo data (`0x11`), pure tone (`0x12`),
+pulse sequence (`0x13`), pure data (`0x14`), and direct recording (`0x15`)
+block types in addition to the classic standard-speed (`0x10`) records. Custom
+loaders that rely on tuned pilot lengths, bespoke tone tables, or raw waveform
+captures play back without falling back to WAV conversion, keeping popular
+demos and fast loaders working straight from their archival images.
+
+### Snapshots
+
+Quick-load snapshot support complements the tape deck when you want to launch
+software without the ROM loader delays. The emulator recognises 48 KB `.sna`
+and `.z80` images (including the common compressed variants) either via the
+`--snapshot` flag or through positional auto-detection. Snapshot loads happen
+before SDL initialisation so the Spectrum appears on-screen already running the
+captured program, complete with CPU registers and RAM restored from the saved
+state.
+
+Snapshot files always select the 48K model today. If you need 128K machine
+state, load the ROM normally and use tape images until broader snapshot formats
+are implemented.
 
 ## Controls
 The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary host-to-Spectrum key mapping is:
@@ -182,9 +207,9 @@ Additional host shortcuts:
 - F11 or Alt+Enter toggles fullscreen mode.
 
 ## Roadmap
-- **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
-  block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
-  `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
+- **Snapshot enhancements** – Broaden the new snapshot loader with 128K `.sna`
+  variants and additional hardware models so every machine can benefit from
+  quick-start images.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
 - **Automation and CI** – Expand the new Linux CI pipeline with Windows builds and long-running cassette regressions so audio,

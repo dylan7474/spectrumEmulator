@@ -135,10 +135,37 @@ static const int TAPE_HEADER_PILOT_COUNT = 8063;
 static const int TAPE_DATA_PILOT_COUNT = 3223;
 static const uint64_t TAPE_SILENCE_THRESHOLD_TSTATES = 350000ULL; // 0.1 second
 
+typedef enum {
+    TAPE_BLOCK_TYPE_STANDARD,
+    TAPE_BLOCK_TYPE_TURBO,
+    TAPE_BLOCK_TYPE_PURE_DATA,
+    TAPE_BLOCK_TYPE_PURE_TONE,
+    TAPE_BLOCK_TYPE_PULSE_SEQUENCE,
+    TAPE_BLOCK_TYPE_DIRECT_RECORDING
+} TapeBlockType;
+
 typedef struct {
+    TapeBlockType type;
     uint8_t* data;
     uint32_t length;
     uint32_t pause_ms;
+    uint8_t used_bits_in_last_byte;
+    uint16_t pilot_pulse_tstates;
+    uint32_t pilot_pulse_count;
+    uint16_t sync_first_pulse_tstates;
+    uint16_t sync_second_pulse_tstates;
+    uint16_t bit0_first_pulse_tstates;
+    uint16_t bit0_second_pulse_tstates;
+    uint16_t bit1_first_pulse_tstates;
+    uint16_t bit1_second_pulse_tstates;
+    uint16_t tone_pulse_tstates;
+    uint32_t tone_pulse_count;
+    uint16_t* pulse_sequence_durations;
+    size_t pulse_sequence_count;
+    uint32_t direct_tstates_per_sample;
+    uint8_t* direct_samples;
+    uint32_t direct_sample_count;
+    int direct_initial_level;
 } TapeBlock;
 
 typedef struct {
@@ -165,6 +192,14 @@ typedef enum {
     TAPE_FORMAT_TZX,
     TAPE_FORMAT_WAV
 } TapeFormat;
+
+typedef enum {
+    SNAPSHOT_FORMAT_NONE,
+    SNAPSHOT_FORMAT_SNA,
+    SNAPSHOT_FORMAT_Z80
+} SnapshotFormat;
+
+typedef struct Z80 Z80;
 
 typedef enum {
     TAPE_PHASE_IDLE,
@@ -358,9 +393,15 @@ static int* ula_instruction_progress_ptr = NULL;
 
 static TapeFormat tape_input_format = TAPE_FORMAT_NONE;
 static const char* tape_input_path = NULL;
+static SnapshotFormat snapshot_input_format = SNAPSHOT_FORMAT_NONE;
+static const char* snapshot_input_path = NULL;
 
 static int string_ends_with_case_insensitive(const char* str, const char* suffix);
 static TapeFormat tape_format_from_extension(const char* path);
+static SnapshotFormat snapshot_format_from_extension(const char* path);
+static int snapshot_load_sna(const char* path, Z80* cpu);
+static int snapshot_load_z80(const char* path, Z80* cpu);
+static int snapshot_load(const char* path, SnapshotFormat format, Z80* cpu);
 static int tape_load_image(const char* path, TapeFormat format, TapeImage* image);
 static void tape_free_image(TapeImage* image);
 static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t length, uint32_t pause_ms);
@@ -374,6 +415,7 @@ static void tape_update(uint64_t current_t_state);
 static int tape_current_block_pilot_count(const TapePlaybackState* state);
 static void tape_waveform_reset(TapeWaveform* waveform);
 static int tape_waveform_add_pulse(TapeWaveform* waveform, uint64_t duration);
+static int tape_waveform_add_with_pending(TapeWaveform* waveform, uint64_t duration, uint64_t* pending_silence);
 static int tape_generate_waveform_from_image(const TapeImage* image, TapeWaveform* waveform);
 static int tape_load_wav(const char* path, TapePlaybackState* state);
 static int tape_create_blank_wav(const char* path, uint32_t sample_rate);
@@ -1219,62 +1261,82 @@ static void tape_log_block_summary(const TapeBlock* block, size_t index) {
         return;
     }
 
-    tape_log("Block %zu: length=%u pause=%u", index, block->length, block->pause_ms);
-    if (!block->data || block->length == 0) {
-        tape_log(" (empty)\n");
-        return;
-    }
+    tape_log("Block %zu: type=%d length=%u pause=%u", index, (int)block->type, block->length, block->pause_ms);
 
-    uint8_t flag = block->data[0];
-    tape_log(" flag=0x%02X", flag);
-
-    if (flag == 0x00 && block->length >= 19) {
-        uint8_t header_type = block->data[1];
-        char name[11];
-        size_t copy_len = 10u;
-        size_t available = 0u;
-        if (block->length > 2u) {
-            available = block->length - 2u;
-        }
-        if (available < copy_len) {
-            copy_len = available;
-        }
-        memset(name, '\0', sizeof(name));
-        if (copy_len > 0u) {
-            memcpy(name, &block->data[2], copy_len);
-            for (size_t i = 0; i < copy_len; ++i) {
-                if ((unsigned char)name[i] < 32u || (unsigned char)name[i] > 126u) {
-                    name[i] = '?';
-                }
+    switch (block->type) {
+        case TAPE_BLOCK_TYPE_STANDARD:
+        case TAPE_BLOCK_TYPE_TURBO:
+        case TAPE_BLOCK_TYPE_PURE_DATA:
+            if (!block->data || block->length == 0) {
+                tape_log(" (empty)\n");
+                return;
             }
-            for (int i = (int)copy_len - 1; i >= 0; --i) {
-                if (name[i] == ' ') {
-                    name[i] = '\0';
-                } else {
-                    break;
+
+            uint8_t flag = block->data[0];
+            tape_log(" flag=0x%02X", flag);
+
+            if (flag == 0x00 && block->length >= 19) {
+                uint8_t header_type = block->data[1];
+                char name[11];
+                size_t copy_len = 10u;
+                size_t available = 0u;
+                if (block->length > 2u) {
+                    available = block->length - 2u;
                 }
+                if (available < copy_len) {
+                    copy_len = available;
+                }
+                memset(name, '\0', sizeof(name));
+                if (copy_len > 0u) {
+                    memcpy(name, &block->data[2], copy_len);
+                    for (size_t i = 0; i < copy_len; ++i) {
+                        if ((unsigned char)name[i] < 32u || (unsigned char)name[i] > 126u) {
+                            name[i] = '?';
+                        }
+                    }
+                    for (int i = (int)copy_len - 1; i >= 0; --i) {
+                        if (name[i] == ' ') {
+                            name[i] = '\0';
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                uint16_t data_length = (uint16_t)block->data[12] | ((uint16_t)block->data[13] << 8);
+                uint16_t param1 = (uint16_t)block->data[14] | ((uint16_t)block->data[15] << 8);
+                uint16_t param2 = (uint16_t)block->data[16] | ((uint16_t)block->data[17] << 8);
+                tape_log(" header=%s name='%s' data_len=%u param1=%u param2=%u\n",
+                         tape_header_type_name(header_type),
+                         name,
+                         data_length,
+                         param1,
+                         param2);
+                return;
             }
-        }
-        uint16_t data_length = (uint16_t)block->data[12] | ((uint16_t)block->data[13] << 8);
-        uint16_t param1 = (uint16_t)block->data[14] | ((uint16_t)block->data[15] << 8);
-        uint16_t param2 = (uint16_t)block->data[16] | ((uint16_t)block->data[17] << 8);
-        tape_log(" header=%s name='%s' data_len=%u param1=%u param2=%u\n",
-                 tape_header_type_name(header_type),
-                 name,
-                 data_length,
-                 param1,
-                 param2);
-        return;
-    }
 
-    if (flag == 0xFF && block->length >= 2) {
-        uint32_t payload_length = block->length - 2u;
-        uint8_t checksum = block->data[block->length - 1];
-        tape_log(" data payload_len=%u checksum=0x%02X\n", payload_length, checksum);
-        return;
-    }
+            if (flag == 0xFF && block->length >= 2) {
+                uint32_t payload_length = block->length - 2u;
+                uint8_t checksum = block->data[block->length - 1];
+                tape_log(" data payload_len=%u checksum=0x%02X\n", payload_length, checksum);
+                return;
+            }
 
-    tape_log("\n");
+            tape_log("\n");
+            return;
+        case TAPE_BLOCK_TYPE_PURE_TONE:
+            tape_log(" tone pulses=%u length=%u\n",
+                     (unsigned)block->tone_pulse_count,
+                     (unsigned)block->tone_pulse_tstates);
+            return;
+        case TAPE_BLOCK_TYPE_PULSE_SEQUENCE:
+            tape_log(" pulse-seq count=%zu\n", block->pulse_sequence_count);
+            return;
+        case TAPE_BLOCK_TYPE_DIRECT_RECORDING:
+            tape_log(" direct samples=%u tstates/sample=%u\n",
+                     (unsigned)block->direct_sample_count,
+                     (unsigned)block->direct_tstates_per_sample);
+            return;
+    }
 }
 
 static void tape_free_image(TapeImage* image) {
@@ -1285,6 +1347,10 @@ static void tape_free_image(TapeImage* image) {
         for (size_t i = 0; i < image->count; ++i) {
             free(image->blocks[i].data);
             image->blocks[i].data = NULL;
+            free(image->blocks[i].pulse_sequence_durations);
+            image->blocks[i].pulse_sequence_durations = NULL;
+            free(image->blocks[i].direct_samples);
+            image->blocks[i].direct_samples = NULL;
         }
         free(image->blocks);
     }
@@ -1293,25 +1359,55 @@ static void tape_free_image(TapeImage* image) {
     image->capacity = 0;
 }
 
-static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t length, uint32_t pause_ms) {
+static TapeBlock* tape_image_new_block(TapeImage* image) {
     if (!image) {
-        return 0;
+        return NULL;
     }
 
     if (image->count == image->capacity) {
         size_t new_capacity = image->capacity ? image->capacity * 2 : 8;
         TapeBlock* new_blocks = (TapeBlock*)realloc(image->blocks, new_capacity * sizeof(TapeBlock));
         if (!new_blocks) {
-            return 0;
+            return NULL;
         }
         image->blocks = new_blocks;
         image->capacity = new_capacity;
     }
 
     TapeBlock* block = &image->blocks[image->count];
+    block->type = TAPE_BLOCK_TYPE_STANDARD;
+    block->length = 0u;
+    block->pause_ms = 0u;
+    block->data = NULL;
+    block->used_bits_in_last_byte = 8u;
+    block->pilot_pulse_tstates = (uint16_t)TAPE_PILOT_PULSE_TSTATES;
+    block->pilot_pulse_count = 0u;
+    block->sync_first_pulse_tstates = (uint16_t)TAPE_SYNC_FIRST_PULSE_TSTATES;
+    block->sync_second_pulse_tstates = (uint16_t)TAPE_SYNC_SECOND_PULSE_TSTATES;
+    block->bit0_first_pulse_tstates = (uint16_t)TAPE_BIT0_PULSE_TSTATES;
+    block->bit0_second_pulse_tstates = (uint16_t)TAPE_BIT0_PULSE_TSTATES;
+    block->bit1_first_pulse_tstates = (uint16_t)TAPE_BIT1_PULSE_TSTATES;
+    block->bit1_second_pulse_tstates = (uint16_t)TAPE_BIT1_PULSE_TSTATES;
+    block->tone_pulse_tstates = 0u;
+    block->tone_pulse_count = 0u;
+    block->pulse_sequence_durations = NULL;
+    block->pulse_sequence_count = 0u;
+    block->direct_tstates_per_sample = 0u;
+    block->direct_samples = NULL;
+    block->direct_sample_count = 0u;
+    block->direct_initial_level = 1;
+    return block;
+}
+
+static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t length, uint32_t pause_ms) {
+    TapeBlock* block = tape_image_new_block(image);
+    if (!block) {
+        return 0;
+    }
+
+    block->type = TAPE_BLOCK_TYPE_STANDARD;
     block->length = length;
     block->pause_ms = pause_ms;
-    block->data = NULL;
 
     if (length > 0) {
         block->data = (uint8_t*)malloc(length);
@@ -1319,6 +1415,160 @@ static int tape_image_add_block(TapeImage* image, const uint8_t* data, uint32_t 
             return 0;
         }
         memcpy(block->data, data, length);
+    }
+
+    tape_log_block_summary(block, image->count);
+    image->count++;
+    return 1;
+}
+
+static int tape_image_add_turbo_block(TapeImage* image,
+                                      const uint8_t* data,
+                                      uint32_t length,
+                                      uint32_t pause_ms,
+                                      uint16_t pilot_pulse_tstates,
+                                      uint32_t pilot_pulses,
+                                      uint16_t sync1_tstates,
+                                      uint16_t sync2_tstates,
+                                      uint16_t bit0_first,
+                                      uint16_t bit0_second,
+                                      uint16_t bit1_first,
+                                      uint16_t bit1_second,
+                                      uint8_t used_bits) {
+    TapeBlock* block = tape_image_new_block(image);
+    if (!block) {
+        return 0;
+    }
+
+    block->type = TAPE_BLOCK_TYPE_TURBO;
+    block->length = length;
+    block->pause_ms = pause_ms;
+    block->pilot_pulse_tstates = pilot_pulse_tstates;
+    block->pilot_pulse_count = pilot_pulses;
+    block->sync_first_pulse_tstates = sync1_tstates;
+    block->sync_second_pulse_tstates = sync2_tstates;
+    block->bit0_first_pulse_tstates = bit0_first;
+    block->bit0_second_pulse_tstates = bit0_second;
+    block->bit1_first_pulse_tstates = bit1_first;
+    block->bit1_second_pulse_tstates = bit1_second;
+    block->used_bits_in_last_byte = (used_bits == 0u) ? 8u : used_bits;
+
+    if (length > 0u) {
+        block->data = (uint8_t*)malloc(length);
+        if (!block->data) {
+            return 0;
+        }
+        memcpy(block->data, data, length);
+    }
+
+    tape_log_block_summary(block, image->count);
+    image->count++;
+    return 1;
+}
+
+static int tape_image_add_pure_data_block(TapeImage* image,
+                                          const uint8_t* data,
+                                          uint32_t length,
+                                          uint32_t pause_ms,
+                                          uint16_t bit0_first,
+                                          uint16_t bit0_second,
+                                          uint16_t bit1_first,
+                                          uint16_t bit1_second,
+                                          uint8_t used_bits) {
+    return tape_image_add_turbo_block(image,
+                                      data,
+                                      length,
+                                      pause_ms,
+                                      0u,
+                                      0u,
+                                      0u,
+                                      0u,
+                                      bit0_first,
+                                      bit0_second,
+                                      bit1_first,
+                                      bit1_second,
+                                      used_bits);
+}
+
+static int tape_image_add_pure_tone_block(TapeImage* image,
+                                          uint16_t pulse_tstates,
+                                          uint32_t pulse_count,
+                                          uint32_t pause_ms) {
+    TapeBlock* block = tape_image_new_block(image);
+    if (!block) {
+        return 0;
+    }
+
+    block->type = TAPE_BLOCK_TYPE_PURE_TONE;
+    block->tone_pulse_tstates = pulse_tstates;
+    block->tone_pulse_count = pulse_count;
+    block->pause_ms = pause_ms;
+
+    tape_log_block_summary(block, image->count);
+    image->count++;
+    return 1;
+}
+
+static int tape_image_add_pulse_sequence_block(TapeImage* image,
+                                               const uint16_t* durations,
+                                               size_t count,
+                                               uint32_t pause_ms) {
+    TapeBlock* block = tape_image_new_block(image);
+    if (!block) {
+        return 0;
+    }
+
+    block->type = TAPE_BLOCK_TYPE_PULSE_SEQUENCE;
+    block->pause_ms = pause_ms;
+
+    if (count > 0u) {
+        size_t bytes = count * sizeof(uint16_t);
+        block->pulse_sequence_durations = (uint16_t*)malloc(bytes);
+        if (!block->pulse_sequence_durations) {
+            return 0;
+        }
+        memcpy(block->pulse_sequence_durations, durations, bytes);
+        block->pulse_sequence_count = count;
+    }
+
+    tape_log_block_summary(block, image->count);
+    image->count++;
+    return 1;
+}
+
+static int tape_image_add_direct_recording_block(TapeImage* image,
+                                                 uint32_t tstates_per_sample,
+                                                 const uint8_t* samples,
+                                                 uint32_t sample_bytes,
+                                                 uint8_t used_bits,
+                                                 uint32_t pause_ms) {
+    TapeBlock* block = tape_image_new_block(image);
+    if (!block) {
+        return 0;
+    }
+
+    block->type = TAPE_BLOCK_TYPE_DIRECT_RECORDING;
+    block->pause_ms = pause_ms;
+    block->direct_tstates_per_sample = tstates_per_sample;
+    block->used_bits_in_last_byte = (used_bits == 0u) ? 8u : used_bits;
+
+    if (sample_bytes > 0u) {
+        block->direct_samples = (uint8_t*)malloc(sample_bytes);
+        if (!block->direct_samples) {
+            return 0;
+        }
+        memcpy(block->direct_samples, samples, sample_bytes);
+    }
+
+    uint32_t total_bits = sample_bytes * 8u;
+    if (sample_bytes > 0u && block->used_bits_in_last_byte < 8u) {
+        total_bits -= (uint32_t)(8u - block->used_bits_in_last_byte);
+    }
+    block->direct_sample_count = total_bits;
+    if (block->direct_sample_count > 0u && block->direct_samples) {
+        block->direct_initial_level = (block->direct_samples[0] & 0x80u) ? 1 : 0;
+    } else {
+        block->direct_initial_level = 0;
     }
 
     tape_log_block_summary(block, image->count);
@@ -1361,6 +1611,16 @@ static int tape_waveform_add_pulse(TapeWaveform* waveform, uint64_t duration) {
     return 1;
 }
 
+static int tape_waveform_add_with_pending(TapeWaveform* waveform,
+                                          uint64_t duration,
+                                          uint64_t* pending_silence) {
+    if (pending_silence && *pending_silence) {
+        duration += *pending_silence;
+        *pending_silence = 0;
+    }
+    return tape_waveform_add_pulse(waveform, duration);
+}
+
 static int tape_generate_waveform_from_image(const TapeImage* image, TapeWaveform* waveform) {
     if (!image || !waveform) {
         return 0;
@@ -1375,57 +1635,136 @@ static int tape_generate_waveform_from_image(const TapeImage* image, TapeWavefor
     }
 
     uint64_t pending_silence = 0;
+    if (waveform->count == 0) {
+        waveform->initial_level = 1;
+    }
     for (size_t block_index = 0; block_index < image->count; ++block_index) {
         const TapeBlock* block = &image->blocks[block_index];
-        int pilot_count = TAPE_DATA_PILOT_COUNT;
-        if (block->length > 0 && block->data && block->data[0] == 0x00) {
-            pilot_count = TAPE_HEADER_PILOT_COUNT;
-        }
+        switch (block->type) {
+            case TAPE_BLOCK_TYPE_STANDARD:
+            case TAPE_BLOCK_TYPE_TURBO:
+            case TAPE_BLOCK_TYPE_PURE_DATA: {
+                uint32_t pilot_count = 0u;
+                uint16_t pilot_pulse = block->pilot_pulse_tstates;
+                uint16_t sync1 = block->sync_first_pulse_tstates;
+                uint16_t sync2 = block->sync_second_pulse_tstates;
+                uint16_t bit0_first = block->bit0_first_pulse_tstates;
+                uint16_t bit0_second = block->bit0_second_pulse_tstates;
+                uint16_t bit1_first = block->bit1_first_pulse_tstates;
+                uint16_t bit1_second = block->bit1_second_pulse_tstates;
 
-        for (int pulse = 0; pulse < pilot_count; ++pulse) {
-            uint64_t duration = (uint64_t)TAPE_PILOT_PULSE_TSTATES;
-            if (pending_silence) {
-                duration += pending_silence;
-                pending_silence = 0;
-            }
-            if (!tape_waveform_add_pulse(waveform, duration)) {
-                return 0;
-            }
-        }
-
-        uint64_t duration = (uint64_t)TAPE_SYNC_FIRST_PULSE_TSTATES;
-        if (pending_silence) {
-            duration += pending_silence;
-            pending_silence = 0;
-        }
-        if (!tape_waveform_add_pulse(waveform, duration)) {
-            return 0;
-        }
-
-        duration = (uint64_t)TAPE_SYNC_SECOND_PULSE_TSTATES;
-        if (!tape_waveform_add_pulse(waveform, duration)) {
-            return 0;
-        }
-
-        if (block->length > 0 && block->data) {
-            for (uint32_t byte_index = 0; byte_index < block->length; ++byte_index) {
-                uint8_t value = block->data[byte_index];
-                uint8_t mask = 0x80u;
-                for (int bit = 0; bit < 8; ++bit) {
-                    int is_one = (value & mask) ? 1 : 0;
-                    uint64_t pulse = (uint64_t)(is_one ? TAPE_BIT1_PULSE_TSTATES : TAPE_BIT0_PULSE_TSTATES);
-                    if (pending_silence) {
-                        pulse += pending_silence;
-                        pending_silence = 0;
+                if (block->type == TAPE_BLOCK_TYPE_STANDARD) {
+                    if (block->length > 0 && block->data && block->data[0] == 0x00) {
+                        pilot_count = (uint32_t)TAPE_HEADER_PILOT_COUNT;
+                    } else {
+                        pilot_count = (uint32_t)TAPE_DATA_PILOT_COUNT;
                     }
-                    if (!tape_waveform_add_pulse(waveform, pulse)) {
-                        return 0;
-                    }
-                    if (!tape_waveform_add_pulse(waveform, pulse)) {
-                        return 0;
-                    }
-                    mask >>= 1;
+                    pilot_pulse = (uint16_t)TAPE_PILOT_PULSE_TSTATES;
+                    sync1 = (uint16_t)TAPE_SYNC_FIRST_PULSE_TSTATES;
+                    sync2 = (uint16_t)TAPE_SYNC_SECOND_PULSE_TSTATES;
+                    bit0_first = (uint16_t)TAPE_BIT0_PULSE_TSTATES;
+                    bit0_second = (uint16_t)TAPE_BIT0_PULSE_TSTATES;
+                    bit1_first = (uint16_t)TAPE_BIT1_PULSE_TSTATES;
+                    bit1_second = (uint16_t)TAPE_BIT1_PULSE_TSTATES;
+                } else {
+                    pilot_count = block->pilot_pulse_count;
                 }
+
+                for (uint32_t pulse = 0; pulse < pilot_count; ++pulse) {
+                    uint64_t duration = (uint64_t)pilot_pulse;
+                    if (!tape_waveform_add_with_pending(waveform, duration, &pending_silence)) {
+                        return 0;
+                    }
+                }
+
+                if (sync1 > 0u) {
+                    if (!tape_waveform_add_with_pending(waveform, (uint64_t)sync1, &pending_silence)) {
+                        return 0;
+                    }
+                }
+
+                if (sync2 > 0u) {
+                    if (!tape_waveform_add_pulse(waveform, (uint64_t)sync2)) {
+                        return 0;
+                    }
+                }
+
+                if (block->length > 0 && block->data) {
+                    for (uint32_t byte_index = 0; byte_index < block->length; ++byte_index) {
+                        uint8_t value = block->data[byte_index];
+                        uint8_t mask = 0x80u;
+                        uint8_t bits_to_emit = 8u;
+                        if (byte_index == block->length - 1u) {
+                            uint8_t used_bits = block->used_bits_in_last_byte;
+                            if (used_bits > 0u && used_bits < 8u) {
+                                bits_to_emit = used_bits;
+                            }
+                        }
+                        for (uint8_t bit = 0u; bit < bits_to_emit; ++bit) {
+                            int is_one = (value & mask) ? 1 : 0;
+                            uint16_t first = is_one ? bit1_first : bit0_first;
+                            uint16_t second = is_one ? bit1_second : bit0_second;
+                            if (!tape_waveform_add_with_pending(waveform, (uint64_t)first, &pending_silence)) {
+                                return 0;
+                            }
+                            if (!tape_waveform_add_pulse(waveform, (uint64_t)second)) {
+                                return 0;
+                            }
+                            mask >>= 1;
+                        }
+                    }
+                }
+                break;
+            }
+            case TAPE_BLOCK_TYPE_PURE_TONE: {
+                uint32_t pulse_count = block->tone_pulse_count;
+                for (uint32_t i = 0; i < pulse_count; ++i) {
+                    if (!tape_waveform_add_with_pending(waveform, (uint64_t)block->tone_pulse_tstates, &pending_silence)) {
+                        return 0;
+                    }
+                }
+                break;
+            }
+            case TAPE_BLOCK_TYPE_PULSE_SEQUENCE: {
+                for (size_t i = 0; i < block->pulse_sequence_count; ++i) {
+                    uint64_t duration = (uint64_t)block->pulse_sequence_durations[i];
+                    if (!tape_waveform_add_with_pending(waveform, duration, &pending_silence)) {
+                        return 0;
+                    }
+                }
+                break;
+            }
+            case TAPE_BLOCK_TYPE_DIRECT_RECORDING: {
+                if (block->direct_sample_count > 0u && block->direct_samples) {
+                    uint32_t samples = block->direct_sample_count;
+                    uint32_t tstates_per_sample = block->direct_tstates_per_sample ? block->direct_tstates_per_sample : 1u;
+                    int current_level = block->direct_initial_level ? 1 : 0;
+                    if (waveform->count == 0) {
+                        waveform->initial_level = current_level;
+                    }
+                    uint64_t run_length = 0;
+                    for (uint32_t sample_index = 0; sample_index < samples; ++sample_index) {
+                        uint32_t byte_index = sample_index / 8u;
+                        uint32_t bit_index = 7u - (sample_index % 8u);
+                        int level = (block->direct_samples[byte_index] >> bit_index) & 0x01;
+                        if (sample_index == 0) {
+                            current_level = level;
+                            run_length = (uint64_t)tstates_per_sample;
+                            continue;
+                        }
+                        if (level == current_level) {
+                            run_length += (uint64_t)tstates_per_sample;
+                        } else {
+                            if (!tape_waveform_add_with_pending(waveform, run_length, &pending_silence)) {
+                                return 0;
+                            }
+                            current_level = level;
+                            run_length = (uint64_t)tstates_per_sample;
+                        }
+                    }
+                    pending_silence += run_length;
+                }
+                break;
             }
         }
 
@@ -1529,7 +1868,7 @@ static int tape_load_tzx(const char* path, TapeImage* image) {
             uint32_t block_length = (uint32_t)length_bytes[0] | ((uint32_t)length_bytes[1] << 8);
 
             uint8_t* buffer = NULL;
-            if (block_length > 0) {
+            if (block_length > 0u) {
                 buffer = (uint8_t*)malloc(block_length);
                 if (!buffer) {
                     fprintf(stderr, "Out of memory while reading TZX block\n");
@@ -1545,7 +1884,7 @@ static int tape_load_tzx(const char* path, TapeImage* image) {
             }
 
             if (buffer) {
-                if (!tape_image_add_block(image, buffer, block_length, pause_ms)) {
+                if (!tape_image_add_block(image, buffer, block_length, pause_ms == 0xFFFFu ? 0u : pause_ms)) {
                     fprintf(stderr, "Failed to store TZX block\n");
                     free(buffer);
                     fclose(tf);
@@ -1554,12 +1893,240 @@ static int tape_load_tzx(const char* path, TapeImage* image) {
                 free(buffer);
             } else {
                 uint8_t empty = 0;
-                if (!tape_image_add_block(image, &empty, 0u, pause_ms)) {
+                if (!tape_image_add_block(image, &empty, 0u, pause_ms == 0xFFFFu ? 0u : pause_ms)) {
                     fprintf(stderr, "Failed to store empty TZX block\n");
                     fclose(tf);
                     return 0;
                 }
             }
+        } else if (block_id == 0x11) {
+            uint8_t header_bytes[16];
+            if (fread(header_bytes, sizeof(header_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX turbo data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint16_t pilot_pulse = (uint16_t)header_bytes[0] | ((uint16_t)header_bytes[1] << 8);
+            uint16_t sync1 = (uint16_t)header_bytes[2] | ((uint16_t)header_bytes[3] << 8);
+            uint16_t sync2 = (uint16_t)header_bytes[4] | ((uint16_t)header_bytes[5] << 8);
+            uint16_t bit0_first = (uint16_t)header_bytes[6] | ((uint16_t)header_bytes[7] << 8);
+            uint16_t bit0_second = (uint16_t)header_bytes[8] | ((uint16_t)header_bytes[9] << 8);
+            uint16_t bit1_first = (uint16_t)header_bytes[10] | ((uint16_t)header_bytes[11] << 8);
+            uint16_t bit1_second = (uint16_t)header_bytes[12] | ((uint16_t)header_bytes[13] << 8);
+            uint16_t pilot_count = (uint16_t)header_bytes[14] | ((uint16_t)header_bytes[15] << 8);
+            int used_bits = fgetc(tf);
+            if (used_bits == EOF) {
+                fprintf(stderr, "Truncated TZX turbo data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint8_t pause_bytes[2];
+            if (fread(pause_bytes, sizeof(pause_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX turbo data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint8_t length_bytes[3];
+            if (fread(length_bytes, sizeof(length_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX turbo data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint32_t pause_ms = (uint32_t)pause_bytes[0] | ((uint32_t)pause_bytes[1] << 8);
+            uint32_t block_length = (uint32_t)length_bytes[0] |
+                                    ((uint32_t)length_bytes[1] << 8) |
+                                    ((uint32_t)length_bytes[2] << 16);
+            uint8_t* buffer = NULL;
+            if (block_length > 0u) {
+                buffer = (uint8_t*)malloc(block_length);
+                if (!buffer) {
+                    fprintf(stderr, "Out of memory while reading TZX turbo block\n");
+                    fclose(tf);
+                    return 0;
+                }
+                if (fread(buffer, block_length, 1, tf) != 1) {
+                    fprintf(stderr, "Failed to read TZX turbo block payload\n");
+                    free(buffer);
+                    fclose(tf);
+                    return 0;
+                }
+            }
+            if (!tape_image_add_turbo_block(image,
+                                            buffer,
+                                            block_length,
+                                            pause_ms == 0xFFFFu ? 0u : pause_ms,
+                                            pilot_pulse,
+                                            pilot_count,
+                                            sync1,
+                                            sync2,
+                                            bit0_first,
+                                            bit0_second,
+                                            bit1_first,
+                                            bit1_second,
+                                            (uint8_t)(used_bits & 0xFF))) {
+                fprintf(stderr, "Failed to store TZX turbo block\n");
+                free(buffer);
+                fclose(tf);
+                return 0;
+            }
+            free(buffer);
+        } else if (block_id == 0x12) {
+            uint8_t tone_bytes[4];
+            if (fread(tone_bytes, sizeof(tone_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX pure tone block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint16_t pulse_length = (uint16_t)tone_bytes[0] | ((uint16_t)tone_bytes[1] << 8);
+            uint16_t pulse_count = (uint16_t)tone_bytes[2] | ((uint16_t)tone_bytes[3] << 8);
+            if (!tape_image_add_pure_tone_block(image, pulse_length, pulse_count, 0u)) {
+                fprintf(stderr, "Failed to store TZX pure tone block\n");
+                fclose(tf);
+                return 0;
+            }
+        } else if (block_id == 0x13) {
+            int pulse_count = fgetc(tf);
+            if (pulse_count == EOF) {
+                fprintf(stderr, "Truncated TZX pulse sequence block\n");
+                fclose(tf);
+                return 0;
+            }
+            if (pulse_count == 0) {
+                continue;
+            }
+            size_t count = (size_t)(pulse_count & 0xFF);
+            uint16_t* durations = (uint16_t*)malloc(count * sizeof(uint16_t));
+            if (!durations) {
+                fprintf(stderr, "Out of memory while reading pulse sequence\n");
+                fclose(tf);
+                return 0;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                uint8_t duration_bytes[2];
+                if (fread(duration_bytes, sizeof(duration_bytes), 1, tf) != 1) {
+                    fprintf(stderr, "Truncated TZX pulse sequence block\n");
+                    free(durations);
+                    fclose(tf);
+                    return 0;
+                }
+                durations[i] = (uint16_t)duration_bytes[0] | ((uint16_t)duration_bytes[1] << 8);
+            }
+            if (!tape_image_add_pulse_sequence_block(image, durations, count, 0u)) {
+                fprintf(stderr, "Failed to store TZX pulse sequence block\n");
+                free(durations);
+                fclose(tf);
+                return 0;
+            }
+            free(durations);
+        } else if (block_id == 0x14) {
+            uint8_t header_bytes[8];
+            if (fread(header_bytes, sizeof(header_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX pure data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint16_t bit0_first = (uint16_t)header_bytes[0] | ((uint16_t)header_bytes[1] << 8);
+            uint16_t bit0_second = (uint16_t)header_bytes[2] | ((uint16_t)header_bytes[3] << 8);
+            uint16_t bit1_first = (uint16_t)header_bytes[4] | ((uint16_t)header_bytes[5] << 8);
+            uint16_t bit1_second = (uint16_t)header_bytes[6] | ((uint16_t)header_bytes[7] << 8);
+            int used_bits = fgetc(tf);
+            if (used_bits == EOF) {
+                fprintf(stderr, "Truncated TZX pure data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint8_t pause_bytes[2];
+            if (fread(pause_bytes, sizeof(pause_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX pure data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint8_t length_bytes[3];
+            if (fread(length_bytes, sizeof(length_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX pure data block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint32_t pause_ms = (uint32_t)pause_bytes[0] | ((uint32_t)pause_bytes[1] << 8);
+            uint32_t block_length = (uint32_t)length_bytes[0] |
+                                    ((uint32_t)length_bytes[1] << 8) |
+                                    ((uint32_t)length_bytes[2] << 16);
+            uint8_t* buffer = NULL;
+            if (block_length > 0u) {
+                buffer = (uint8_t*)malloc(block_length);
+                if (!buffer) {
+                    fprintf(stderr, "Out of memory while reading TZX pure data block\n");
+                    fclose(tf);
+                    return 0;
+                }
+                if (fread(buffer, block_length, 1, tf) != 1) {
+                    fprintf(stderr, "Failed to read TZX pure data block payload\n");
+                    free(buffer);
+                    fclose(tf);
+                    return 0;
+                }
+            }
+            if (!tape_image_add_pure_data_block(image,
+                                                buffer,
+                                                block_length,
+                                                pause_ms == 0xFFFFu ? 0u : pause_ms,
+                                                bit0_first,
+                                                bit0_second,
+                                                bit1_first,
+                                                bit1_second,
+                                                (uint8_t)(used_bits & 0xFF))) {
+                fprintf(stderr, "Failed to store TZX pure data block\n");
+                free(buffer);
+                fclose(tf);
+                return 0;
+            }
+            free(buffer);
+        } else if (block_id == 0x15) {
+            uint8_t header_bytes[5];
+            if (fread(header_bytes, sizeof(header_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX direct recording block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint16_t sample_tstates = (uint16_t)header_bytes[0] | ((uint16_t)header_bytes[1] << 8);
+            uint16_t pause_ms = (uint16_t)header_bytes[2] | ((uint16_t)header_bytes[3] << 8);
+            uint8_t used_bits = header_bytes[4];
+            uint8_t length_bytes[3];
+            if (fread(length_bytes, sizeof(length_bytes), 1, tf) != 1) {
+                fprintf(stderr, "Truncated TZX direct recording block\n");
+                fclose(tf);
+                return 0;
+            }
+            uint32_t sample_bytes = (uint32_t)length_bytes[0] |
+                                     ((uint32_t)length_bytes[1] << 8) |
+                                     ((uint32_t)length_bytes[2] << 16);
+            uint8_t* buffer = NULL;
+            if (sample_bytes > 0u) {
+                buffer = (uint8_t*)malloc(sample_bytes);
+                if (!buffer) {
+                    fprintf(stderr, "Out of memory while reading TZX direct recording block\n");
+                    fclose(tf);
+                    return 0;
+                }
+                if (fread(buffer, sample_bytes, 1, tf) != 1) {
+                    fprintf(stderr, "Failed to read TZX direct recording block payload\n");
+                    free(buffer);
+                    fclose(tf);
+                    return 0;
+                }
+            }
+            if (!tape_image_add_direct_recording_block(image,
+                                                       sample_tstates,
+                                                       buffer,
+                                                       sample_bytes,
+                                                       used_bits,
+                                                       pause_ms == 0xFFFFu ? 0u : (uint32_t)pause_ms)) {
+                fprintf(stderr, "Failed to store TZX direct recording block\n");
+                free(buffer);
+                fclose(tf);
+                return 0;
+            }
+            free(buffer);
         } else {
             fprintf(stderr, "Unsupported TZX block type 0x%02X in '%s'\n", block_id, path);
             fclose(tf);
@@ -1569,6 +2136,415 @@ static int tape_load_tzx(const char* path, TapeImage* image) {
 
     fclose(tf);
     return 1;
+}
+
+static int z80_decompress_stream(FILE* sf, uint8_t* dest, size_t dest_size) {
+    if (!sf || !dest) {
+        return 0;
+    }
+
+    size_t dest_index = 0;
+    while (dest_index < dest_size) {
+        int byte_value = fgetc(sf);
+        if (byte_value == EOF) {
+            return 0;
+        }
+        if (byte_value != 0xED) {
+            dest[dest_index++] = (uint8_t)byte_value;
+            continue;
+        }
+
+        int next_value = fgetc(sf);
+        if (next_value == EOF) {
+            return 0;
+        }
+        if (next_value != 0xED) {
+            dest[dest_index++] = 0xED;
+            if (ungetc(next_value, sf) == EOF) {
+                return 0;
+            }
+            continue;
+        }
+
+        int count_value = fgetc(sf);
+        int data_value = fgetc(sf);
+        if (count_value == EOF || data_value == EOF) {
+            return 0;
+        }
+        size_t repeat = (count_value == 0) ? 256u : (size_t)count_value;
+        for (size_t i = 0; i < repeat; ++i) {
+            if (dest_index >= dest_size) {
+                return 0;
+            }
+            dest[dest_index++] = (uint8_t)data_value;
+        }
+    }
+
+    return 1;
+}
+
+static int z80_decompress_block_buffer(const uint8_t* src,
+                                       size_t src_len,
+                                       uint8_t* dest,
+                                       size_t dest_len) {
+    if (!src || !dest) {
+        return 0;
+    }
+
+    size_t src_index = 0;
+    size_t dest_index = 0;
+    while (dest_index < dest_len && src_index < src_len) {
+        uint8_t value = src[src_index++];
+        if (value != 0xED || src_index >= src_len) {
+            dest[dest_index++] = value;
+            continue;
+        }
+
+        uint8_t next = src[src_index];
+        if (next != 0xED) {
+            dest[dest_index++] = value;
+            continue;
+        }
+
+        src_index++;
+        if (src_index + 1 >= src_len) {
+            return 0;
+        }
+        uint8_t count_byte = src[src_index++];
+        uint8_t data_byte = src[src_index++];
+        size_t repeat = (count_byte == 0) ? 256u : (size_t)count_byte;
+        for (size_t i = 0; i < repeat; ++i) {
+            if (dest_index >= dest_len) {
+                return 0;
+            }
+            dest[dest_index++] = data_byte;
+        }
+    }
+
+    return dest_index == dest_len;
+}
+
+static SnapshotFormat snapshot_format_from_extension(const char* path) {
+    if (!path) {
+        return SNAPSHOT_FORMAT_NONE;
+    }
+
+    if (string_ends_with_case_insensitive(path, ".sna")) {
+        return SNAPSHOT_FORMAT_SNA;
+    }
+    if (string_ends_with_case_insensitive(path, ".z80")) {
+        return SNAPSHOT_FORMAT_Z80;
+    }
+
+    return SNAPSHOT_FORMAT_NONE;
+}
+
+static int snapshot_load_sna(const char* path, Z80* cpu) {
+    if (!path || !cpu) {
+        return 0;
+    }
+
+    FILE* sf = fopen(path, "rb");
+    if (!sf) {
+        fprintf(stderr, "Failed to open SNA snapshot '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t header[27];
+    if (fread(header, sizeof(header), 1, sf) != 1) {
+        fprintf(stderr, "Failed to read SNA header from '%s'\n", path);
+        fclose(sf);
+        return 0;
+    }
+
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+
+    cpu->reg_I = header[0];
+    uint16_t hl_alt = (uint16_t)header[1] | ((uint16_t)header[2] << 8);
+    uint16_t de_alt = (uint16_t)header[3] | ((uint16_t)header[4] << 8);
+    uint16_t bc_alt = (uint16_t)header[5] | ((uint16_t)header[6] << 8);
+    uint16_t af_alt = (uint16_t)header[7] | ((uint16_t)header[8] << 8);
+    uint16_t hl = (uint16_t)header[9] | ((uint16_t)header[10] << 8);
+    uint16_t de = (uint16_t)header[11] | ((uint16_t)header[12] << 8);
+    uint16_t bc = (uint16_t)header[13] | ((uint16_t)header[14] << 8);
+    uint16_t iy = (uint16_t)header[15] | ((uint16_t)header[16] << 8);
+    uint16_t ix = (uint16_t)header[17] | ((uint16_t)header[18] << 8);
+    uint8_t iff2 = header[19];
+    uint8_t r = header[20];
+    uint16_t af = (uint16_t)header[21] | ((uint16_t)header[22] << 8);
+    uint16_t sp = (uint16_t)header[23] | ((uint16_t)header[24] << 8);
+    uint8_t interrupt_mode = header[25];
+    uint8_t border = header[26] & 0x07u;
+
+    cpu->alt_reg_L = (uint8_t)(hl_alt & 0xFFu);
+    cpu->alt_reg_H = (uint8_t)(hl_alt >> 8);
+    cpu->alt_reg_E = (uint8_t)(de_alt & 0xFFu);
+    cpu->alt_reg_D = (uint8_t)(de_alt >> 8);
+    cpu->alt_reg_C = (uint8_t)(bc_alt & 0xFFu);
+    cpu->alt_reg_B = (uint8_t)(bc_alt >> 8);
+    cpu->alt_reg_F = (uint8_t)(af_alt & 0xFFu);
+    cpu->alt_reg_A = (uint8_t)(af_alt >> 8);
+
+    cpu->reg_L = (uint8_t)(hl & 0xFFu);
+    cpu->reg_H = (uint8_t)(hl >> 8);
+    cpu->reg_E = (uint8_t)(de & 0xFFu);
+    cpu->reg_D = (uint8_t)(de >> 8);
+    cpu->reg_C = (uint8_t)(bc & 0xFFu);
+    cpu->reg_B = (uint8_t)(bc >> 8);
+    cpu->reg_IY = iy;
+    cpu->reg_IX = ix;
+    cpu->iff2 = (iff2 & 0x01u) ? 1 : 0;
+    cpu->iff1 = cpu->iff2;
+    cpu->reg_R = r;
+    cpu->reg_F = (uint8_t)(af & 0xFFu);
+    cpu->reg_A = (uint8_t)(af >> 8);
+    cpu->reg_SP = sp;
+    cpu->interruptMode = (int)(interrupt_mode & 0x03u);
+    cpu->ei_delay = 0;
+    cpu->halted = 0;
+
+    border_color_idx = border;
+
+    uint8_t* ram_buffer = (uint8_t*)malloc(0xC000u);
+    if (!ram_buffer) {
+        fprintf(stderr, "Out of memory loading SNA snapshot\n");
+        fclose(sf);
+        return 0;
+    }
+
+    if (fread(ram_buffer, 0xC000u, 1, sf) != 1) {
+        fprintf(stderr, "Failed to read SNA RAM image from '%s'\n", path);
+        free(ram_buffer);
+        fclose(sf);
+        return 0;
+    }
+
+    uint8_t pc_bytes[2];
+    if (fread(pc_bytes, sizeof(pc_bytes), 1, sf) != 1) {
+        fprintf(stderr, "Failed to read SNA program counter from '%s'\n", path);
+        free(ram_buffer);
+        fclose(sf);
+        return 0;
+    }
+    uint16_t pc = (uint16_t)pc_bytes[0] | ((uint16_t)pc_bytes[1] << 8);
+    cpu->reg_PC = pc;
+
+    long current_pos = ftell(sf);
+    if (current_pos >= 0 && fseek(sf, 0, SEEK_END) == 0) {
+        long end_pos = ftell(sf);
+        if (end_pos > current_pos) {
+            fprintf(stderr, "SNA snapshot '%s' uses unsupported 128K extensions\n", path);
+            free(ram_buffer);
+            fclose(sf);
+            return 0;
+        }
+    }
+
+    memcpy(ram_pages[5], ram_buffer + 0x0000u, 0x4000u);
+    memcpy(ram_pages[2], ram_buffer + 0x4000u, 0x4000u);
+    memcpy(ram_pages[7], ram_buffer + 0x8000u, 0x4000u);
+    free(ram_buffer);
+    spectrum_apply_memory_configuration();
+
+    fclose(sf);
+    return 1;
+}
+
+static int snapshot_load_z80(const char* path, Z80* cpu) {
+    if (!path || !cpu) {
+        return 0;
+    }
+
+    FILE* sf = fopen(path, "rb");
+    if (!sf) {
+        fprintf(stderr, "Failed to open Z80 snapshot '%s': %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t header[30];
+    if (fread(header, sizeof(header), 1, sf) != 1) {
+        fprintf(stderr, "Failed to read Z80 header from '%s'\n", path);
+        fclose(sf);
+        return 0;
+    }
+
+    uint16_t pc = (uint16_t)header[6] | ((uint16_t)header[7] << 8);
+    uint16_t sp = (uint16_t)header[8] | ((uint16_t)header[9] << 8);
+    uint8_t flags = header[12];
+    uint8_t compressed_flag = header[13];
+
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+
+    cpu->reg_A = header[0];
+    cpu->reg_F = header[1];
+    cpu->reg_C = header[2];
+    cpu->reg_B = header[3];
+    cpu->reg_L = header[4];
+    cpu->reg_H = header[5];
+    cpu->reg_SP = sp;
+    cpu->reg_I = header[10];
+    cpu->reg_R = (uint8_t)((header[11] & 0x7Fu) | ((flags & 0x80u) ? 0x80u : 0u));
+    cpu->reg_E = header[14];
+    cpu->reg_D = header[15];
+    cpu->alt_reg_C = header[16];
+    cpu->alt_reg_B = header[17];
+    cpu->alt_reg_E = header[18];
+    cpu->alt_reg_D = header[19];
+    cpu->alt_reg_L = header[20];
+    cpu->alt_reg_H = header[21];
+    cpu->alt_reg_A = header[22];
+    cpu->alt_reg_F = header[23];
+    cpu->reg_IY = (uint16_t)header[24] | ((uint16_t)header[25] << 8);
+    cpu->reg_IX = (uint16_t)header[26] | ((uint16_t)header[27] << 8);
+    cpu->iff1 = (header[28] & 0x01u) ? 1 : 0;
+    cpu->iff2 = (header[29] & 0x01u) ? 1 : cpu->iff1;
+    cpu->interruptMode = 1;
+    cpu->ei_delay = 0;
+    cpu->halted = 0;
+
+    border_color_idx = flags & 0x07u;
+
+    uint8_t* ram_buffer = (uint8_t*)malloc(0xC000u);
+    if (!ram_buffer) {
+        fprintf(stderr, "Out of memory loading Z80 snapshot\n");
+        fclose(sf);
+        return 0;
+    }
+
+    if (pc != 0) {
+        if (compressed_flag) {
+            if (!z80_decompress_stream(sf, ram_buffer, 0xC000u)) {
+                fprintf(stderr, "Failed to decompress Z80 snapshot '%s'\n", path);
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
+        } else {
+            if (fread(ram_buffer, 0xC000u, 1, sf) != 1) {
+                fprintf(stderr, "Failed to read Z80 RAM image from '%s'\n", path);
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
+        }
+    } else {
+        uint8_t ext_len_bytes[2];
+        if (fread(ext_len_bytes, sizeof(ext_len_bytes), 1, sf) != 1) {
+            fprintf(stderr, "Failed to read Z80 extended header length from '%s'\n", path);
+            free(ram_buffer);
+            fclose(sf);
+            return 0;
+        }
+        uint16_t ext_len = (uint16_t)ext_len_bytes[0] | ((uint16_t)ext_len_bytes[1] << 8);
+        uint8_t* ext_header = NULL;
+        if (ext_len > 0u) {
+            ext_header = (uint8_t*)malloc(ext_len);
+            if (!ext_header) {
+                fprintf(stderr, "Out of memory reading Z80 extended header\n");
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
+            if (fread(ext_header, ext_len, 1, sf) != 1) {
+                fprintf(stderr, "Failed to read Z80 extended header from '%s'\n", path);
+                free(ext_header);
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
+        }
+
+        if (ext_header && ext_len >= 2u) {
+            pc = (uint16_t)ext_header[0] | ((uint16_t)ext_header[1] << 8);
+        }
+        uint8_t hardware_mode = (ext_header && ext_len >= 3u) ? ext_header[2] : 0u;
+        free(ext_header);
+
+        if (hardware_mode != 0u && hardware_mode != 1u) {
+            fprintf(stderr, "Z80 snapshot '%s' targets unsupported hardware mode %u\n", path, hardware_mode);
+            free(ram_buffer);
+            fclose(sf);
+            return 0;
+        }
+
+        size_t segments_loaded = 0u;
+        while (segments_loaded < 3u) {
+            uint8_t len_bytes[2];
+            if (fread(len_bytes, sizeof(len_bytes), 1, sf) != 1) {
+                fprintf(stderr, "Truncated Z80 memory block in '%s'\n", path);
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
+            uint16_t block_len = (uint16_t)len_bytes[0] | ((uint16_t)len_bytes[1] << 8);
+            int page_id = fgetc(sf);
+            if (page_id == EOF) {
+                fprintf(stderr, "Truncated Z80 memory block header in '%s'\n", path);
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
+
+            (void)page_id;
+
+            uint8_t* segment = ram_buffer + (segments_loaded * 0x4000u);
+            if (block_len == 0xFFFFu) {
+                if (fread(segment, 0x4000u, 1, sf) != 1) {
+                    fprintf(stderr, "Failed to read uncompressed block from '%s'\n", path);
+                    free(ram_buffer);
+                    fclose(sf);
+                    return 0;
+                }
+            } else {
+                uint8_t* block_data = (uint8_t*)malloc(block_len);
+                if (!block_data) {
+                    fprintf(stderr, "Out of memory reading Z80 block\n");
+                    free(ram_buffer);
+                    fclose(sf);
+                    return 0;
+                }
+                if (fread(block_data, block_len, 1, sf) != 1) {
+                    fprintf(stderr, "Failed to read Z80 block payload from '%s'\n", path);
+                    free(block_data);
+                    free(ram_buffer);
+                    fclose(sf);
+                    return 0;
+                }
+                if (!z80_decompress_block_buffer(block_data, block_len, segment, 0x4000u)) {
+                    fprintf(stderr, "Failed to decompress Z80 block from '%s'\n", path);
+                    free(block_data);
+                    free(ram_buffer);
+                    fclose(sf);
+                    return 0;
+                }
+                free(block_data);
+            }
+            segments_loaded++;
+        }
+    }
+
+    memcpy(ram_pages[5], ram_buffer + 0x0000u, 0x4000u);
+    memcpy(ram_pages[2], ram_buffer + 0x4000u, 0x4000u);
+    memcpy(ram_pages[7], ram_buffer + 0x8000u, 0x4000u);
+    free(ram_buffer);
+    spectrum_apply_memory_configuration();
+
+    cpu->reg_PC = pc;
+
+    fclose(sf);
+    return 1;
+}
+
+static int snapshot_load(const char* path, SnapshotFormat format, Z80* cpu) {
+    switch (format) {
+        case SNAPSHOT_FORMAT_SNA:
+            return snapshot_load_sna(path, cpu);
+        case SNAPSHOT_FORMAT_Z80:
+            return snapshot_load_z80(path, cpu);
+        default:
+            break;
+    }
+    return 0;
 }
 
 static int tape_create_blank_wav(const char* path, uint32_t sample_rate) {
@@ -6624,6 +7600,7 @@ static void print_usage(const char* prog) {
             "[--contention <48k|128k|plus2a|plus3>] "
             "[--peripheral <none|if1|plus3>] "
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
+            "[--snapshot <sna_or_z80>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
             "[--test-rom-dir <dir>] [--run-tests] [rom_file]\n",
             prog);
@@ -7083,6 +8060,8 @@ int main(int argc, char *argv[]) {
     int rom_provided = 0;
     int run_tests = 0;
     const char* test_rom_dir = "tests/roms";
+    Z80 cpu;
+    memset(&cpu, 0, sizeof(cpu));
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
@@ -7195,6 +8174,21 @@ int main(int argc, char *argv[]) {
             }
             tape_input_format = TAPE_FORMAT_WAV;
             tape_input_path = argv[++i];
+        } else if (strcmp(argv[i], "--snapshot") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            if (snapshot_input_format != SNAPSHOT_FORMAT_NONE) {
+                fprintf(stderr, "Only one snapshot image may be specified\n");
+                return 1;
+            }
+            snapshot_input_path = argv[++i];
+            snapshot_input_format = snapshot_format_from_extension(snapshot_input_path);
+            if (snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
+                fprintf(stderr, "Unsupported snapshot type for '%s'\n", snapshot_input_path);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--save-tap") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -7224,8 +8218,12 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--run-tests") == 0) {
             run_tests = 1;
         } else {
+            SnapshotFormat inferred_snapshot = snapshot_format_from_extension(argv[i]);
             TapeFormat inferred_format = tape_format_from_extension(argv[i]);
-            if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
+            if (inferred_snapshot != SNAPSHOT_FORMAT_NONE && snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
+                snapshot_input_format = inferred_snapshot;
+                snapshot_input_path = argv[i];
+            } else if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
                 tape_input_format = inferred_format;
                 tape_input_path = argv[i];
             } else if (!rom_filename) {
@@ -7309,6 +8307,14 @@ int main(int argc, char *argv[]) {
     spectrum_configure_model(spectrum_model);
     spectrum_map_rom_page(0u);
 
+    if (snapshot_input_format != SNAPSHOT_FORMAT_NONE && snapshot_input_path) {
+        if (!snapshot_load(snapshot_input_path, snapshot_input_format, &cpu)) {
+            free(rom_fallback_path);
+            return 1;
+        }
+        printf("Loaded snapshot %s\n", snapshot_input_path);
+    }
+
     printf("Loaded %zu bytes from %s\n", rom_read, rom_log_path);
     free(rom_fallback_path);
 
@@ -7357,8 +8363,15 @@ int main(int argc, char *argv[]) {
 
     if(!init_sdl()){tape_shutdown();cleanup_sdl();return 1;}
 
-    Z80 cpu={0}; cpu.reg_PC=0x0000; cpu.reg_SP=0xFFFF; cpu.iff1=0; cpu.iff2=0; cpu.interruptMode=1;
-    cpu.halted = 0; cpu.ei_delay = 0;
+    if (snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
+        cpu.reg_PC = 0x0000;
+        cpu.reg_SP = 0xFFFF;
+        cpu.iff1 = 0;
+        cpu.iff2 = 0;
+        cpu.interruptMode = 1;
+    }
+    cpu.halted = 0;
+    cpu.ei_delay = 0;
     total_t_states = 0;
 
     if (tape_input_enabled) {
