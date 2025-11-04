@@ -84,6 +84,15 @@ static SpectrumMemoryPage spectrum_pages[4] = {
 #define VRAM_START 0x4000
 #define ATTR_START 0x5800
 #define T_STATES_PER_FRAME 69888 // 3.5MHz / 50Hz (Spectrum CPU speed)
+#define BORDER_EVENT_CAPACITY 65536
+#define ULA_LINES_PER_FRAME 312
+#define ULA_T_STATES_PER_LINE 224
+#define ULA_VISIBLE_TOP_LINES 12
+#define ULA_VISIBLE_BOTTOM_LINES 12
+#define ULA_LEFT_BORDER_TSTATES 24
+#define ULA_DISPLAY_TSTATES 128
+#define ULA_RIGHT_BORDER_TSTATES 24
+#define ULA_LINE_VISIBLE_TSTATES (ULA_LEFT_BORDER_TSTATES + ULA_DISPLAY_TSTATES + ULA_RIGHT_BORDER_TSTATES)
 
 const double CPU_CLOCK_HZ = 3500000.0;
 
@@ -498,6 +507,8 @@ int cpu_interrupt(Z80* cpu, uint8_t data_bus);
 int cpu_nmi(Z80* cpu);
 int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
 void audio_callback(void* userdata, Uint8* stream, int len);
+static void border_record_event(uint64_t event_t_state, uint8_t color_idx);
+static void border_draw_span(uint64_t span_start, uint64_t span_end, uint8_t color_idx);
 static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t index);
 static void spectrum_apply_memory_configuration(void);
 static void spectrum_update_contention_flags(void);
@@ -906,6 +917,16 @@ void writeWord(uint16_t addr, uint16_t val) {
 
 // --- I/O Port Access Helpers ---
 uint8_t border_color_idx = 0;
+
+typedef struct {
+    uint64_t t_state;
+    uint8_t color_idx;
+} BorderColorEvent;
+
+static BorderColorEvent border_color_events[BORDER_EVENT_CAPACITY];
+static size_t border_color_event_count = 0;
+static uint64_t border_frame_start_tstate = 0;
+static uint8_t border_frame_color = 0;
 
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level) {
     beeper_event_head = 0;
@@ -6687,7 +6708,57 @@ void cleanup_sdl(void) {
 
 // --- Render ZX Spectrum Screen ---
 void render_screen(void) {
-    uint32_t border_rgba = spectrum_colors[border_color_idx & 7];
+    uint64_t frame_start = border_frame_start_tstate;
+    uint64_t frame_end = frame_start + T_STATES_PER_FRAME;
+
+    uint8_t start_color = border_frame_color & 0x07u;
+    size_t drop_count = 0;
+    while (drop_count < border_color_event_count && border_color_events[drop_count].t_state <= frame_start) {
+        start_color = border_color_events[drop_count].color_idx & 0x07u;
+        ++drop_count;
+    }
+    if (drop_count > 0) {
+        size_t remaining = border_color_event_count - drop_count;
+        if (remaining > 0) {
+            memmove(&border_color_events[0], &border_color_events[drop_count], remaining * sizeof(BorderColorEvent));
+        }
+        border_color_event_count -= drop_count;
+    }
+    border_frame_color = start_color;
+
+    uint32_t base_rgba = spectrum_colors[start_color];
+    size_t total_pixels = (size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT;
+    for (size_t i = 0; i < total_pixels; ++i) {
+        pixels[i] = base_rgba;
+    }
+
+    uint64_t segment_start = frame_start;
+    uint8_t current_color = start_color;
+    size_t event_index = 0;
+    while (event_index < border_color_event_count && border_color_events[event_index].t_state < frame_end) {
+        uint64_t event_time = border_color_events[event_index].t_state;
+        if (event_time > segment_start) {
+            border_draw_span(segment_start, event_time, current_color);
+        }
+        current_color = border_color_events[event_index].color_idx & 0x07u;
+        segment_start = event_time;
+        ++event_index;
+    }
+    if (frame_end > segment_start) {
+        border_draw_span(segment_start, frame_end, current_color);
+    }
+
+    if (event_index > 0) {
+        size_t remaining = border_color_event_count - event_index;
+        if (remaining > 0) {
+            memmove(&border_color_events[0], &border_color_events[event_index], remaining * sizeof(BorderColorEvent));
+        }
+        border_color_event_count = remaining;
+    }
+
+    border_frame_start_tstate = frame_end;
+    border_frame_color = current_color & 0x07u;
+
     uint64_t frame_count = total_t_states / T_STATES_PER_FRAME;
     int flash_phase = (int)((frame_count >> 5) & 1ULL);
     const uint8_t* vram_bank = memory + VRAM_START;
@@ -6702,7 +6773,6 @@ void render_screen(void) {
             attr_bank = bank + (ATTR_START - VRAM_START);
         }
     }
-    for(int y=0; y<TOTAL_HEIGHT; ++y) { for(int x=0; x<TOTAL_WIDTH; ++x) { if(x<BORDER_SIZE || x>=BORDER_SIZE+SCREEN_WIDTH || y<BORDER_SIZE || y>=BORDER_SIZE+SCREEN_HEIGHT) pixels[y * TOTAL_WIDTH + x] = border_rgba; } }
     for (int y = 0; y < SCREEN_HEIGHT; ++y) {
         for (int x_char = 0; x_char < SCREEN_WIDTH / 8; ++x_char) {
             uint16_t pix_addr = VRAM_START + ((y & 0xC0) << 5) + ((y & 7) << 8) + ((y & 0x38) << 2) + x_char;
@@ -6711,19 +6781,30 @@ void render_screen(void) {
             uint16_t attr_offset = (uint16_t)(attr_addr - ATTR_START);
             uint8_t pix_byte = vram_bank[pix_offset];
             uint8_t attr_byte = attr_bank[attr_offset];
-            int ink_idx=attr_byte&7; int pap_idx=(attr_byte>>3)&7; int bright=(attr_byte>>6)&1; int flash=(attr_byte>>7)&1;
-            const uint32_t* cmap=bright?spectrum_bright_colors:spectrum_colors; uint32_t ink=cmap[ink_idx]; uint32_t pap=cmap[pap_idx];
+            int ink_idx = attr_byte & 7;
+            int pap_idx = (attr_byte >> 3) & 7;
+            int bright = (attr_byte >> 6) & 1;
+            int flash = (attr_byte >> 7) & 1;
+            const uint32_t* cmap = bright ? spectrum_bright_colors : spectrum_colors;
+            uint32_t ink = cmap[ink_idx];
+            uint32_t pap = cmap[pap_idx];
             if (flash && flash_phase) {
                 uint32_t tmp = ink;
                 ink = pap;
                 pap = tmp;
             }
-            for (int bit = 0; bit < 8; ++bit) { int sx=BORDER_SIZE+x_char*8+(7-bit); int sy=BORDER_SIZE+y; pixels[sy*TOTAL_WIDTH+sx]=((pix_byte>>bit)&1)?ink:pap; }
+            for (int bit = 0; bit < 8; ++bit) {
+                int sx = BORDER_SIZE + x_char * 8 + (7 - bit);
+                int sy = BORDER_SIZE + y;
+                pixels[sy * TOTAL_WIDTH + sx] = ((pix_byte >> bit) & 1) ? ink : pap;
+            }
         }
     }
     tape_render_overlay();
     SDL_UpdateTexture(texture, NULL, pixels, TOTAL_WIDTH * sizeof(uint32_t));
-    SDL_RenderClear(renderer); SDL_RenderCopy(renderer, texture, NULL, NULL); SDL_RenderPresent(renderer);
+    SDL_RenderClear(renderer);
+    SDL_RenderCopy(renderer, texture, NULL, NULL);
+    SDL_RenderPresent(renderer);
 }
 
 // --- SDL Keycode to Spectrum Matrix Mapping ---
@@ -6849,6 +6930,151 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
     beeper_hp_last_output = last_output;
 
     (void)userdata;
+}
+
+static void border_record_event(uint64_t event_t_state, uint8_t color_idx) {
+    color_idx &= 0x07u;
+
+    if (event_t_state < border_frame_start_tstate) {
+        border_frame_color = color_idx;
+        return;
+    }
+
+    if (border_color_event_count > 0) {
+        BorderColorEvent* last = &border_color_events[border_color_event_count - 1];
+        if (event_t_state < last->t_state) {
+            event_t_state = last->t_state;
+        }
+        if (last->color_idx == color_idx) {
+            return;
+        }
+    } else if (color_idx == border_frame_color) {
+        return;
+    }
+
+    size_t capacity = BORDER_EVENT_CAPACITY;
+    if (border_color_event_count >= capacity) {
+        size_t drop = border_color_event_count - capacity + 1u;
+        if (drop > border_color_event_count) {
+            drop = border_color_event_count;
+        }
+        if (drop > 0) {
+            size_t remaining = border_color_event_count - drop;
+            if (remaining > 0) {
+                memmove(&border_color_events[0], &border_color_events[drop], remaining * sizeof(BorderColorEvent));
+            }
+            border_color_event_count = remaining;
+        }
+    }
+
+    border_color_events[border_color_event_count].t_state = event_t_state;
+    border_color_events[border_color_event_count].color_idx = color_idx;
+    ++border_color_event_count;
+}
+
+static void border_draw_span(uint64_t span_start, uint64_t span_end, uint8_t color_idx) {
+    if (span_end <= span_start) {
+        return;
+    }
+
+    uint64_t frame_start = border_frame_start_tstate;
+    if (span_end <= frame_start) {
+        return;
+    }
+
+    uint64_t frame_end = frame_start + T_STATES_PER_FRAME;
+    if (span_start < frame_start) {
+        span_start = frame_start;
+    }
+    if (span_end > frame_end) {
+        span_end = frame_end;
+    }
+    if (span_end <= span_start) {
+        return;
+    }
+
+    uint32_t rgba = spectrum_colors[color_idx & 0x07u];
+
+    uint64_t offset_start = span_start - frame_start;
+    uint64_t offset_end = span_end - frame_start;
+
+    uint64_t line_start = offset_start / ULA_T_STATES_PER_LINE;
+    uint64_t line_end = (offset_end + (ULA_T_STATES_PER_LINE - 1u)) / ULA_T_STATES_PER_LINE;
+    if (line_end > ULA_LINES_PER_FRAME) {
+        line_end = ULA_LINES_PER_FRAME;
+    }
+
+    for (uint64_t line = line_start; line < line_end; ++line) {
+        if (line < ULA_VISIBLE_TOP_LINES) {
+            continue;
+        }
+        if (line >= ULA_LINES_PER_FRAME - ULA_VISIBLE_BOTTOM_LINES) {
+            continue;
+        }
+
+        int y = (int)(line - ULA_VISIBLE_TOP_LINES);
+        if (y < 0 || y >= TOTAL_HEIGHT) {
+            continue;
+        }
+
+        uint64_t line_tstate_start = line * ULA_T_STATES_PER_LINE;
+        uint64_t line_tstate_end = line_tstate_start + ULA_T_STATES_PER_LINE;
+
+        uint64_t segment_start = offset_start > line_tstate_start ? offset_start : line_tstate_start;
+        uint64_t segment_end = offset_end < line_tstate_end ? offset_end : line_tstate_end;
+        if (segment_end <= segment_start) {
+            continue;
+        }
+
+        uint64_t rel_start = segment_start - line_tstate_start;
+        uint64_t rel_end = segment_end - line_tstate_start;
+
+        if (rel_start >= ULA_LINE_VISIBLE_TSTATES) {
+            continue;
+        }
+        if (rel_end > ULA_LINE_VISIBLE_TSTATES) {
+            rel_end = ULA_LINE_VISIBLE_TSTATES;
+        }
+
+        int col_start = (int)(rel_start * 2u);
+        int col_end = (int)(rel_end * 2u);
+
+        if (col_start < 0) {
+            col_start = 0;
+        }
+        if (col_end > TOTAL_WIDTH) {
+            col_end = TOTAL_WIDTH;
+        }
+        if (col_start >= col_end) {
+            continue;
+        }
+
+        uint32_t* row = &pixels[y * TOTAL_WIDTH];
+        if (y < BORDER_SIZE || y >= BORDER_SIZE + SCREEN_HEIGHT) {
+            for (int x = col_start; x < col_end; ++x) {
+                row[x] = rgba;
+            }
+        } else {
+            int left_limit = BORDER_SIZE;
+            if (col_start < left_limit) {
+                int left_start = col_start;
+                int left_end = col_end < left_limit ? col_end : left_limit;
+                for (int x = left_start; x < left_end; ++x) {
+                    row[x] = rgba;
+                }
+            }
+
+            int right_limit = TOTAL_WIDTH - BORDER_SIZE;
+            if (col_end > right_limit) {
+                int right_start = col_start > right_limit ? col_start : right_limit;
+                if (right_start < col_end) {
+                    for (int x = right_start; x < col_end; ++x) {
+                        row[x] = rgba;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // --- Main Program ---
@@ -7347,6 +7573,7 @@ static void ula_process_port_events(uint64_t current_t_state) {
         uint8_t value = ula_write_queue[i].value;
         uint64_t event_t_state = ula_write_queue[i].t_state;
         border_color_idx = value & 0x07;
+        border_record_event(event_t_state, (uint8_t)(border_color_idx & 0x07));
 
         int new_beeper_state = (value >> 4) & 0x01;
         if (new_beeper_state != beeper_state) {
