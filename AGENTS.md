@@ -3,5 +3,6 @@
 - Follow C11 conventions with 4-space indentation in C source files.
 - Prefer standard library calls and avoid platform-specific extensions unless wrapped in `#ifdef` guards.
 - Update `README.md` whenever build prerequisites, user-facing workflows, or CPU opcode coverage details change.
+- Make sure README tape deck documentation stays in sync with changes to the loader border graphics or control overlay so users know how the on-screen indicators behave.
 - Shell scripts must use `#!/usr/bin/env bash` and start with `set -euo pipefail`.
 - Keep the late gate-array contention tables and +3 peripheral wait-state tests in sync with the documented behaviour whenever timing changes are made.
