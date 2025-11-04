@@ -2350,6 +2350,31 @@ static int snapshot_load_sna(const char* path, Z80* cpu) {
     return 1;
 }
 
+static int z80_map_page_id_to_offset(int page_id, size_t* offset, uint8_t* mask_bit) {
+    if (!offset || !mask_bit) {
+        return 0;
+    }
+
+    switch (page_id) {
+        case 8:
+            *offset = 0x0000u;
+            *mask_bit = 0x01u;
+            return 1;
+        case 4:
+            *offset = 0x4000u;
+            *mask_bit = 0x02u;
+            return 1;
+        case 5:
+            *offset = 0x8000u;
+            *mask_bit = 0x04u;
+            return 1;
+        default:
+            break;
+    }
+
+    return 0;
+}
+
 static int snapshot_load_z80(const char* path, Z80* cpu) {
     if (!path || !cpu) {
         return 0;
@@ -2467,8 +2492,8 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
             return 0;
         }
 
-        size_t segments_loaded = 0u;
-        while (segments_loaded < 3u) {
+        uint8_t loaded_mask = 0u;
+        while (loaded_mask != 0x07u) {
             uint8_t len_bytes[2];
             if (fread(len_bytes, sizeof(len_bytes), 1, sf) != 1) {
                 fprintf(stderr, "Truncated Z80 memory block in '%s'\n", path);
@@ -2485,9 +2510,22 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
                 return 0;
             }
 
-            (void)page_id;
+            size_t segment_offset = 0u;
+            uint8_t mask_bit = 0u;
+            if (!z80_map_page_id_to_offset(page_id, &segment_offset, &mask_bit)) {
+                fprintf(stderr, "Z80 snapshot '%s' contains unsupported memory page id %d\n", path, page_id);
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
+            if ((loaded_mask & mask_bit) != 0u) {
+                fprintf(stderr, "Z80 snapshot '%s' repeats memory page id %d\n", path, page_id);
+                free(ram_buffer);
+                fclose(sf);
+                return 0;
+            }
 
-            uint8_t* segment = ram_buffer + (segments_loaded * 0x4000u);
+            uint8_t* segment = ram_buffer + segment_offset;
             if (block_len == 0xFFFFu) {
                 if (fread(segment, 0x4000u, 1, sf) != 1) {
                     fprintf(stderr, "Failed to read uncompressed block from '%s'\n", path);
@@ -2519,7 +2557,7 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
                 }
                 free(block_data);
             }
-            segments_loaded++;
+            loaded_mask |= mask_bit;
         }
     }
 
