@@ -703,20 +703,38 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
     memset(rom_pages, 0, sizeof(rom_pages));
     uint8_t bank_loaded[4] = {0, 0, 0, 0};
 
+    size_t dest_order[4];
+    size_t dest_count = 0u;
+    if (bank_hint >= 0) {
+        dest_order[dest_count++] = (size_t)bank_hint;
+        for (size_t bank = 0; bank < 4u; ++bank) {
+            if ((int)bank == bank_hint) {
+                continue;
+            }
+            dest_order[dest_count++] = bank;
+        }
+    } else {
+        for (size_t bank = 0; bank < 4u; ++bank) {
+            dest_order[dest_count++] = bank;
+        }
+    }
+
     size_t buffer_offset = 0u;
-    size_t dest_index = (bank_hint >= 0) ? (size_t)bank_hint : 0u;
-    while (buffer_offset + 0x4000u <= rom_size && dest_index < 4u) {
+    size_t chunk_index = 0u;
+    while (buffer_offset + 0x4000u <= rom_size && chunk_index < dest_count) {
+        size_t dest_index = dest_order[chunk_index];
         memcpy(rom_pages[dest_index], rom_buffer + buffer_offset, 0x4000u);
         bank_loaded[dest_index] = 1u;
         buffer_offset += 0x4000u;
-        ++dest_index;
+        ++chunk_index;
     }
 
-    if (buffer_offset < rom_size && dest_index < 4u) {
+    if (buffer_offset < rom_size && chunk_index < dest_count) {
         size_t remaining = rom_size - buffer_offset;
         if (remaining > 0x4000u) {
             remaining = 0x4000u;
         }
+        size_t dest_index = dest_order[chunk_index];
         memcpy(rom_pages[dest_index], rom_buffer + buffer_offset, remaining);
         if (remaining < 0x4000u) {
             memset(rom_pages[dest_index] + remaining, 0, 0x4000u - remaining);
