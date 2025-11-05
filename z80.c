@@ -702,6 +702,7 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
 
     memset(rom_pages, 0, sizeof(rom_pages));
     uint8_t bank_loaded[4] = {0, 0, 0, 0};
+    uint8_t bank_loaded_from_hint[4] = {0, 0, 0, 0};
 
     size_t dest_order[4];
     size_t dest_count = 0u;
@@ -725,6 +726,9 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
         size_t dest_index = dest_order[chunk_index];
         memcpy(rom_pages[dest_index], rom_buffer + buffer_offset, 0x4000u);
         bank_loaded[dest_index] = 1u;
+        if (chunk_index == 0u && bank_hint >= 0 && dest_index == (size_t)bank_hint) {
+            bank_loaded_from_hint[dest_index] = 1u;
+        }
         buffer_offset += 0x4000u;
         ++chunk_index;
     }
@@ -740,6 +744,9 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
             memset(rom_pages[dest_index] + remaining, 0, 0x4000u - remaining);
         }
         bank_loaded[dest_index] = 1u;
+        if (chunk_index == 0u && bank_hint >= 0 && dest_index == (size_t)bank_hint) {
+            bank_loaded_from_hint[dest_index] = 1u;
+        }
     }
 
     size_t current_loaded = 0u;
@@ -802,6 +809,7 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
                 }
                 if (spectrum_load_rom_bank_file(companion_path, rom_pages[bank])) {
                     bank_loaded[bank] = 1u;
+                    bank_loaded_from_hint[bank] = 1u;
                     ++current_loaded;
                     printf("Loaded ROM bank %zu from %s\n", bank, companion_path);
                 }
@@ -814,7 +822,15 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
         inspect_limit = 4u;
     }
 
-    if (inspect_limit >= 2u) {
+    int hints_cover_all = 1;
+    for (size_t bank = 0; bank < inspect_limit; ++bank) {
+        if (!bank_loaded[bank] || !bank_loaded_from_hint[bank]) {
+            hints_cover_all = 0;
+            break;
+        }
+    }
+
+    if (!hints_cover_all && inspect_limit >= 2u) {
         int menu_candidate = -1;
         int basic_candidate = -1;
         size_t non_basic_candidates[4];
@@ -845,12 +861,14 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
             printf("Assuming ROM bank %d is the 128K menu (non-48K companion)\n", menu_candidate);
         }
 
+        int menu_confirmed = (menu_candidate >= 0);
+
         if (menu_candidate >= 0 && menu_candidate != 0) {
             spectrum_swap_rom_banks(0u, (size_t)menu_candidate, bank_loaded);
             printf("Reordered ROM bank %d into slot 0 for 128K menu\n", menu_candidate);
         }
 
-        if (inspect_limit > 1u) {
+        if (menu_confirmed && inspect_limit > 1u) {
             int refreshed_basic_candidate = -1;
             for (size_t bank = 0; bank < inspect_limit; ++bank) {
                 if (!bank_loaded[bank]) {
