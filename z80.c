@@ -535,8 +535,8 @@ static int spectrum_rom_bank_seems_48k_basic(const uint8_t *rom) {
     }
 
     int has_1982 = spectrum_rom_contains_ascii(rom, 0x4000u, "1982");
-    int has_sinclair = spectrum_rom_contains_ascii(rom, 0x4000u, "SINCLAIR");
-    return has_1982 && has_sinclair;
+    int has_sinclair_research = spectrum_rom_contains_ascii(rom, 0x4000u, "SINCLAIR RESEARCH");
+    return has_1982 && has_sinclair_research;
 }
 
 static int spectrum_rom_bank_seems_128k_menu(const uint8_t *rom) {
@@ -544,7 +544,7 @@ static int spectrum_rom_bank_seems_128k_menu(const uint8_t *rom) {
         return 0;
     }
 
-    static const char *menu_markers[] = {"128K", "1986", "1985", "AMSTRAD", "128 "};
+    static const char *menu_markers[] = {"128K", "1986", "1985", "AMSTRAD", "MENU"};
     size_t marker_count = sizeof(menu_markers) / sizeof(menu_markers[0]);
     int marker_hit = 0;
     for (size_t i = 0; i < marker_count; ++i) {
@@ -817,16 +817,32 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
     if (inspect_limit >= 2u) {
         int menu_candidate = -1;
         int basic_candidate = -1;
+        size_t non_basic_candidates[4];
+        size_t non_basic_count = 0u;
         for (size_t bank = 0; bank < inspect_limit; ++bank) {
             if (!bank_loaded[bank]) {
                 continue;
             }
+
+            if (spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
+                if (basic_candidate < 0) {
+                    basic_candidate = (int)bank;
+                }
+                continue;
+            }
+
             if (menu_candidate < 0 && spectrum_rom_bank_seems_128k_menu(rom_pages[bank])) {
                 menu_candidate = (int)bank;
             }
-            if (basic_candidate < 0 && spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
-                basic_candidate = (int)bank;
+
+            if (non_basic_count < sizeof(non_basic_candidates) / sizeof(non_basic_candidates[0])) {
+                non_basic_candidates[non_basic_count++] = bank;
             }
+        }
+
+        if (menu_candidate < 0 && basic_candidate >= 0 && non_basic_count > 0u) {
+            menu_candidate = (int)non_basic_candidates[0];
+            printf("Assuming ROM bank %d is the 128K menu (non-48K companion)\n", menu_candidate);
         }
 
         if (menu_candidate >= 0 && menu_candidate != 0) {
