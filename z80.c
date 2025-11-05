@@ -10,6 +10,10 @@
 #include <stdarg.h>
 #include <SDL.h>
 
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 // --- Z80 Flag Register Bits ---
 #define FLAG_C  (1 << 0) // Carry Flag
 #define FLAG_N  (1 << 1) // Add/Subtract Flag
@@ -501,6 +505,268 @@ uint8_t keyboard_matrix[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 // --- ROM Handling ---
 static const char *default_rom_filename = "48.rom";
+
+static size_t spectrum_expected_rom_banks(SpectrumModel model) {
+    switch (model) {
+        case SPECTRUM_MODEL_128K:
+            return 2u;
+        case SPECTRUM_MODEL_PLUS2A:
+        case SPECTRUM_MODEL_PLUS3:
+            return 4u;
+        case SPECTRUM_MODEL_48K:
+        default:
+            return 1u;
+    }
+}
+
+static int spectrum_load_rom_bank_file(const char *path, uint8_t *dest) {
+    if (!path || !dest) {
+        return 0;
+    }
+
+    FILE *bank_file = fopen(path, "rb");
+    if (!bank_file) {
+        return 0;
+    }
+
+    memset(dest, 0, 0x4000);
+    size_t read = fread(dest, 1, 0x4000, bank_file);
+    fclose(bank_file);
+
+    if (read < 0x4000) {
+        fprintf(stderr,
+                "ROM bank '%s' is %zu bytes; expected at least 16384 bytes\n",
+                path,
+                read);
+        if (read == 0) {
+            return 0;
+        }
+    }
+
+    if (read > 0x4000) {
+        fprintf(stderr,
+                "ROM bank '%s' is larger than 16384 bytes; extra data will be ignored\n",
+                path);
+    }
+
+    return 1;
+}
+
+static int spectrum_populate_rom_pages(const char *rom_primary_path,
+                                       const uint8_t *rom_buffer,
+                                       size_t rom_size) {
+    if (!rom_buffer || rom_size < 0x4000) {
+        return 0;
+    }
+
+    size_t expected_banks = spectrum_expected_rom_banks(spectrum_model);
+    if (expected_banks == 0u) {
+        expected_banks = 1u;
+    }
+    if (expected_banks > 4u) {
+        expected_banks = 4u;
+    }
+
+    char rom_stem[PATH_MAX];
+    char rom_extension[PATH_MAX];
+    rom_stem[0] = '\0';
+    rom_extension[0] = '\0';
+
+    if (rom_primary_path) {
+        size_t path_len = strlen(rom_primary_path);
+        if (path_len >= PATH_MAX) {
+            path_len = PATH_MAX - 1u;
+        }
+
+        const char *last_slash = strrchr(rom_primary_path, '/');
+        const char *last_backslash = strrchr(rom_primary_path, '\\');
+        if (!last_slash || (last_backslash && last_backslash > last_slash)) {
+            last_slash = last_backslash;
+        }
+
+        const char *extension = strrchr(rom_primary_path, '.');
+        if (extension && last_slash && extension < last_slash) {
+            extension = NULL;
+        }
+
+        size_t stem_len = extension ? (size_t)(extension - rom_primary_path) : path_len;
+        if (stem_len >= PATH_MAX) {
+            stem_len = PATH_MAX - 1u;
+        }
+        memcpy(rom_stem, rom_primary_path, stem_len);
+        rom_stem[stem_len] = '\0';
+
+        if (extension) {
+            size_t ext_len = strlen(extension);
+            if (ext_len >= PATH_MAX) {
+                ext_len = PATH_MAX - 1u;
+            }
+            memcpy(rom_extension, extension, ext_len);
+            rom_extension[ext_len] = '\0';
+        }
+    }
+
+    size_t stem_length = strlen(rom_stem);
+    int bank_hint = -1;
+    char separator_hint = '-';
+    if (stem_length >= 2u) {
+        char sep_candidate = rom_stem[stem_length - 2u];
+        char digit_candidate = rom_stem[stem_length - 1u];
+        if ((sep_candidate == '-' || sep_candidate == '_') && isdigit((unsigned char)digit_candidate)) {
+            int digit_value = digit_candidate - '0';
+            if (digit_value >= 0 && digit_value <= 9) {
+                bank_hint = digit_value;
+                separator_hint = sep_candidate;
+                stem_length -= 2u;
+                rom_stem[stem_length] = '\0';
+            }
+        }
+    }
+
+    if (bank_hint < 0 || bank_hint > 3) {
+        bank_hint = -1;
+    }
+
+    memset(rom_pages, 0, sizeof(rom_pages));
+    uint8_t bank_loaded[4] = {0, 0, 0, 0};
+
+    size_t buffer_offset = 0u;
+    size_t dest_index = (bank_hint >= 0) ? (size_t)bank_hint : 0u;
+    while (buffer_offset + 0x4000u <= rom_size && dest_index < 4u) {
+        memcpy(rom_pages[dest_index], rom_buffer + buffer_offset, 0x4000u);
+        bank_loaded[dest_index] = 1u;
+        buffer_offset += 0x4000u;
+        ++dest_index;
+    }
+
+    if (buffer_offset < rom_size && dest_index < 4u) {
+        size_t remaining = rom_size - buffer_offset;
+        if (remaining > 0x4000u) {
+            remaining = 0x4000u;
+        }
+        memcpy(rom_pages[dest_index], rom_buffer + buffer_offset, remaining);
+        if (remaining < 0x4000u) {
+            memset(rom_pages[dest_index] + remaining, 0, 0x4000u - remaining);
+        }
+        bank_loaded[dest_index] = 1u;
+    }
+
+    size_t current_loaded = 0u;
+    for (size_t i = 0; i < 4u; ++i) {
+        if (bank_loaded[i]) {
+            ++current_loaded;
+        }
+    }
+
+    char separator_candidates[3];
+    size_t separator_count = 0u;
+    separator_candidates[separator_count++] = separator_hint;
+    if (separator_hint != '-') {
+        separator_candidates[separator_count++] = '-';
+    }
+    if (separator_hint != '_' && separator_count < 3u) {
+        separator_candidates[separator_count++] = '_';
+    }
+
+    if (rom_stem[0] == '\0' && rom_primary_path) {
+        size_t path_len = strlen(rom_primary_path);
+        if (path_len >= PATH_MAX) {
+            path_len = PATH_MAX - 1u;
+        }
+        memcpy(rom_stem, rom_primary_path, path_len);
+        rom_stem[path_len] = '\0';
+        stem_length = strlen(rom_stem);
+    } else {
+        stem_length = strlen(rom_stem);
+    }
+
+    size_t banks_needed = expected_banks;
+    if (banks_needed == 0u) {
+        banks_needed = 1u;
+    }
+    if (banks_needed > 4u) {
+        banks_needed = 4u;
+    }
+
+    char companion_path[PATH_MAX];
+    if (current_loaded < banks_needed && rom_stem[0] != '\0') {
+        for (size_t sep_index = 0; sep_index < separator_count && current_loaded < banks_needed; ++sep_index) {
+            char separator = separator_candidates[sep_index];
+            if (separator == '\0') {
+                continue;
+            }
+            for (size_t bank = 0; bank < banks_needed && current_loaded < banks_needed; ++bank) {
+                if (bank_loaded[bank]) {
+                    continue;
+                }
+                int written = snprintf(companion_path,
+                                       sizeof(companion_path),
+                                       "%s%c%zu%s",
+                                       rom_stem,
+                                       separator,
+                                       bank,
+                                       rom_extension);
+                if (written <= 0 || (size_t)written >= sizeof(companion_path)) {
+                    continue;
+                }
+                if (spectrum_load_rom_bank_file(companion_path, rom_pages[bank])) {
+                    bank_loaded[bank] = 1u;
+                    ++current_loaded;
+                    printf("Loaded ROM bank %zu from %s\n", bank, companion_path);
+                }
+            }
+        }
+    }
+
+    int fallback_bank = -1;
+    for (size_t i = 0; i < 4u; ++i) {
+        if (bank_loaded[i]) {
+            fallback_bank = (int)i;
+            break;
+        }
+    }
+
+    if (fallback_bank < 0) {
+        fprintf(stderr, "Failed to populate any ROM bank from '%s'\n", rom_primary_path ? rom_primary_path : "<buffer>");
+        return 0;
+    }
+
+    if (current_loaded < banks_needed) {
+        fprintf(stderr,
+                "Warning: only %zu of %zu ROM banks were found for '%s'; mirroring bank %d\n",
+                current_loaded,
+                banks_needed,
+                rom_primary_path ? rom_primary_path : "<buffer>",
+                fallback_bank);
+        for (size_t bank = 0; bank < banks_needed; ++bank) {
+            if (!bank_loaded[bank]) {
+                memcpy(rom_pages[bank], rom_pages[fallback_bank], 0x4000);
+                bank_loaded[bank] = 1u;
+            }
+        }
+        current_loaded = banks_needed;
+    }
+
+    size_t final_bank_count = banks_needed;
+    if (current_loaded > final_bank_count) {
+        final_bank_count = current_loaded;
+        if (final_bank_count > 4u) {
+            final_bank_count = 4u;
+        }
+    }
+
+    if (final_bank_count == 0u) {
+        final_bank_count = 1u;
+    }
+
+    for (size_t bank = final_bank_count; bank < 4u; ++bank) {
+        size_t mirror = bank % final_bank_count;
+        memcpy(rom_pages[bank], rom_pages[mirror], 0x4000);
+    }
+
+    rom_page_count = (uint8_t)final_bank_count;
+    return 1;
+}
 
 static char *build_executable_relative_path(const char *executable_path, const char *filename);
 // --- Z80 CPU State ---
@@ -8347,7 +8613,7 @@ int main(int argc, char *argv[]) {
         free(rom_fallback_path);
         return 1;
     }
-    uint8_t rom_buffer[0x8000];
+    uint8_t rom_buffer[0x10000];
     size_t rom_read = fread(rom_buffer, 1, sizeof(rom_buffer), rf);
     fclose(rf);
     if (rom_read < 0x4000) {
@@ -8359,33 +8625,9 @@ int main(int argc, char *argv[]) {
     memset(memory, 0, sizeof(memory));
     memset(ram_pages, 0, sizeof(ram_pages));
 
-    memset(rom_pages, 0, sizeof(rom_pages));
-    memcpy(rom_pages[0], rom_buffer, 0x4000);
-    if (spectrum_model == SPECTRUM_MODEL_PLUS2A || spectrum_model == SPECTRUM_MODEL_PLUS3) {
-        size_t available_banks = rom_read / 0x4000u;
-        if (available_banks == 0u) {
-            available_banks = 1u;
-        }
-        if (available_banks > 4u) {
-            available_banks = 4u;
-        }
-        for (size_t i = 0; i < available_banks; ++i) {
-            memcpy(rom_pages[i], rom_buffer + (i * 0x4000u), 0x4000);
-        }
-        for (size_t i = available_banks; i < 4u; ++i) {
-            memcpy(rom_pages[i], rom_pages[i % available_banks], 0x4000);
-        }
-        rom_page_count = 4u;
-    } else {
-        if (spectrum_model != SPECTRUM_MODEL_48K && rom_read >= 0x8000) {
-            memcpy(rom_pages[1], rom_buffer + 0x4000, 0x4000);
-            rom_page_count = 2u;
-        } else {
-            memcpy(rom_pages[1], rom_pages[0], 0x4000);
-            rom_page_count = 1u;
-        }
-        memcpy(rom_pages[2], rom_pages[0], 0x4000);
-        memcpy(rom_pages[3], rom_pages[1], 0x4000);
+    if (!spectrum_populate_rom_pages(rom_log_path, rom_buffer, rom_read)) {
+        free(rom_fallback_path);
+        return 1;
     }
 
     spectrum_configure_model(spectrum_model);
@@ -8399,7 +8641,10 @@ int main(int argc, char *argv[]) {
         printf("Loaded snapshot %s\n", snapshot_input_path);
     }
 
-    printf("Loaded %zu bytes from %s\n", rom_read, rom_log_path);
+    printf("Loaded %zu bytes from %s (%u ROM banks)\n",
+           rom_read,
+           rom_log_path,
+           (unsigned int)rom_page_count);
     free(rom_fallback_path);
 
     tape_playback.use_waveform_playback = 0;
