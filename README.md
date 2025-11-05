@@ -190,7 +190,11 @@ flag, the high bit of the `R` register, and the surrounding register fields are
 restored without the off-by-one skew that previously scrambled CPU state. The
 RLE unpacker for Version 2/3 block payloads now verifies that both the repeat
 count and data byte are present before expanding a sequence, preventing
-truncated compressed pages from aborting snapshot loads.
+truncated compressed pages from aborting snapshot loads. The loader also
+refreshes the visible RAM pages immediately after copying snapshot data, so the
+CPU resumes execution with the restored memory image, and prints the recovered
+program counter, stack pointer, and interrupt mode to stderr for quick
+diagnostics when a file refuses to boot.
 
 ## Controls
 The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary host-to-Spectrum key mapping is:

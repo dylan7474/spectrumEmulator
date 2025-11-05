@@ -552,6 +552,7 @@ void audio_callback(void* userdata, Uint8* stream, int len);
 static void border_record_event(uint64_t event_t_state, uint8_t color_idx);
 static void border_draw_span(uint64_t span_start, uint64_t span_end, uint8_t color_idx);
 static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t index);
+static void spectrum_refresh_visible_ram(void);
 static void spectrum_apply_memory_configuration(void);
 static void spectrum_update_contention_flags(void);
 static inline int ula_contention_penalty(uint64_t t_state);
@@ -661,6 +662,16 @@ static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t 
         memset(memory + base, 0, 0x4000);
         slot->type = MEMORY_PAGE_NONE;
         slot->index = 0u;
+    }
+}
+
+static void spectrum_refresh_visible_ram(void) {
+    for (int segment = 0; segment < 4; ++segment) {
+        SpectrumMemoryPage* slot = &spectrum_pages[segment];
+        if (slot->type == MEMORY_PAGE_RAM && slot->index < 8u) {
+            uint16_t base = (uint16_t)(segment * 0x4000u);
+            memcpy(memory + base, ram_pages[slot->index], 0x4000u);
+        }
     }
 }
 
@@ -2343,10 +2354,19 @@ static int snapshot_load_sna(const char* path, Z80* cpu) {
     memcpy(ram_pages[5], ram_buffer + 0x0000u, 0x4000u);
     memcpy(ram_pages[2], ram_buffer + 0x4000u, 0x4000u);
     memcpy(ram_pages[7], ram_buffer + 0x8000u, 0x4000u);
+    spectrum_refresh_visible_ram();
     free(ram_buffer);
     spectrum_apply_memory_configuration();
 
     fclose(sf);
+
+    fprintf(stderr,
+            "SNA snapshot '%s': PC=%04X SP=%04X IM=%d border=%u\n",
+            path,
+            (unsigned)cpu->reg_PC,
+            (unsigned)cpu->reg_SP,
+            cpu->interruptMode,
+            (unsigned)border);
     return 1;
 }
 
@@ -2394,6 +2414,7 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
     }
 
     uint16_t pc = (uint16_t)header[6] | ((uint16_t)header[7] << 8);
+    int header_pc_zero = (pc == 0u);
     uint16_t sp = (uint16_t)header[8] | ((uint16_t)header[9] << 8);
     uint8_t flags = header[12];
     uint8_t compressed_flag = (flags & 0x20u) ? 1u : 0u;
@@ -2579,12 +2600,22 @@ static int snapshot_load_z80(const char* path, Z80* cpu) {
     memcpy(ram_pages[5], ram_buffer + 0x0000u, 0x4000u);
     memcpy(ram_pages[2], ram_buffer + 0x4000u, 0x4000u);
     memcpy(ram_pages[7], ram_buffer + 0x8000u, 0x4000u);
+    spectrum_refresh_visible_ram();
     free(ram_buffer);
     spectrum_apply_memory_configuration();
 
     cpu->reg_PC = pc;
 
     fclose(sf);
+
+    fprintf(stderr,
+            "Z80 snapshot '%s': version %s PC=%04X SP=%04X IM=%d border=%u\n",
+            path,
+            header_pc_zero ? "V2/3" : "V1",
+            (unsigned)cpu->reg_PC,
+            (unsigned)cpu->reg_SP,
+            cpu->interruptMode,
+            (unsigned)border_color_idx);
     return 1;
 }
 
