@@ -506,6 +506,79 @@ uint8_t keyboard_matrix[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 // --- ROM Handling ---
 static const char *default_rom_filename = "48.rom";
 
+static int spectrum_rom_contains_ascii(const uint8_t *rom, size_t size, const char *needle) {
+    if (!rom || !needle) {
+        return 0;
+    }
+
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0u || needle_len > size) {
+        return 0;
+    }
+
+    for (size_t i = 0; i + needle_len <= size; ++i) {
+        size_t j = 0u;
+        while (j < needle_len && rom[i + j] == (uint8_t)needle[j]) {
+            ++j;
+        }
+        if (j == needle_len) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int spectrum_rom_bank_seems_48k_basic(const uint8_t *rom) {
+    if (!rom) {
+        return 0;
+    }
+
+    int has_1982 = spectrum_rom_contains_ascii(rom, 0x4000u, "1982");
+    int has_sinclair = spectrum_rom_contains_ascii(rom, 0x4000u, "SINCLAIR");
+    return has_1982 && has_sinclair;
+}
+
+static int spectrum_rom_bank_seems_128k_menu(const uint8_t *rom) {
+    if (!rom) {
+        return 0;
+    }
+
+    static const char *menu_markers[] = {"128K", "1986", "1985", "AMSTRAD", "128 "};
+    size_t marker_count = sizeof(menu_markers) / sizeof(menu_markers[0]);
+    int marker_hit = 0;
+    for (size_t i = 0; i < marker_count; ++i) {
+        if (spectrum_rom_contains_ascii(rom, 0x4000u, menu_markers[i])) {
+            marker_hit = 1;
+            break;
+        }
+    }
+
+    if (!marker_hit) {
+        return 0;
+    }
+
+    int has_128_text = spectrum_rom_contains_ascii(rom, 0x4000u, "128");
+    return has_128_text;
+}
+
+static void spectrum_swap_rom_banks(size_t a, size_t b, uint8_t bank_loaded[4]) {
+    if (a >= 4u || b >= 4u || a == b) {
+        return;
+    }
+
+    uint8_t temp_bank[0x4000u];
+    memcpy(temp_bank, rom_pages[a], sizeof(temp_bank));
+    memcpy(rom_pages[a], rom_pages[b], sizeof(temp_bank));
+    memcpy(rom_pages[b], temp_bank, sizeof(temp_bank));
+
+    if (bank_loaded) {
+        uint8_t tmp_flag = bank_loaded[a];
+        bank_loaded[a] = bank_loaded[b];
+        bank_loaded[b] = tmp_flag;
+    }
+}
+
 static size_t spectrum_expected_rom_banks(SpectrumModel model) {
     switch (model) {
         case SPECTRUM_MODEL_128K:
@@ -714,6 +787,49 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
                     ++current_loaded;
                     printf("Loaded ROM bank %zu from %s\n", bank, companion_path);
                 }
+            }
+        }
+    }
+
+    size_t inspect_limit = banks_needed;
+    if (inspect_limit > 4u) {
+        inspect_limit = 4u;
+    }
+
+    if (inspect_limit >= 2u) {
+        int menu_candidate = -1;
+        int basic_candidate = -1;
+        for (size_t bank = 0; bank < inspect_limit; ++bank) {
+            if (!bank_loaded[bank]) {
+                continue;
+            }
+            if (menu_candidate < 0 && spectrum_rom_bank_seems_128k_menu(rom_pages[bank])) {
+                menu_candidate = (int)bank;
+            }
+            if (basic_candidate < 0 && spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
+                basic_candidate = (int)bank;
+            }
+        }
+
+        if (menu_candidate >= 0 && menu_candidate != 0) {
+            spectrum_swap_rom_banks(0u, (size_t)menu_candidate, bank_loaded);
+            printf("Reordered ROM bank %d into slot 0 for 128K menu\n", menu_candidate);
+        }
+
+        if (inspect_limit > 1u) {
+            int refreshed_basic_candidate = -1;
+            for (size_t bank = 0; bank < inspect_limit; ++bank) {
+                if (!bank_loaded[bank]) {
+                    continue;
+                }
+                if (spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
+                    refreshed_basic_candidate = (int)bank;
+                    break;
+                }
+            }
+            if (refreshed_basic_candidate >= 0 && refreshed_basic_candidate != 1) {
+                spectrum_swap_rom_banks(1u, (size_t)refreshed_basic_candidate, bank_loaded);
+                printf("Reordered ROM bank %d into slot 1 for 48K BASIC\n", refreshed_basic_candidate);
             }
         }
     }
