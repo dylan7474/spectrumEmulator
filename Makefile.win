@@ -52,10 +52,10 @@ SDL2_LIBS := $(shell if command -v $(PKG_CONFIG) >/dev/null 2>&1; then \
 endif
 endif
 
-# Ensure the MinGW support libraries are linked if pkg-config did not add them.
+# Ensure the MinGW support libraries are linked if pkg-config omitted SDL2main.
 WIN_SUPPORT_LIBS := -lmingw32 -lSDL2main -lSDL2 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid
-ifeq ($(strip $(filter -lSDL2,$(SDL2_LIBS))),)
-SDL2_LIBS += $(WIN_SUPPORT_LIBS)
+ifeq ($(strip $(filter -lSDL2main,$(SDL2_LIBS))),)
+SDL2_LIBS += $(filter-out $(SDL2_LIBS),$(WIN_SUPPORT_LIBS))
 endif
 
 CFLAGS ?= -Wall -Wextra -O2
