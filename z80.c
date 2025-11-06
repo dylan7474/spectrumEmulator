@@ -640,6 +640,13 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
         expected_banks = 4u;
     }
 
+    const char *rom_label = rom_primary_path ? rom_primary_path : "<buffer>";
+    printf("Preparing ROM layout for model %d using '%s' (%zu expected bank%s)\n",
+           (int)spectrum_model,
+           rom_label,
+           expected_banks,
+           expected_banks == 1u ? "" : "s");
+
     char rom_stem[PATH_MAX];
     char rom_extension[PATH_MAX];
     rom_stem[0] = '\0';
@@ -700,9 +707,25 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
         bank_hint = -1;
     }
 
+    if (bank_hint >= 0) {
+        printf("Primary ROM filename supplies numeric bank hint %d (separator '%c')\n",
+               bank_hint,
+               separator_hint);
+    } else {
+        printf("Primary ROM filename did not contain a numeric bank hint\n");
+    }
+
     memset(rom_pages, 0, sizeof(rom_pages));
     uint8_t bank_loaded[4] = {0, 0, 0, 0};
     uint8_t bank_loaded_from_hint[4] = {0, 0, 0, 0};
+    uint8_t bank_loaded_from_primary[4] = {0, 0, 0, 0};
+    uint8_t bank_loaded_from_companion[4] = {0, 0, 0, 0};
+    uint8_t bank_mirrored_from[4];
+    uint8_t bank_matches_basic[4] = {0, 0, 0, 0};
+    uint8_t bank_matches_menu[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < 4u; ++i) {
+        bank_mirrored_from[i] = 0xFFu;
+    }
 
     size_t dest_order[4];
     size_t dest_count = 0u;
@@ -726,9 +749,16 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
         size_t dest_index = dest_order[chunk_index];
         memcpy(rom_pages[dest_index], rom_buffer + buffer_offset, 0x4000u);
         bank_loaded[dest_index] = 1u;
+        bank_loaded_from_primary[dest_index] = 1u;
+        bank_mirrored_from[dest_index] = (uint8_t)dest_index;
         if (chunk_index == 0u && bank_hint >= 0 && dest_index == (size_t)bank_hint) {
             bank_loaded_from_hint[dest_index] = 1u;
         }
+        printf("Primary ROM chunk %zu copied into bank %zu (0x%04zX bytes)%s\n",
+               chunk_index,
+               dest_index,
+               (size_t)0x4000u,
+               (bank_hint >= 0 && dest_index == (size_t)bank_hint) ? " [hinted]" : "");
         buffer_offset += 0x4000u;
         ++chunk_index;
     }
@@ -744,9 +774,15 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
             memset(rom_pages[dest_index] + remaining, 0, 0x4000u - remaining);
         }
         bank_loaded[dest_index] = 1u;
+        bank_loaded_from_primary[dest_index] = 1u;
+        bank_mirrored_from[dest_index] = (uint8_t)dest_index;
         if (chunk_index == 0u && bank_hint >= 0 && dest_index == (size_t)bank_hint) {
             bank_loaded_from_hint[dest_index] = 1u;
         }
+        printf("Primary ROM tail chunk copied into bank %zu (%zu bytes)%s\n",
+               dest_index,
+               remaining,
+               (bank_hint >= 0 && dest_index == (size_t)bank_hint) ? " [hinted]" : "");
     }
 
     size_t current_loaded = 0u;
@@ -810,6 +846,8 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
                 if (spectrum_load_rom_bank_file(companion_path, rom_pages[bank])) {
                     bank_loaded[bank] = 1u;
                     bank_loaded_from_hint[bank] = 1u;
+                    bank_loaded_from_companion[bank] = 1u;
+                    bank_mirrored_from[bank] = (uint8_t)bank;
                     ++current_loaded;
                     printf("Loaded ROM bank %zu from %s\n", bank, companion_path);
                 }
@@ -830,7 +868,12 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
         }
     }
 
+    if (hints_cover_all) {
+        printf("All required ROM banks arrived with numeric hints; skipping heuristic reordering\n");
+    }
+
     if (!hints_cover_all && inspect_limit >= 2u) {
+        printf("ROM bank hints incomplete; analysing signatures to find menu and BASIC banks\n");
         int menu_candidate = -1;
         int basic_candidate = -1;
         size_t non_basic_candidates[4];
@@ -841,6 +884,10 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
             }
 
             if (spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
+                if (!bank_matches_basic[bank]) {
+                    printf("ROM bank %zu matches 48K BASIC signature\n", bank);
+                    bank_matches_basic[bank] = 1u;
+                }
                 if (basic_candidate < 0) {
                     basic_candidate = (int)bank;
                 }
@@ -848,6 +895,10 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
             }
 
             if (menu_candidate < 0 && spectrum_rom_bank_seems_128k_menu(rom_pages[bank])) {
+                if (!bank_matches_menu[bank]) {
+                    printf("ROM bank %zu matches 128K menu signature\n", bank);
+                    bank_matches_menu[bank] = 1u;
+                }
                 menu_candidate = (int)bank;
             }
 
@@ -875,6 +926,10 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
                     continue;
                 }
                 if (spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
+                    if (!bank_matches_basic[bank]) {
+                        printf("ROM bank %zu matches 48K BASIC signature\n", bank);
+                        bank_matches_basic[bank] = 1u;
+                    }
                     refreshed_basic_candidate = (int)bank;
                     break;
                 }
@@ -904,12 +959,13 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
                 "Warning: only %zu of %zu ROM banks were found for '%s'; mirroring bank %d\n",
                 current_loaded,
                 banks_needed,
-                rom_primary_path ? rom_primary_path : "<buffer>",
+                rom_label,
                 fallback_bank);
         for (size_t bank = 0; bank < banks_needed; ++bank) {
             if (!bank_loaded[bank]) {
                 memcpy(rom_pages[bank], rom_pages[fallback_bank], 0x4000);
                 bank_loaded[bank] = 1u;
+                bank_mirrored_from[bank] = (uint8_t)fallback_bank;
             }
         }
         current_loaded = banks_needed;
@@ -930,9 +986,53 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
     for (size_t bank = final_bank_count; bank < 4u; ++bank) {
         size_t mirror = bank % final_bank_count;
         memcpy(rom_pages[bank], rom_pages[mirror], 0x4000);
+        bank_mirrored_from[bank] = (uint8_t)mirror;
     }
 
     rom_page_count = (uint8_t)final_bank_count;
+
+    printf("Final ROM bank layout (%zu active bank%s, ROM page count %u):\n",
+           final_bank_count,
+           final_bank_count == 1u ? "" : "s",
+           (unsigned int)rom_page_count);
+    for (size_t bank = 0; bank < final_bank_count; ++bank) {
+        const char *source;
+        char source_detail[64];
+        if (bank_loaded_from_primary[bank]) {
+            source = "primary image";
+            source_detail[0] = '\0';
+        } else if (bank_loaded_from_companion[bank]) {
+            source = "companion image";
+            source_detail[0] = '\0';
+        } else if (bank_mirrored_from[bank] != 0xFFu && bank_mirrored_from[bank] != bank) {
+            source = "mirrored";
+            snprintf(source_detail,
+                     sizeof(source_detail),
+                     " (from bank %u)",
+                     (unsigned int)bank_mirrored_from[bank]);
+        } else if (bank_mirrored_from[bank] == bank) {
+            source = "initialised";
+            source_detail[0] = '\0';
+        } else {
+            source = "uninitialised";
+            source_detail[0] = '\0';
+        }
+
+        const char *classification = "no signature";
+        if (bank_matches_menu[bank] || spectrum_rom_bank_seems_128k_menu(rom_pages[bank])) {
+            classification = "128K menu signature";
+        } else if (bank_matches_basic[bank] || spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
+            classification = "48K BASIC signature";
+        }
+
+        printf("  bank %zu: %s%s%s\n",
+               bank,
+               source,
+               source_detail,
+               bank_loaded_from_hint[bank] ? " [hinted]" : "");
+        printf("    signature: %s\n", classification);
+    }
+
     return 1;
 }
 
