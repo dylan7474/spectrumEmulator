@@ -59,6 +59,9 @@ static uint8_t page_contended[4] = {0u, 1u, 0u, 0u};
 static uint8_t floating_bus_last_value = 0xFFu;
 static uint8_t gate_array_7ffd_state = 0u;
 static uint8_t gate_array_1ffd_state = 0u;
+static uint8_t ay_registers[16];
+static uint8_t ay_selected_register = 0u;
+static int ay_register_latched = 0;
 
 typedef enum {
     MEMORY_PAGE_NONE,
@@ -1503,6 +1506,9 @@ static void spectrum_configure_model(SpectrumModel model) {
     paging_disabled = 0;
     gate_array_7ffd_state = 0u;
     gate_array_1ffd_state = 0u;
+    ay_selected_register = 0u;
+    ay_register_latched = 0;
+    memset(ay_registers, 0, sizeof(ay_registers));
     current_screen_bank = 5u;
     current_rom_page = 0u;
     current_paged_bank = (model == SPECTRUM_MODEL_48K) ? 7u : 0u;
@@ -6347,6 +6353,21 @@ void io_write(uint16_t port, uint8_t value) {
     }
 
     int is_128k_family = (spectrum_model != SPECTRUM_MODEL_48K);
+    if (is_128k_family) {
+        uint16_t ay_port = (uint16_t)(port & 0xC002u);
+        if (ay_port == 0xC000u) {
+            ay_selected_register = (uint8_t)(value & 0x0Fu);
+            ay_register_latched = 1;
+            return;
+        }
+        if (ay_port == 0x8000u) {
+            uint8_t reg = (uint8_t)(ay_selected_register & 0x0Fu);
+            ay_registers[reg] = value;
+            ay_register_latched = 1;
+            return;
+        }
+    }
+
     if (is_128k_family && (port & 0x7FFD) == 0x7FFD) {
         if (!paging_disabled) {
             uint8_t masked = (uint8_t)(value & 0x3Fu);
@@ -6392,6 +6413,18 @@ uint8_t io_read(uint16_t port) {
         // printf("IO Read Port 0x%04X (ULA/Keyboard): AddrHi=0x%02X -> Result=0x%02X\n", port, high_byte, result); // DEBUG
         return result;
     }
+
+    if (spectrum_model != SPECTRUM_MODEL_48K) {
+        uint16_t ay_port = (uint16_t)(port & 0xC002u);
+        if (ay_port == 0xC000u || ay_port == 0x8000u) {
+            if (!ay_register_latched) {
+                return 0xFFu;
+            }
+            uint8_t reg = (uint8_t)(ay_selected_register & 0x0Fu);
+            return ay_registers[reg];
+        }
+    }
+
     uint64_t access_t_state = spectrum_current_access_tstate();
     apply_port_contention(access_t_state);
     return spectrum_sample_floating_bus(access_t_state);
