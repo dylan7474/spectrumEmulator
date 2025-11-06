@@ -33,9 +33,10 @@ Sourcing the script without arguments simply exports the recommended compiler
 flags while allowing you to manage dependencies manually.
 
 ### Windows
-1. Ensure a POSIX-compatible shell environment such as MSYS2 or Cygwin with SDL2 development packages installed.
-2. Use `./configure` (optional on Windows) or confirm that `gcc`, `pkg-config`, and SDL2 are available in your environment.
-3. Build with `make -f Makefile.win` to produce the Windows binary.
+1. Install a POSIX-compatible shell such as MSYS2 or Cygwin and ensure a GCC toolchain is available.
+2. Install the SDL2 development package. If you downloaded the official development ZIP, set `SDL2_DIR` to its root (or pass `SDL2_INCLUDEDIR`/`SDL2_LIBDIR`) so the makefile can locate headers and import libraries.
+3. Optionally run `./configure` from the shell to confirm the compiler and SDL2 files are visible.
+4. Build with `make -f Makefile.win` (or `mingw32-make -f Makefile.win` on MinGW environments). The resulting executable is `z80.exe` in the project root.
 
 ## Running
 Launch the compiled executable from the command line. By default the emulator powers up as a 48 KB Spectrum when provided with a standard ROM dump:
