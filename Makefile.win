@@ -1,0 +1,77 @@
+# --- Windows Makefile for Z80 Emulator ---
+#
+# This makefile targets MinGW or MSYS2 environments where a GCC-compatible
+# toolchain is available. It mirrors the Unix build while providing helpers to
+# locate SDL2 when pkg-config is unavailable.
+
+CC ?= gcc
+PKG_CONFIG ?= pkg-config
+
+TARGET := z80.exe
+SRCS := z80.c
+
+# Allow callers to provide explicit SDL2 include/lib directories. When
+# SDL2_INCLUDEDIR or SDL2_LIBDIR are unset but SDL2_DIR is present, fall back to
+# the conventional directory layout from the official Windows development
+# archives.
+SDL2_DIR ?=
+SDL2_INCLUDEDIR ?=
+SDL2_LIBDIR ?=
+
+# Collect include flags, preferring explicit variables but deferring to
+# pkg-config when none are supplied.
+ifndef SDL2_CFLAGS
+SDL2_CFLAGS :=
+ifneq ($(strip $(SDL2_INCLUDEDIR)),)
+SDL2_CFLAGS += -I"$(SDL2_INCLUDEDIR)"
+endif
+ifneq ($(strip $(SDL2_DIR)),)
+SDL2_CFLAGS += -I"$(SDL2_DIR)/include" -I"$(SDL2_DIR)/include/SDL2"
+endif
+ifeq ($(strip $(SDL2_CFLAGS)),)
+SDL2_CFLAGS := $(shell if command -v $(PKG_CONFIG) >/dev/null 2>&1; then \
+        $(PKG_CONFIG) --cflags sdl2 2>/dev/null; \
+    fi)
+endif
+endif
+
+# Collect linker flags. When pkg-config cannot be used, assume the common
+# MinGW-style import libraries distributed with SDL2.
+ifndef SDL2_LIBS
+SDL2_LIBS :=
+ifneq ($(strip $(SDL2_LIBDIR)),)
+SDL2_LIBS += -L"$(SDL2_LIBDIR)"
+endif
+ifneq ($(strip $(SDL2_DIR)),)
+SDL2_LIBS += -L"$(SDL2_DIR)/lib"
+endif
+ifeq ($(strip $(SDL2_LIBS)),)
+SDL2_LIBS := $(shell if command -v $(PKG_CONFIG) >/dev/null 2>&1; then \
+        $(PKG_CONFIG) --libs sdl2 2>/dev/null; \
+    fi)
+endif
+endif
+
+# Ensure the MinGW support libraries are linked if pkg-config omitted SDL2main.
+WIN_SUPPORT_LIBS := -lmingw32 -lSDL2main -lSDL2 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid
+ifeq ($(strip $(filter -lSDL2main,$(SDL2_LIBS))),)
+SDL2_LIBS += $(filter-out $(SDL2_LIBS),$(WIN_SUPPORT_LIBS))
+endif
+
+CFLAGS ?= -Wall -Wextra -O2
+CFLAGS += -std=c11 $(SDL2_CFLAGS)
+
+LDFLAGS += $(SDL2_LIBS) -lm
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
+
+run: $(TARGET)
+	./$< 48.rom
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: all run clean
