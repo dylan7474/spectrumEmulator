@@ -176,16 +176,15 @@ demos and fast loaders working straight from their archival images.
 ### Snapshots
 
 Quick-load snapshot support complements the tape deck when you want to launch
-software without the ROM loader delays. The emulator recognises 48 KB `.sna`
-and `.z80` images (including the common compressed variants) either via the
-`--snapshot` flag or through positional auto-detection. Snapshot loads happen
-before SDL initialisation so the Spectrum appears on-screen already running the
-captured program, complete with CPU registers and RAM restored from the saved
-state.
-
-Snapshot files always select the 48K model today. If you need 128K machine
-state, load the ROM normally and use tape images until broader snapshot formats
-are implemented.
+software without the ROM loader delays. The emulator recognises 48 KB and 128
+KB `.sna` images alongside the `.z80` family (including the common compressed
+variants) either via the `--snapshot` flag or through positional
+auto-detection. Snapshot loads happen before SDL initialisation so the Spectrum
+appears on-screen already running the captured program, complete with CPU
+registers and RAM restored from the saved state. 128K `.sna` files automatically
+recover the last `0x7FFD` and (when present) `0x1FFD` gate-array writes so the
+loader can select the 128K, +2A, or +3 models as needed without user
+intervention, giving every machine an instant boot path.
 
 Recent fixes corrected the Version 1 `.z80` header parser so the compression
 flag, the high bit of the `R` register, and the surrounding register fields are
@@ -220,9 +219,9 @@ Additional host shortcuts:
 - F11 or Alt+Enter toggles fullscreen mode.
 
 ## Roadmap
-- **Snapshot enhancements** – Broaden the new snapshot loader with 128K `.sna`
-  variants and additional hardware models so every machine can benefit from
-  quick-start images.
+- **Snapshot stress tests** – Build automated `.sna`/`.z80` regression suites and
+  compatibility probes so the broadened loader stays reliable across ROM and
+  paging combinations.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
 - **Automation and CI** – Expand the new Linux CI pipeline with Windows builds and long-running cassette regressions so audio,
