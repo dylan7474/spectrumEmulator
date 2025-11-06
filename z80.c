@@ -529,13 +529,43 @@ static int spectrum_rom_contains_ascii(const uint8_t *rom, size_t size, const ch
     return 0;
 }
 
+static int spectrum_rom_contains_ascii_case_insensitive(const uint8_t *rom,
+                                                        size_t size,
+                                                        const char *needle) {
+    if (!rom || !needle) {
+        return 0;
+    }
+
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0u || needle_len > size) {
+        return 0;
+    }
+
+    for (size_t i = 0; i + needle_len <= size; ++i) {
+        size_t j = 0u;
+        while (j < needle_len) {
+            unsigned char rom_byte = rom[i + j];
+            unsigned char needle_byte = (unsigned char)needle[j];
+            if (tolower(rom_byte) != tolower(needle_byte)) {
+                break;
+            }
+            ++j;
+        }
+        if (j == needle_len) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static int spectrum_rom_bank_seems_48k_basic(const uint8_t *rom) {
     if (!rom) {
         return 0;
     }
 
     int has_1982 = spectrum_rom_contains_ascii(rom, 0x4000u, "1982");
-    int has_sinclair_research = spectrum_rom_contains_ascii(rom, 0x4000u, "SINCLAIR RESEARCH");
+    int has_sinclair_research = spectrum_rom_contains_ascii_case_insensitive(rom, 0x4000u, "Sinclair Research");
     return has_1982 && has_sinclair_research;
 }
 
@@ -548,7 +578,7 @@ static int spectrum_rom_bank_seems_128k_menu(const uint8_t *rom) {
     size_t marker_count = sizeof(menu_markers) / sizeof(menu_markers[0]);
     int marker_hit = 0;
     for (size_t i = 0; i < marker_count; ++i) {
-        if (spectrum_rom_contains_ascii(rom, 0x4000u, menu_markers[i])) {
+        if (spectrum_rom_contains_ascii_case_insensitive(rom, 0x4000u, menu_markers[i])) {
             marker_hit = 1;
             break;
         }
@@ -562,7 +592,15 @@ static int spectrum_rom_bank_seems_128k_menu(const uint8_t *rom) {
     return has_128_text;
 }
 
-static void spectrum_swap_rom_banks(size_t a, size_t b, uint8_t bank_loaded[4]) {
+static void spectrum_swap_rom_banks(size_t a,
+                                    size_t b,
+                                    uint8_t bank_loaded[4],
+                                    uint8_t bank_loaded_from_primary[4],
+                                    uint8_t bank_loaded_from_companion[4],
+                                    uint8_t bank_loaded_from_hint[4],
+                                    uint8_t bank_mirrored_from[4],
+                                    uint8_t bank_matches_basic[4],
+                                    uint8_t bank_matches_menu[4]) {
     if (a >= 4u || b >= 4u || a == b) {
         return;
     }
@@ -576,6 +614,46 @@ static void spectrum_swap_rom_banks(size_t a, size_t b, uint8_t bank_loaded[4]) 
         uint8_t tmp_flag = bank_loaded[a];
         bank_loaded[a] = bank_loaded[b];
         bank_loaded[b] = tmp_flag;
+    }
+    if (bank_loaded_from_primary) {
+        uint8_t tmp_flag = bank_loaded_from_primary[a];
+        bank_loaded_from_primary[a] = bank_loaded_from_primary[b];
+        bank_loaded_from_primary[b] = tmp_flag;
+    }
+    if (bank_loaded_from_companion) {
+        uint8_t tmp_flag = bank_loaded_from_companion[a];
+        bank_loaded_from_companion[a] = bank_loaded_from_companion[b];
+        bank_loaded_from_companion[b] = tmp_flag;
+    }
+    if (bank_loaded_from_hint) {
+        uint8_t tmp_flag = bank_loaded_from_hint[a];
+        bank_loaded_from_hint[a] = bank_loaded_from_hint[b];
+        bank_loaded_from_hint[b] = tmp_flag;
+    }
+    if (bank_mirrored_from) {
+        uint8_t tmp_origin = bank_mirrored_from[a];
+        bank_mirrored_from[a] = bank_mirrored_from[b];
+        bank_mirrored_from[b] = tmp_origin;
+        for (size_t i = 0; i < 4u; ++i) {
+            if (i == a || i == b) {
+                continue;
+            }
+            if (bank_mirrored_from[i] == (uint8_t)a) {
+                bank_mirrored_from[i] = (uint8_t)b;
+            } else if (bank_mirrored_from[i] == (uint8_t)b) {
+                bank_mirrored_from[i] = (uint8_t)a;
+            }
+        }
+    }
+    if (bank_matches_basic) {
+        uint8_t tmp_flag = bank_matches_basic[a];
+        bank_matches_basic[a] = bank_matches_basic[b];
+        bank_matches_basic[b] = tmp_flag;
+    }
+    if (bank_matches_menu) {
+        uint8_t tmp_flag = bank_matches_menu[a];
+        bank_matches_menu[a] = bank_matches_menu[b];
+        bank_matches_menu[b] = tmp_flag;
     }
 }
 
@@ -868,12 +946,19 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
         }
     }
 
+    int enforce_pair_order = (expected_banks <= 2u);
     if (hints_cover_all) {
-        printf("All required ROM banks arrived with numeric hints; skipping heuristic reordering\n");
+        if (enforce_pair_order && inspect_limit >= 2u) {
+            printf("All required ROM banks arrived with numeric hints; verifying canonical order\n");
+        } else {
+            printf("All required ROM banks arrived with numeric hints; skipping heuristic reordering\n");
+        }
     }
 
-    if (!hints_cover_all && inspect_limit >= 2u) {
-        printf("ROM bank hints incomplete; analysing signatures to find menu and BASIC banks\n");
+    if (inspect_limit >= 2u && enforce_pair_order) {
+        if (!hints_cover_all) {
+            printf("ROM bank hints incomplete; analysing signatures to find menu and BASIC banks\n");
+        }
         int menu_candidate = -1;
         int basic_candidate = -1;
         size_t non_basic_candidates[4];
@@ -907,37 +992,55 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
             }
         }
 
-        if (menu_candidate < 0 && basic_candidate >= 0 && non_basic_count > 0u) {
+        if (!hints_cover_all && menu_candidate < 0 && basic_candidate >= 0 && non_basic_count > 0u) {
             menu_candidate = (int)non_basic_candidates[0];
             printf("Assuming ROM bank %d is the 128K menu (non-48K companion)\n", menu_candidate);
         }
 
-        int menu_confirmed = (menu_candidate >= 0);
-
         if (menu_candidate >= 0 && menu_candidate != 0) {
-            spectrum_swap_rom_banks(0u, (size_t)menu_candidate, bank_loaded);
-            printf("Reordered ROM bank %d into slot 0 for 128K menu\n", menu_candidate);
+            int original_menu = menu_candidate;
+            spectrum_swap_rom_banks(0u,
+                                     (size_t)menu_candidate,
+                                     bank_loaded,
+                                     bank_loaded_from_primary,
+                                     bank_loaded_from_companion,
+                                     bank_loaded_from_hint,
+                                     bank_mirrored_from,
+                                     bank_matches_basic,
+                                     bank_matches_menu);
+            const char *note = hints_cover_all ? " (overrode numeric hints)" : "";
+            printf("Reordered ROM bank %d into slot 0 for 128K menu%s\n", original_menu, note);
+            if (basic_candidate == 0) {
+                basic_candidate = original_menu;
+            } else if (basic_candidate == original_menu) {
+                basic_candidate = 0;
+            }
+            menu_candidate = 0;
         }
 
-        if (menu_confirmed && inspect_limit > 1u) {
-            int refreshed_basic_candidate = -1;
-            for (size_t bank = 0; bank < inspect_limit; ++bank) {
-                if (!bank_loaded[bank]) {
-                    continue;
-                }
-                if (spectrum_rom_bank_seems_48k_basic(rom_pages[bank])) {
-                    if (!bank_matches_basic[bank]) {
-                        printf("ROM bank %zu matches 48K BASIC signature\n", bank);
-                        bank_matches_basic[bank] = 1u;
-                    }
-                    refreshed_basic_candidate = (int)bank;
-                    break;
-                }
+        size_t desired_basic_slot = 1u;
+        if (basic_candidate >= 0 && inspect_limit > desired_basic_slot && (size_t)basic_candidate != desired_basic_slot) {
+            int original_basic = basic_candidate;
+            spectrum_swap_rom_banks(desired_basic_slot,
+                                     (size_t)basic_candidate,
+                                     bank_loaded,
+                                     bank_loaded_from_primary,
+                                     bank_loaded_from_companion,
+                                     bank_loaded_from_hint,
+                                     bank_mirrored_from,
+                                     bank_matches_basic,
+                                     bank_matches_menu);
+            const char *note = hints_cover_all ? " (overrode numeric hints)" : "";
+            printf("Reordered ROM bank %d into slot %zu for 48K BASIC%s\n",
+                   original_basic,
+                   desired_basic_slot,
+                   note);
+            if (menu_candidate == (int)desired_basic_slot) {
+                menu_candidate = original_basic;
+            } else if (menu_candidate == original_basic) {
+                menu_candidate = (int)desired_basic_slot;
             }
-            if (refreshed_basic_candidate >= 0 && refreshed_basic_candidate != 1) {
-                spectrum_swap_rom_banks(1u, (size_t)refreshed_basic_candidate, bank_loaded);
-                printf("Reordered ROM bank %d into slot 1 for 48K BASIC\n", refreshed_basic_candidate);
-            }
+            basic_candidate = (int)desired_basic_slot;
         }
     }
 
@@ -990,6 +1093,16 @@ static int spectrum_populate_rom_pages(const char *rom_primary_path,
     }
 
     rom_page_count = (uint8_t)final_bank_count;
+
+    for (size_t bank = 0; bank < final_bank_count; ++bank) {
+        if (!bank_loaded[bank]) {
+            bank_matches_basic[bank] = 0u;
+            bank_matches_menu[bank] = 0u;
+            continue;
+        }
+        bank_matches_basic[bank] = spectrum_rom_bank_seems_48k_basic(rom_pages[bank]) ? 1u : 0u;
+        bank_matches_menu[bank] = spectrum_rom_bank_seems_128k_menu(rom_pages[bank]) ? 1u : 0u;
+    }
 
     printf("Final ROM bank layout (%zu active bank%s, ROM page count %u):\n",
            final_bank_count,
