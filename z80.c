@@ -32,6 +32,22 @@ typedef enum {
     SPECTRUM_MODEL_PLUS3
 } SpectrumModel;
 
+static const char* spectrum_model_to_string(SpectrumModel model) {
+    switch (model) {
+        case SPECTRUM_MODEL_48K:
+            return "48K";
+        case SPECTRUM_MODEL_128K:
+            return "128K";
+        case SPECTRUM_MODEL_PLUS2A:
+            return "+2A";
+        case SPECTRUM_MODEL_PLUS3:
+            return "+3";
+        default:
+            break;
+    }
+    return "Unknown";
+}
+
 typedef enum {
     CONTENTION_PROFILE_48K,
     CONTENTION_PROFILE_128K,
@@ -2921,8 +2937,6 @@ static int snapshot_load_sna(const char* path, Z80* cpu) {
         return 0;
     }
 
-    spectrum_configure_model(SPECTRUM_MODEL_48K);
-
     cpu->reg_I = header[0];
     uint16_t hl_alt = (uint16_t)header[1] | ((uint16_t)header[2] << 8);
     uint16_t de_alt = (uint16_t)header[3] | ((uint16_t)header[4] << 8);
@@ -2993,33 +3007,136 @@ static int snapshot_load_sna(const char* path, Z80* cpu) {
     uint16_t pc = (uint16_t)pc_bytes[0] | ((uint16_t)pc_bytes[1] << 8);
     cpu->reg_PC = pc;
 
-    long current_pos = ftell(sf);
-    if (current_pos >= 0 && fseek(sf, 0, SEEK_END) == 0) {
+    long extension_pos = ftell(sf);
+    size_t extension_bytes = 0u;
+    if (extension_pos >= 0 && fseek(sf, 0, SEEK_END) == 0) {
         long end_pos = ftell(sf);
-        if (end_pos > current_pos) {
-            fprintf(stderr, "SNA snapshot '%s' uses unsupported 128K extensions\n", path);
+        if (end_pos >= extension_pos) {
+            extension_bytes = (size_t)(end_pos - extension_pos);
+        }
+        if (fseek(sf, extension_pos, SEEK_SET) != 0) {
+            fprintf(stderr, "Failed to seek within SNA snapshot '%s'\n", path);
             free(ram_buffer);
             fclose(sf);
             return 0;
         }
     }
 
-    memcpy(ram_pages[5], ram_buffer + 0x0000u, 0x4000u);
-    memcpy(ram_pages[2], ram_buffer + 0x4000u, 0x4000u);
-    memcpy(ram_pages[7], ram_buffer + 0x8000u, 0x4000u);
-    spectrum_refresh_visible_ram();
+    int loaded_ok = 0;
+    if (extension_bytes == 0u) {
+        spectrum_configure_model(SPECTRUM_MODEL_48K);
+        memcpy(ram_pages[5], ram_buffer + 0x0000u, 0x4000u);
+        memcpy(ram_pages[2], ram_buffer + 0x4000u, 0x4000u);
+        memcpy(ram_pages[7], ram_buffer + 0x8000u, 0x4000u);
+        spectrum_apply_memory_configuration();
+        spectrum_refresh_visible_ram();
+        loaded_ok = 1;
+    } else {
+        size_t required_bytes = 2u + (size_t)8u * 0x4000u;
+        if (extension_bytes < required_bytes) {
+            fprintf(stderr, "SNA snapshot '%s' truncated 128K payload (%zu bytes)\n",
+                    path,
+                    extension_bytes);
+        } else {
+            uint8_t port_7ffd = 0u;
+            uint8_t trdos_flag = 0u;
+            if (fread(&port_7ffd, 1, 1, sf) != 1 || fread(&trdos_flag, 1, 1, sf) != 1) {
+                fprintf(stderr, "Failed to read SNA 128K gate-array state from '%s'\n", path);
+            } else {
+                (void)trdos_flag;
+                loaded_ok = 1;
+                for (int bank = 0; bank < 8; ++bank) {
+                    if (fread(ram_pages[bank], 0x4000u, 1, sf) != 1) {
+                        fprintf(stderr, "Failed to read SNA 128K RAM bank %d from '%s'\n",
+                                bank,
+                                path);
+                        loaded_ok = 0;
+                        break;
+                    }
+                }
+            }
+
+            if (loaded_ok) {
+                size_t consumed = required_bytes;
+                uint8_t port_1ffd = 0u;
+                int have_1ffd = 0;
+                if (extension_bytes > consumed) {
+                    size_t remaining = extension_bytes - consumed;
+                    if (remaining >= 1u) {
+                        if (fread(&port_1ffd, 1, 1, sf) != 1) {
+                            fprintf(stderr, "Failed to read SNA 128K 1FFD state from '%s'\n", path);
+                            loaded_ok = 0;
+                        } else {
+                            have_1ffd = 1;
+                            consumed += 1u;
+                        }
+                    }
+                    if (loaded_ok && extension_bytes > consumed) {
+                        fprintf(stderr,
+                                "SNA snapshot '%s' has %zu unexpected padding bytes\n",
+                                path,
+                                extension_bytes - consumed);
+                        loaded_ok = 0;
+                    }
+                }
+
+                if (loaded_ok) {
+                    SpectrumModel preferred = spectrum_model;
+                    SpectrumModel target_model;
+                    if (have_1ffd) {
+                        if (preferred == SPECTRUM_MODEL_PLUS2A || preferred == SPECTRUM_MODEL_PLUS3) {
+                            target_model = preferred;
+                        } else {
+                            target_model = SPECTRUM_MODEL_PLUS2A;
+                        }
+                    } else {
+                        if (preferred == SPECTRUM_MODEL_128K ||
+                            preferred == SPECTRUM_MODEL_PLUS2A ||
+                            preferred == SPECTRUM_MODEL_PLUS3) {
+                            target_model = preferred;
+                        } else {
+                            target_model = SPECTRUM_MODEL_128K;
+                        }
+                    }
+
+                    spectrum_configure_model(target_model);
+
+                    gate_array_7ffd_state = (uint8_t)(port_7ffd & 0x3Fu);
+                    paging_disabled = (gate_array_7ffd_state & 0x20u) ? 1 : 0;
+                    current_paged_bank = (uint8_t)(gate_array_7ffd_state & 0x07u);
+                    if (target_model == SPECTRUM_MODEL_PLUS2A || target_model == SPECTRUM_MODEL_PLUS3) {
+                        gate_array_1ffd_state = have_1ffd ? (uint8_t)(port_1ffd & 0x07u) : 0u;
+                    } else {
+                        gate_array_1ffd_state = 0u;
+                    }
+
+                    spectrum_apply_memory_configuration();
+                    spectrum_refresh_visible_ram();
+                }
+            }
+        }
+    }
+
     free(ram_buffer);
-    spectrum_apply_memory_configuration();
+
+    if (!loaded_ok) {
+        fclose(sf);
+        return 0;
+    }
 
     fclose(sf);
 
     fprintf(stderr,
-            "SNA snapshot '%s': PC=%04X SP=%04X IM=%d border=%u\n",
+            "SNA snapshot '%s': model=%s PC=%04X SP=%04X IM=%d border=%u bank=%u rom=%u %s\n",
             path,
+            spectrum_model_to_string(spectrum_model),
             (unsigned)cpu->reg_PC,
             (unsigned)cpu->reg_SP,
             cpu->interruptMode,
-            (unsigned)border);
+            (unsigned)border,
+            (unsigned)current_paged_bank,
+            (unsigned)current_rom_page,
+            paging_disabled ? "paging=locked" : "paging=unlocked");
     return 1;
 }
 
