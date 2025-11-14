@@ -3868,7 +3868,8 @@ static void tape_reset_playback(TapePlaybackState* state) {
     state->position_tstates = 0;
     state->position_start_tstate = 0;
     state->last_transition_tstate = 0;
-    if (state == &tape_playback && state->format == TAPE_FORMAT_WAV) {
+    if (state == &tape_playback &&
+        (state->format == TAPE_FORMAT_WAV || tape_recorder.output_format == TAPE_OUTPUT_WAV)) {
         tape_wav_shared_position_tstates = 0;
     }
     if ((state->format == TAPE_FORMAT_WAV) ||
@@ -5526,7 +5527,9 @@ static void tape_update(uint64_t current_t_state) {
             } else {
                 state->playing = 0;
                 tape_playback_accumulate_elapsed(state, transition_time);
-                if (state == &tape_playback && state->format == TAPE_FORMAT_WAV) {
+                if (state == &tape_playback &&
+                    (state->format == TAPE_FORMAT_WAV ||
+                     tape_recorder.output_format == TAPE_OUTPUT_WAV)) {
                     tape_wav_shared_position_tstates = state->position_tstates;
                 }
                 tape_deck_status = TAPE_DECK_STATUS_STOP;
@@ -5547,7 +5550,9 @@ static void tape_update(uint64_t current_t_state) {
                     speaker_update_output(state->pause_end_tstate, 1);
                     tape_playback_accumulate_elapsed(state, state->pause_end_tstate);
                     state->last_transition_tstate = state->pause_end_tstate;
-                    if (state == &tape_playback && state->format == TAPE_FORMAT_WAV) {
+                    if (state == &tape_playback &&
+                        (state->format == TAPE_FORMAT_WAV ||
+                         tape_recorder.output_format == TAPE_OUTPUT_WAV)) {
                         tape_wav_shared_position_tstates = state->position_tstates;
                     }
                     tape_deck_status = TAPE_DECK_STATUS_STOP;
@@ -5561,7 +5566,9 @@ static void tape_update(uint64_t current_t_state) {
                     speaker_update_output(state->pause_end_tstate, 1);
                     tape_playback_accumulate_elapsed(state, state->pause_end_tstate);
                     state->last_transition_tstate = state->pause_end_tstate;
-                    if (state == &tape_playback && state->format == TAPE_FORMAT_WAV) {
+                    if (state == &tape_playback &&
+                        (state->format == TAPE_FORMAT_WAV ||
+                         tape_recorder.output_format == TAPE_OUTPUT_WAV)) {
                         tape_wav_shared_position_tstates = state->position_tstates;
                     }
                     tape_deck_status = TAPE_DECK_STATUS_STOP;
@@ -5688,7 +5695,9 @@ static void tape_update(uint64_t current_t_state) {
             }
             tape_playback_accumulate_elapsed(state, stop_time);
             state->last_transition_tstate = stop_time;
-            if (state == &tape_playback && state->format == TAPE_FORMAT_WAV) {
+            if (state == &tape_playback &&
+                (state->format == TAPE_FORMAT_WAV ||
+                 tape_recorder.output_format == TAPE_OUTPUT_WAV)) {
                 tape_wav_shared_position_tstates = state->position_tstates;
             }
             tape_deck_status = TAPE_DECK_STATUS_STOP;
