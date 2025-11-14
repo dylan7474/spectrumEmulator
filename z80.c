@@ -5087,44 +5087,15 @@ layout_retry:
         ++control_count;
     }
 
-    char control_hint[128];
-    control_hint[0] = '\0';
-    size_t control_hint_len = 0u;
-    if (show_play) {
-        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
-                                            sizeof(control_hint) - control_hint_len,
-                                            "%sPlay (P)",
-                                            control_hint_len > 0 ? "   " : "");
-    }
-    if (show_stop && control_hint_len < sizeof(control_hint)) {
-        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
-                                            sizeof(control_hint) - control_hint_len,
-                                            "%sStop (S)",
-                                            control_hint_len > 0 ? "   " : "");
-    }
-    if (show_rewind && control_hint_len < sizeof(control_hint)) {
-        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
-                                            sizeof(control_hint) - control_hint_len,
-                                            "%sRewind (W)",
-                                            control_hint_len > 0 ? "   " : "");
-    }
-    if (show_record && control_hint_len < sizeof(control_hint)) {
-        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
-                                            sizeof(control_hint) - control_hint_len,
-                                            "%sRecord (R)",
-                                            control_hint_len > 0 ? "   " : "");
-    }
-    int control_hint_width = control_hint[0] ? tape_overlay_text_width(control_hint, scale, spacing) : 0;
-
     struct TapeManagerActionButton {
         const char* label;
         int enabled;
     };
 
     struct TapeManagerActionButton action_buttons[] = {
-        {"LOAD (L)", 1},
-        {"EJECT (E)", (tape_input_enabled || tape_input_format != TAPE_FORMAT_NONE) ? 1 : 0},
-        {"CLOSE (TAB)", 1}
+        {"LOAD", 1},
+        {"EJECT", (tape_input_enabled || tape_input_format != TAPE_FORMAT_NONE) ? 1 : 0},
+        {"CLOSE", 1}
     };
 
     int action_button_widths[3];
@@ -5206,9 +5177,6 @@ layout_retry:
     if (control_row_width > panel_width) {
         panel_width = control_row_width;
     }
-    if (control_hint_width > panel_width) {
-        panel_width = control_hint_width;
-    }
     if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && action_row_width > panel_width) {
         panel_width = action_row_width;
     }
@@ -5249,10 +5217,6 @@ layout_retry:
         if (control_count > 0) {
             panel_height += section_gap;
             panel_height += control_button_size;
-            if (control_hint[0]) {
-                panel_height += line_gap;
-                panel_height += line_height;
-            }
         }
 
         panel_height += section_gap;
@@ -5363,12 +5327,6 @@ layout_retry:
 
             cursor_y += control_button_size;
 
-            if (control_hint[0]) {
-                cursor_y += line_gap;
-                int hint_x = origin_x + (panel_width - control_hint_width) / 2;
-                tape_overlay_draw_text(hint_x, cursor_y, control_hint, scale, spacing, dim_text_color);
-                cursor_y += line_height;
-            }
         }
 
         cursor_y += section_gap;
