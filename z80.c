@@ -309,6 +309,17 @@ typedef enum {
 static TapeDeckStatus tape_deck_status = TAPE_DECK_STATUS_IDLE;
 static int tape_debug_logging = 0;
 
+typedef enum {
+    TAPE_MANAGER_MODE_HIDDEN,
+    TAPE_MANAGER_MODE_MENU,
+    TAPE_MANAGER_MODE_FILE_INPUT
+} TapeManagerMode;
+
+static TapeManagerMode tape_manager_mode = TAPE_MANAGER_MODE_HIDDEN;
+static char tape_manager_status[128] = "PRESS TAB TO OPEN TAPE MANAGER";
+static char tape_manager_input_buffer[PATH_MAX];
+static size_t tape_manager_input_length = 0u;
+
 static void tape_log(const char* fmt, ...) {
     if (!tape_debug_logging || !fmt) {
         return;
@@ -360,6 +371,13 @@ typedef struct {
 
 static const TapeOverlayGlyph tape_overlay_font[] = {
     {' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+    {'!', {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04}},
+    {'(', {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}},
+    {')', {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}},
+    {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+    {'.', {0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x00}},
+    {'/', {0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00}},
+    {'?', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}},
     {'0', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
     {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
     {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
@@ -371,18 +389,33 @@ static const TapeOverlayGlyph tape_overlay_font[] = {
     {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
     {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
     {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
     {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+    {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}},
     {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+    {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+    {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E}},
+    {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'J', {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C}},
+    {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
     {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+    {'M', {0x11, 0x1B, 0x15, 0x11, 0x11, 0x11, 0x11}},
+    {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}},
     {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
     {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'Q', {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}},
     {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
     {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
     {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'V', {0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04}},
     {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}},
+    {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}},
     {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
-    {':', {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}},
-    {'.', {0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x00}}
+    {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
+    {'_', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F}},
+    {':', {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}}
 };
 
 static const TapeControlIcon tape_control_icons[] = {
@@ -416,6 +449,7 @@ static int* ula_instruction_progress_ptr = NULL;
 
 static TapeFormat tape_input_format = TAPE_FORMAT_NONE;
 static const char* tape_input_path = NULL;
+static char tape_input_path_storage[PATH_MAX];
 static SnapshotFormat snapshot_input_format = SNAPSHOT_FORMAT_NONE;
 static const char* snapshot_input_path = NULL;
 
@@ -466,6 +500,18 @@ static void tape_deck_rewind(uint64_t current_t_state);
 static void tape_deck_record(uint64_t current_t_state, int append_mode);
 static int tape_handle_control_key(const SDL_Event* event);
 static int tape_handle_mouse_button(const SDL_Event* event);
+static int tape_manager_handle_event(const SDL_Event* event);
+static int tape_manager_handle_text_input(const SDL_Event* event);
+static void tape_manager_toggle(void);
+static void tape_manager_hide(void);
+static void tape_manager_show_menu(void);
+static void tape_manager_begin_path_input(void);
+static void tape_manager_cancel_path_input(void);
+static void tape_manager_set_status(const char* fmt, ...);
+static int tape_manager_load_path(const char* path);
+static void tape_manager_eject_tape(void);
+static void tape_render_manager(void);
+static void tape_set_input_path(const char* path);
 static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t stop_t_state);
 static uint64_t tape_playback_elapsed_tstates(const TapePlaybackState* state, uint64_t current_t_state);
 static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
@@ -3748,6 +3794,21 @@ static TapeFormat tape_format_from_extension(const char* path) {
     return TAPE_FORMAT_NONE;
 }
 
+static void tape_set_input_path(const char* path) {
+    if (path && *path) {
+        size_t length = strlen(path);
+        if (length >= sizeof(tape_input_path_storage)) {
+            length = sizeof(tape_input_path_storage) - 1u;
+        }
+        memcpy(tape_input_path_storage, path, length);
+        tape_input_path_storage[length] = '\0';
+        tape_input_path = tape_input_path_storage;
+    } else {
+        tape_input_path_storage[0] = '\0';
+        tape_input_path = NULL;
+    }
+}
+
 static int tape_load_image(const char* path, TapeFormat format, TapeImage* image) {
     if (!path || !image || format == TAPE_FORMAT_NONE) {
         return 0;
@@ -4175,6 +4236,106 @@ static void tape_overlay_draw_text(int origin_x, int origin_y, const char* text,
     }
 }
 
+static void tape_overlay_draw_rect(int x, int y, int width, int height, uint32_t fill_color, uint32_t border_color) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    for (int yy = 0; yy < height; ++yy) {
+        int py = y + yy;
+        if (py < 0 || py >= TOTAL_HEIGHT) {
+            continue;
+        }
+        for (int xx = 0; xx < width; ++xx) {
+            int px = x + xx;
+            if (px < 0 || px >= TOTAL_WIDTH) {
+                continue;
+            }
+            int is_border = (yy == 0 || yy == height - 1 || xx == 0 || xx == width - 1);
+            pixels[py * TOTAL_WIDTH + px] = is_border ? border_color : fill_color;
+        }
+    }
+}
+
+static int tape_use_recorder_time(void) {
+    int use_recorder_time = 0;
+
+    if (tape_recorder.recording) {
+        use_recorder_time = 1;
+    } else if (!tape_playback.playing) {
+        switch (tape_deck_status) {
+            case TAPE_DECK_STATUS_RECORD:
+                use_recorder_time = 1;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (!use_recorder_time && !tape_input_enabled && tape_recorder.enabled) {
+        use_recorder_time = 1;
+    }
+
+    return use_recorder_time;
+}
+
+static uint64_t tape_current_elapsed_tstates(void) {
+    int use_recorder_time = tape_use_recorder_time();
+    int shared_wav = (tape_input_format == TAPE_FORMAT_WAV) ||
+                     (tape_recorder.output_format == TAPE_OUTPUT_WAV);
+
+    if (shared_wav) {
+        if (tape_recorder.recording) {
+            return tape_recorder_elapsed_tstates(total_t_states);
+        }
+        if (tape_playback.playing) {
+            return tape_playback_elapsed_tstates(&tape_playback, total_t_states);
+        }
+        if (tape_recorder.enabled && tape_recorder.output_format == TAPE_OUTPUT_WAV) {
+            return tape_recorder.position_tstates;
+        }
+        return tape_wav_shared_position_tstates;
+    }
+
+    if (use_recorder_time) {
+        return tape_recorder_elapsed_tstates(total_t_states);
+    }
+
+    if (tape_input_enabled) {
+        return tape_playback_elapsed_tstates(&tape_playback, total_t_states);
+    }
+
+    return 0ull;
+}
+
+static void tape_format_counter_text(char* buffer, size_t buffer_size) {
+    if (!buffer || buffer_size == 0u) {
+        return;
+    }
+
+    uint64_t elapsed_tstates = tape_current_elapsed_tstates();
+    uint64_t clock_hz = (uint64_t)(CPU_CLOCK_HZ + 0.5);
+    if (clock_hz == 0ull) {
+        clock_hz = 1ull;
+    }
+
+    uint64_t total_tenths = (elapsed_tstates * 10ull + clock_hz / 2ull) / clock_hz;
+    uint64_t minutes = total_tenths / 600ull;
+    uint64_t seconds = (total_tenths / 10ull) % 60ull;
+    uint64_t tenths = total_tenths % 10ull;
+
+    if (minutes > 99ull) {
+        minutes = 99ull;
+    }
+
+    (void)snprintf(buffer,
+                   buffer_size,
+                   "%02llu:%02llu.%1llu",
+                   (unsigned long long)minutes,
+                   (unsigned long long)seconds,
+                   (unsigned long long)tenths);
+}
+
 static const TapeControlIcon* tape_control_find_icon(TapeControlAction action) {
     size_t icon_count = sizeof(tape_control_icons) / sizeof(tape_control_icons[0]);
     for (size_t i = 0; i < icon_count; ++i) {
@@ -4307,12 +4468,10 @@ static void tape_render_overlay(void) {
 
     const char* mode_text = "STOP";
     int mode_is_record = 0;
-    int use_recorder_time = 0;
 
     if (tape_recorder.recording) {
         mode_text = "REC";
         mode_is_record = 1;
-        use_recorder_time = 1;
     } else if (tape_playback.playing) {
         mode_text = "PLAY";
     } else {
@@ -4326,7 +4485,6 @@ static void tape_render_overlay(void) {
             case TAPE_DECK_STATUS_RECORD:
                 mode_text = "REC";
                 mode_is_record = 1;
-                use_recorder_time = 1;
                 break;
             case TAPE_DECK_STATUS_STOP:
             case TAPE_DECK_STATUS_IDLE:
@@ -4336,46 +4494,8 @@ static void tape_render_overlay(void) {
         }
     }
 
-    if (!use_recorder_time && !tape_input_enabled && tape_recorder.enabled) {
-        use_recorder_time = 1;
-    }
-
-    uint64_t elapsed_tstates = 0;
-    int shared_wav = (tape_input_format == TAPE_FORMAT_WAV) ||
-                     (tape_recorder.output_format == TAPE_OUTPUT_WAV);
-    if (shared_wav) {
-        if (tape_recorder.recording) {
-            elapsed_tstates = tape_recorder_elapsed_tstates(total_t_states);
-        } else if (tape_playback.playing) {
-            elapsed_tstates = tape_playback_elapsed_tstates(&tape_playback, total_t_states);
-        } else if (tape_recorder.enabled && tape_recorder.output_format == TAPE_OUTPUT_WAV) {
-            elapsed_tstates = tape_recorder.position_tstates;
-        } else {
-            elapsed_tstates = tape_wav_shared_position_tstates;
-        }
-    } else if (use_recorder_time) {
-        elapsed_tstates = tape_recorder_elapsed_tstates(total_t_states);
-    } else if (tape_input_enabled) {
-        elapsed_tstates = tape_playback_elapsed_tstates(&tape_playback, total_t_states);
-    }
-
-    uint64_t clock_hz = (uint64_t)(CPU_CLOCK_HZ + 0.5);
-    if (clock_hz == 0) {
-        clock_hz = 1;
-    }
-    uint64_t total_tenths = (elapsed_tstates * 10ull + clock_hz / 2ull) / clock_hz;
-    uint64_t minutes = total_tenths / 600ull;
-    uint64_t seconds = (total_tenths / 10ull) % 60ull;
-    uint64_t tenths = total_tenths % 10ull;
-    if (minutes > 99ull) {
-        minutes = 99ull;
-    }
-
     char counter_text[16];
-    (void)snprintf(counter_text, sizeof(counter_text), "%02llu:%02llu.%1llu",
-                   (unsigned long long)minutes,
-                   (unsigned long long)seconds,
-                   (unsigned long long)tenths);
+    tape_format_counter_text(counter_text, sizeof(counter_text));
 
     int scale = 2;
     int spacing = scale;
@@ -4448,20 +4568,7 @@ static void tape_render_overlay(void) {
     uint32_t status_color = mode_is_record ? 0xFF5555FFu : 0xFFFFFFFFu;
     uint32_t counter_color = 0xFFFFFFFFu;
 
-    for (int y = 0; y < panel_height; ++y) {
-        int py = origin_y + y;
-        if (py < 0 || py >= TOTAL_HEIGHT) {
-            continue;
-        }
-        for (int x = 0; x < panel_width; ++x) {
-            int px = origin_x + x;
-            if (px < 0 || px >= TOTAL_WIDTH) {
-                continue;
-            }
-            int is_border = (y == 0 || y == panel_height - 1 || x == 0 || x == panel_width - 1);
-            pixels[py * TOTAL_WIDTH + px] = is_border ? border_color : background_color;
-        }
-    }
+    tape_overlay_draw_rect(origin_x, origin_y, panel_width, panel_height, background_color, border_color);
 
     int text_x = origin_x + padding;
     int status_y = origin_y + padding;
@@ -4514,6 +4621,801 @@ static void tape_render_overlay(void) {
                                              record_available,
                                              highlight_action == TAPE_CONTROL_ACTION_RECORD);
             button_x += button_size + button_gap;
+        }
+    }
+}
+
+static void tape_manager_clear_input(void) {
+    tape_manager_input_length = 0u;
+    if (sizeof(tape_manager_input_buffer) > 0u) {
+        tape_manager_input_buffer[0] = '\0';
+    }
+}
+
+static const char* tape_manager_filename(const char* path) {
+    if (!path || !*path) {
+        return NULL;
+    }
+
+    const char* base = path;
+    const char* slash = strrchr(path, '/');
+    if (slash && slash[1] != '\0') {
+        base = slash + 1;
+    }
+#ifdef _WIN32
+    const char* backslash = strrchr(path, '\\');
+    if (backslash && backslash[1] != '\0' && backslash + 1 > base) {
+        base = backslash + 1;
+    }
+#else
+    const char* backslash = strrchr(path, '\\');
+    if (backslash && backslash[1] != '\0' && backslash + 1 > base) {
+        base = backslash + 1;
+    }
+#endif
+    if (*base == '\0') {
+        return path;
+    }
+    return base;
+}
+
+static void tape_manager_set_status(const char* fmt, ...) {
+    if (!fmt) {
+        tape_manager_status[0] = '\0';
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(tape_manager_status, sizeof(tape_manager_status), fmt, args);
+    va_end(args);
+}
+
+static void tape_manager_hide(void) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
+        SDL_StopTextInput();
+    }
+    tape_manager_mode = TAPE_MANAGER_MODE_HIDDEN;
+    tape_manager_clear_input();
+}
+
+static void tape_manager_show_menu(void) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
+        SDL_StopTextInput();
+    }
+    tape_manager_mode = TAPE_MANAGER_MODE_MENU;
+}
+
+static void tape_manager_toggle(void) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_HIDDEN) {
+        tape_manager_show_menu();
+    } else {
+        tape_manager_hide();
+    }
+}
+
+static void tape_manager_begin_path_input(void) {
+    size_t length = 0u;
+    if (tape_input_path && *tape_input_path) {
+        length = strlen(tape_input_path);
+        if (length >= sizeof(tape_manager_input_buffer)) {
+            length = sizeof(tape_manager_input_buffer) - 1u;
+        }
+        memcpy(tape_manager_input_buffer, tape_input_path, length);
+    }
+    tape_manager_input_buffer[length] = '\0';
+    tape_manager_input_length = length;
+    tape_manager_mode = TAPE_MANAGER_MODE_FILE_INPUT;
+    SDL_StartTextInput();
+    tape_manager_set_status("ENTER TAPE PATH AND PRESS RETURN");
+}
+
+static void tape_manager_cancel_path_input(void) {
+    tape_manager_show_menu();
+    tape_manager_clear_input();
+}
+
+static void tape_manager_eject_tape(void) {
+    if (!tape_input_enabled && tape_input_format == TAPE_FORMAT_NONE) {
+        tape_manager_set_status("NO TAPE TO EJECT");
+        return;
+    }
+
+    tape_pause_playback(&tape_playback, total_t_states);
+    tape_recorder_stop_session(total_t_states, 1);
+    tape_free_image(&tape_playback.image);
+    tape_waveform_reset(&tape_playback.waveform);
+    tape_playback.format = TAPE_FORMAT_NONE;
+    tape_playback.use_waveform_playback = 0;
+    tape_playback.playing = 0;
+    tape_input_enabled = 0;
+    tape_input_format = TAPE_FORMAT_NONE;
+    tape_set_input_path(NULL);
+    tape_reset_playback(&tape_playback);
+    tape_wav_shared_position_tstates = 0;
+    if (tape_recorder.enabled) {
+        tape_deck_status = TAPE_DECK_STATUS_STOP;
+    } else {
+        tape_deck_status = TAPE_DECK_STATUS_IDLE;
+    }
+    tape_manager_set_status("EJECTED TAPE");
+    printf("Tape ejected\n");
+}
+
+static int tape_manager_load_path(const char* path) {
+    if (!path || !*path) {
+        tape_manager_set_status("NO FILE SPECIFIED");
+        return 0;
+    }
+
+    TapeFormat format = tape_format_from_extension(path);
+    if (format == TAPE_FORMAT_NONE) {
+        tape_manager_set_status("UNSUPPORTED TAPE FORMAT");
+        return 0;
+    }
+
+    TapePlaybackState new_state;
+    memset(&new_state, 0, sizeof(new_state));
+
+    if (format == TAPE_FORMAT_WAV) {
+        if (!tape_load_wav(path, &new_state)) {
+            tape_free_image(&new_state.image);
+            tape_waveform_reset(&new_state.waveform);
+            tape_manager_set_status("FAILED TO LOAD WAV TAPE");
+            return 0;
+        }
+    } else {
+        new_state.format = format;
+        if (!tape_load_image(path, format, &new_state.image)) {
+            tape_free_image(&new_state.image);
+            tape_manager_set_status("FAILED TO LOAD TAPE IMAGE");
+            return 0;
+        }
+        if (!tape_generate_waveform_from_image(&new_state.image, &new_state.waveform)) {
+            tape_free_image(&new_state.image);
+            tape_waveform_reset(&new_state.waveform);
+            tape_manager_set_status("FAILED TO PREPARE TAPE AUDIO");
+            return 0;
+        }
+        new_state.use_waveform_playback = 1;
+    }
+
+    tape_reset_playback(&new_state);
+
+    tape_pause_playback(&tape_playback, total_t_states);
+    tape_recorder_stop_session(total_t_states, 1);
+    tape_free_image(&tape_playback.image);
+    tape_waveform_reset(&tape_playback.waveform);
+
+    tape_playback = new_state;
+    tape_input_format = format;
+    tape_set_input_path(path);
+
+    if (format == TAPE_FORMAT_WAV) {
+        tape_playback.use_waveform_playback = 0;
+    }
+
+    tape_reset_playback(&tape_playback);
+
+    if (format == TAPE_FORMAT_WAV) {
+        tape_input_enabled = 1;
+        tape_wav_shared_position_tstates = 0;
+        printf("Loaded WAV tape %s (%zu transitions @ %u Hz)\n",
+               tape_input_path,
+               tape_playback.waveform.count,
+               (unsigned)tape_playback.waveform.sample_rate);
+        if (tape_playback.waveform.count == 0) {
+            fprintf(stderr, "Warning: WAV tape '%s' contains no transitions\n", tape_input_path);
+        }
+    } else {
+        printf("Loaded tape image %s (%zu blocks)\n", tape_input_path, tape_playback.image.count);
+        if (tape_playback.image.count == 0) {
+            fprintf(stderr, "Warning: tape image '%s' is empty\n", tape_input_path);
+            tape_input_enabled = 0;
+        } else {
+            tape_input_enabled = 1;
+        }
+    }
+
+    if (tape_input_enabled || tape_recorder.enabled) {
+        tape_deck_status = TAPE_DECK_STATUS_STOP;
+    } else {
+        tape_deck_status = TAPE_DECK_STATUS_IDLE;
+    }
+
+    tape_manager_clear_input();
+    tape_manager_show_menu();
+
+    const char* base_name = tape_manager_filename(tape_input_path);
+    if (!base_name) {
+        base_name = tape_input_path ? tape_input_path : "(NONE)";
+    }
+    tape_manager_set_status("LOADED %s", base_name);
+    return 1;
+}
+
+static int tape_manager_handle_event(const SDL_Event* event) {
+    if (!event) {
+        return 0;
+    }
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_HIDDEN) {
+        return 0;
+    }
+
+    if (event->type == SDL_KEYUP) {
+        return 1;
+    }
+
+    if (event->type != SDL_KEYDOWN) {
+        return 0;
+    }
+
+    if (event->key.repeat) {
+        return 1;
+    }
+
+    SDL_Keycode key = event->key.keysym.sym;
+    SDL_Keymod mods = event->key.keysym.mod;
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
+        switch (key) {
+            case SDLK_ESCAPE:
+                tape_manager_cancel_path_input();
+                tape_manager_set_status("LOAD CANCELLED");
+                return 1;
+            case SDLK_RETURN:
+            case SDLK_KP_ENTER:
+                tape_manager_input_buffer[tape_manager_input_length] = '\0';
+                (void)tape_manager_load_path(tape_manager_input_buffer);
+                return 1;
+            case SDLK_BACKSPACE:
+            case SDLK_DELETE:
+                if (tape_manager_input_length > 0u) {
+                    tape_manager_input_length--;
+                    tape_manager_input_buffer[tape_manager_input_length] = '\0';
+                }
+                return 1;
+            default:
+                return 1;
+        }
+    }
+
+    switch (key) {
+        case SDLK_ESCAPE:
+            tape_manager_hide();
+            return 1;
+        case SDLK_l:
+            tape_manager_begin_path_input();
+            return 1;
+        case SDLK_e:
+            tape_manager_eject_tape();
+            return 1;
+        case SDLK_p:
+            tape_deck_play(total_t_states);
+            tape_manager_set_status("PLAY COMMAND SENT");
+            return 1;
+        case SDLK_s:
+            tape_deck_stop(total_t_states);
+            tape_manager_set_status("STOP COMMAND SENT");
+            return 1;
+        case SDLK_w:
+            tape_deck_rewind(total_t_states);
+            tape_manager_set_status("REWIND COMMAND SENT");
+            return 1;
+        case SDLK_r:
+            tape_deck_record(total_t_states, (mods & KMOD_SHIFT) ? 1 : 0);
+            if (tape_recorder.recording) {
+                if (mods & KMOD_SHIFT) {
+                    tape_manager_set_status("APPEND RECORDING ACTIVE");
+                } else {
+                    tape_manager_set_status("RECORDING ACTIVE");
+                }
+            } else if (tape_recorder.enabled) {
+                tape_manager_set_status("RECORD COMMAND SENT");
+            } else {
+                tape_manager_set_status("NO RECORDER OUTPUT CONFIGURED");
+            }
+            return 1;
+        default:
+            return 1;
+    }
+}
+
+static int tape_manager_handle_text_input(const SDL_Event* event) {
+    if (!event || event->type != SDL_TEXTINPUT) {
+        return 0;
+    }
+
+    if (tape_manager_mode != TAPE_MANAGER_MODE_FILE_INPUT) {
+        return 0;
+    }
+
+    const char* text = event->text.text;
+    while (text && *text) {
+        if (tape_manager_input_length + 1u < sizeof(tape_manager_input_buffer)) {
+            tape_manager_input_buffer[tape_manager_input_length++] = *text;
+            tape_manager_input_buffer[tape_manager_input_length] = '\0';
+        }
+        ++text;
+    }
+    return 1;
+}
+
+static void tape_render_manager(void) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_HIDDEN) {
+        return;
+    }
+
+    int scale = 2;
+
+layout_retry:
+    const int spacing = scale;
+    const int padding = 12;
+    const int line_height = TAPE_OVERLAY_FONT_HEIGHT * scale;
+    const int line_gap = scale;
+    const int section_gap = line_height;
+    const int counter_scale = (scale > 1) ? 3 : 2;
+    const int counter_padding = scale * 4;
+    const int control_button_size = line_height * 2;
+    const int control_button_gap = scale * 4;
+    const int text_button_padding = scale * 4;
+    const int text_button_height = line_height + scale * 6;
+    const int text_button_gap = scale * 4;
+    const int input_box_padding = scale * 4;
+    const int input_box_height = line_height + scale * 4;
+
+    const uint32_t panel_background = 0x1C1C1CF0u;
+    const uint32_t panel_border = 0xFFFFFFFFu;
+    const uint32_t title_color = 0xFFFFFFFFu;
+    const uint32_t text_color = 0xDDDDDDFFu;
+    const uint32_t dim_text_color = 0xB0B0B0FFu;
+    const uint32_t status_color = 0x9FD36CFFu;
+    const uint32_t counter_background = 0x101820FFu;
+    const uint32_t counter_border = 0x4F81EFFFu;
+    const uint32_t counter_text_color = 0xE0F2FFFFu;
+    const uint32_t text_button_fill = 0x2C2C2CFFu;
+    const uint32_t text_button_disabled_fill = 0x242424FFu;
+    const uint32_t text_button_border = 0xFFFFFFFFu;
+    const uint32_t input_box_border = 0x6FA7FFFFu;
+
+    const char* deck_state_text = "IDLE";
+    if (tape_recorder.recording) {
+        deck_state_text = "RECORDING";
+    } else if (tape_playback.playing) {
+        deck_state_text = "PLAYING";
+    } else {
+        switch (tape_deck_status) {
+            case TAPE_DECK_STATUS_PLAY:
+                deck_state_text = "PLAY";
+                break;
+            case TAPE_DECK_STATUS_STOP:
+                deck_state_text = "STOP";
+                break;
+            case TAPE_DECK_STATUS_REWIND:
+                deck_state_text = "REWIND";
+                break;
+            case TAPE_DECK_STATUS_RECORD:
+                deck_state_text = "RECORD";
+                break;
+            case TAPE_DECK_STATUS_IDLE:
+            default:
+                break;
+        }
+    }
+
+    const char* tape_name = tape_manager_filename(tape_input_path);
+    if (!tape_name) {
+        tape_name = (tape_input_path && *tape_input_path) ? tape_input_path : "(NONE)";
+    }
+
+    const char* recorder_name = NULL;
+    if (tape_recorder.enabled && tape_recorder.output_path && *tape_recorder.output_path) {
+        recorder_name = tape_manager_filename(tape_recorder.output_path);
+        if (!recorder_name) {
+            recorder_name = tape_recorder.output_path;
+        }
+    }
+
+    char deck_line[64];
+    (void)snprintf(deck_line, sizeof(deck_line), "DECK: %s", deck_state_text);
+    char tape_line[PATH_MAX + 16];
+    (void)snprintf(tape_line, sizeof(tape_line), "TAPE: %s", tape_name);
+    char recorder_line[PATH_MAX + 16];
+    if (recorder_name) {
+        (void)snprintf(recorder_line, sizeof(recorder_line), "RECORDER: %s", recorder_name);
+    } else {
+        (void)snprintf(recorder_line, sizeof(recorder_line), "RECORDER: (NONE)");
+    }
+
+    char counter_text[16];
+    tape_format_counter_text(counter_text, sizeof(counter_text));
+    int counter_text_width = tape_overlay_text_width(counter_text, counter_scale, spacing);
+    int counter_text_height = TAPE_OVERLAY_FONT_HEIGHT * counter_scale;
+    int counter_box_width = counter_text_width + counter_padding * 2;
+    int counter_box_height = counter_text_height + counter_padding * 2;
+
+    char status_line[sizeof(tape_manager_status) + 16];
+    if (tape_manager_status[0] != '\0') {
+        (void)snprintf(status_line, sizeof(status_line), "STATUS: %s", tape_manager_status);
+    } else {
+        (void)snprintf(status_line, sizeof(status_line), "STATUS: READY");
+    }
+
+    int record_available = (tape_recorder.enabled ||
+                            (tape_input_format == TAPE_FORMAT_WAV && tape_input_path)) ? 1 : 0;
+    int show_play = tape_input_enabled ? 1 : 0;
+    int show_stop = (tape_input_enabled || tape_recorder.enabled) ? 1 : 0;
+    int show_rewind = tape_input_enabled ? 1 : 0;
+    int show_record = record_available ? 1 : 0;
+
+    int control_count = 0;
+    int control_row_width = 0;
+    if (show_play) {
+        control_row_width += control_button_size;
+        ++control_count;
+    }
+    if (show_stop) {
+        if (control_count > 0) {
+            control_row_width += control_button_gap;
+        }
+        control_row_width += control_button_size;
+        ++control_count;
+    }
+    if (show_rewind) {
+        if (control_count > 0) {
+            control_row_width += control_button_gap;
+        }
+        control_row_width += control_button_size;
+        ++control_count;
+    }
+    if (show_record) {
+        if (control_count > 0) {
+            control_row_width += control_button_gap;
+        }
+        control_row_width += control_button_size;
+        ++control_count;
+    }
+
+    char control_hint[128];
+    control_hint[0] = '\0';
+    size_t control_hint_len = 0u;
+    if (show_play) {
+        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
+                                            sizeof(control_hint) - control_hint_len,
+                                            "%sPlay (P)",
+                                            control_hint_len > 0 ? "   " : "");
+    }
+    if (show_stop && control_hint_len < sizeof(control_hint)) {
+        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
+                                            sizeof(control_hint) - control_hint_len,
+                                            "%sStop (S)",
+                                            control_hint_len > 0 ? "   " : "");
+    }
+    if (show_rewind && control_hint_len < sizeof(control_hint)) {
+        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
+                                            sizeof(control_hint) - control_hint_len,
+                                            "%sRewind (W)",
+                                            control_hint_len > 0 ? "   " : "");
+    }
+    if (show_record && control_hint_len < sizeof(control_hint)) {
+        control_hint_len += (size_t)snprintf(control_hint + control_hint_len,
+                                            sizeof(control_hint) - control_hint_len,
+                                            "%sRecord (R)",
+                                            control_hint_len > 0 ? "   " : "");
+    }
+    int control_hint_width = control_hint[0] ? tape_overlay_text_width(control_hint, scale, spacing) : 0;
+
+    struct TapeManagerActionButton {
+        const char* label;
+        int enabled;
+    };
+
+    struct TapeManagerActionButton action_buttons[] = {
+        {"LOAD (L)", 1},
+        {"EJECT (E)", (tape_input_enabled || tape_input_format != TAPE_FORMAT_NONE) ? 1 : 0},
+        {"CLOSE (TAB)", 1}
+    };
+
+    int action_button_widths[3];
+    int action_row_width = 0;
+    for (int i = 0; i < 3; ++i) {
+        int label_width = tape_overlay_text_width(action_buttons[i].label, scale, spacing);
+        int button_width = label_width + text_button_padding * 2;
+        action_button_widths[i] = button_width;
+        if (i > 0) {
+            action_row_width += text_button_gap;
+        }
+        action_row_width += button_width;
+    }
+
+    const char* shortcuts_lines[3];
+    int shortcuts_line_widths[3];
+    int shortcuts_line_count = 0;
+    int shortcuts_width = 0;
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU) {
+        shortcuts_lines[shortcuts_line_count] =
+            "SHORTCUTS: P PLAY  S STOP  W REWIND  R RECORD";
+        shortcuts_line_widths[shortcuts_line_count] =
+            tape_overlay_text_width(shortcuts_lines[shortcuts_line_count], scale, spacing);
+        if (shortcuts_line_widths[shortcuts_line_count] > shortcuts_width) {
+            shortcuts_width = shortcuts_line_widths[shortcuts_line_count];
+        }
+        shortcuts_line_count++;
+
+        shortcuts_lines[shortcuts_line_count] =
+            "SHIFT+R APPEND  L LOAD  E EJECT  TAB/ESC CLOSE";
+        shortcuts_line_widths[shortcuts_line_count] =
+            tape_overlay_text_width(shortcuts_lines[shortcuts_line_count], scale, spacing);
+        if (shortcuts_line_widths[shortcuts_line_count] > shortcuts_width) {
+            shortcuts_width = shortcuts_line_widths[shortcuts_line_count];
+        }
+        shortcuts_line_count++;
+    }
+
+    char input_prompt[48];
+    char input_line[PATH_MAX + 4];
+    char input_help[64];
+    int input_prompt_width = 0;
+    int input_line_width = 0;
+    int input_box_width = 0;
+    int input_help_width = 0;
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
+        (void)snprintf(input_prompt, sizeof(input_prompt), "LOAD TAPE PATH:");
+        (void)snprintf(input_line, sizeof(input_line), "> %s", tape_manager_input_buffer);
+        (void)snprintf(input_help, sizeof(input_help), "RETURN TO LOAD, ESC TO CANCEL, TAB CLOSES");
+        input_prompt_width = tape_overlay_text_width(input_prompt, scale, spacing);
+        input_line_width = tape_overlay_text_width(input_line, scale, spacing);
+        input_box_width = input_line_width + input_box_padding * 2;
+        input_help_width = tape_overlay_text_width(input_help, scale, spacing);
+    }
+
+    const int info_line_count = 3;
+    int info_width = tape_overlay_text_width(deck_line, scale, spacing);
+    int tape_line_width = tape_overlay_text_width(tape_line, scale, spacing);
+    int recorder_line_width = tape_overlay_text_width(recorder_line, scale, spacing);
+    if (tape_line_width > info_width) {
+        info_width = tape_line_width;
+    }
+    if (recorder_line_width > info_width) {
+        info_width = recorder_line_width;
+    }
+
+    int panel_width = tape_overlay_text_width("TAPE MANAGER", scale, spacing);
+    if (info_width > panel_width) {
+        panel_width = info_width;
+    }
+    if (counter_box_width > panel_width) {
+        panel_width = counter_box_width;
+    }
+    int status_width = tape_overlay_text_width(status_line, scale, spacing);
+    if (status_width > panel_width) {
+        panel_width = status_width;
+    }
+    if (control_row_width > panel_width) {
+        panel_width = control_row_width;
+    }
+    if (control_hint_width > panel_width) {
+        panel_width = control_hint_width;
+    }
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && action_row_width > panel_width) {
+        panel_width = action_row_width;
+    }
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_width > panel_width) {
+        panel_width = shortcuts_width;
+    }
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
+        if (input_prompt_width > panel_width) {
+            panel_width = input_prompt_width;
+        }
+        if (input_box_width > panel_width) {
+            panel_width = input_box_width;
+        }
+        if (input_help_width > panel_width) {
+            panel_width = input_help_width;
+        }
+    }
+
+    panel_width += padding * 2;
+
+    if (panel_width > TOTAL_WIDTH && scale > 1) {
+        --scale;
+        goto layout_retry;
+    }
+
+    int info_height = info_line_count * line_height + (info_line_count - 1) * line_gap;
+
+    int panel_height = padding * 2;
+    panel_height += line_height; // title
+    panel_height += line_gap;
+    panel_height += info_height;
+    panel_height += section_gap;
+    panel_height += line_height; // counter label
+    panel_height += line_gap;
+    panel_height += counter_box_height;
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU) {
+        if (control_count > 0) {
+            panel_height += section_gap;
+            panel_height += control_button_size;
+            if (control_hint[0]) {
+                panel_height += line_gap;
+                panel_height += line_height;
+            }
+        }
+
+        panel_height += section_gap;
+        panel_height += text_button_height;
+    } else {
+        panel_height += section_gap;
+        panel_height += line_height; // input prompt
+        panel_height += line_gap;
+        panel_height += input_box_height;
+        panel_height += line_gap;
+        panel_height += line_height; // input help
+    }
+
+    panel_height += section_gap;
+    panel_height += line_height; // status line
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_line_count > 0) {
+        panel_height += line_gap;
+        panel_height += shortcuts_line_count * line_height;
+        if (shortcuts_line_count > 1) {
+            panel_height += (shortcuts_line_count - 1) * line_gap;
+        }
+    }
+
+    int origin_x = (TOTAL_WIDTH - panel_width) / 2;
+    int origin_y = (TOTAL_HEIGHT - panel_height) / 2;
+    if (origin_x < 0) {
+        origin_x = 0;
+    }
+    if (origin_y < 0) {
+        origin_y = 0;
+    }
+
+    tape_overlay_draw_rect(origin_x, origin_y, panel_width, panel_height, panel_background, panel_border);
+
+    int cursor_x = origin_x + padding;
+    int cursor_y = origin_y + padding;
+
+    tape_overlay_draw_text(cursor_x, cursor_y, "TAPE MANAGER", scale, spacing, title_color);
+    cursor_y += line_height + line_gap;
+
+    tape_overlay_draw_text(cursor_x, cursor_y, deck_line, scale, spacing, text_color);
+    cursor_y += line_height + line_gap;
+    tape_overlay_draw_text(cursor_x, cursor_y, tape_line, scale, spacing, text_color);
+    cursor_y += line_height + line_gap;
+    tape_overlay_draw_text(cursor_x, cursor_y, recorder_line, scale, spacing, text_color);
+    cursor_y += line_height;
+
+    cursor_y += section_gap;
+
+    tape_overlay_draw_text(cursor_x, cursor_y, "COUNTER", scale, spacing, dim_text_color);
+    cursor_y += line_height + line_gap;
+
+    int counter_box_x = origin_x + (panel_width - counter_box_width) / 2;
+    tape_overlay_draw_rect(counter_box_x, cursor_y, counter_box_width, counter_box_height, counter_background, counter_border);
+    int counter_text_x = counter_box_x + (counter_box_width - counter_text_width) / 2;
+    int counter_text_y = cursor_y + (counter_box_height - counter_text_height) / 2;
+    tape_overlay_draw_text(counter_text_x, counter_text_y, counter_text, counter_scale, spacing, counter_text_color);
+    cursor_y += counter_box_height;
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU) {
+        if (control_count > 0) {
+            cursor_y += section_gap;
+            int controls_x = origin_x + (panel_width - control_row_width) / 2;
+            int button_x = controls_x;
+            int button_y = cursor_y;
+            TapeControlAction highlight_action = tape_control_action_from_status(tape_deck_status);
+
+            if (show_play) {
+                tape_overlay_draw_control_button(button_x,
+                                                 button_y,
+                                                 control_button_size,
+                                                 scale,
+                                                 TAPE_CONTROL_ACTION_PLAY,
+                                                 tape_input_enabled,
+                                                 highlight_action == TAPE_CONTROL_ACTION_PLAY);
+                button_x += control_button_size + control_button_gap;
+            }
+            if (show_stop) {
+                tape_overlay_draw_control_button(button_x,
+                                                 button_y,
+                                                 control_button_size,
+                                                 scale,
+                                                 TAPE_CONTROL_ACTION_STOP,
+                                                 show_stop,
+                                                 highlight_action == TAPE_CONTROL_ACTION_STOP);
+                button_x += control_button_size + control_button_gap;
+            }
+            if (show_rewind) {
+                tape_overlay_draw_control_button(button_x,
+                                                 button_y,
+                                                 control_button_size,
+                                                 scale,
+                                                 TAPE_CONTROL_ACTION_REWIND,
+                                                 tape_input_enabled,
+                                                 highlight_action == TAPE_CONTROL_ACTION_REWIND);
+                button_x += control_button_size + control_button_gap;
+            }
+            if (show_record) {
+                tape_overlay_draw_control_button(button_x,
+                                                 button_y,
+                                                 control_button_size,
+                                                 scale,
+                                                 TAPE_CONTROL_ACTION_RECORD,
+                                                 record_available,
+                                                 highlight_action == TAPE_CONTROL_ACTION_RECORD);
+            }
+
+            cursor_y += control_button_size;
+
+            if (control_hint[0]) {
+                cursor_y += line_gap;
+                int hint_x = origin_x + (panel_width - control_hint_width) / 2;
+                tape_overlay_draw_text(hint_x, cursor_y, control_hint, scale, spacing, dim_text_color);
+                cursor_y += line_height;
+            }
+        }
+
+        cursor_y += section_gap;
+
+        int actions_x = origin_x + (panel_width - action_row_width) / 2;
+        int action_y = cursor_y;
+        for (int i = 0; i < 3; ++i) {
+            uint32_t fill_color = action_buttons[i].enabled ? text_button_fill : text_button_disabled_fill;
+            uint32_t label_color = action_buttons[i].enabled ? text_color : dim_text_color;
+            int button_width = action_button_widths[i];
+            tape_overlay_draw_rect(actions_x, action_y, button_width, text_button_height, fill_color, text_button_border);
+            int label_width = tape_overlay_text_width(action_buttons[i].label, scale, spacing);
+            int label_x = actions_x + (button_width - label_width) / 2;
+            int label_y = action_y + (text_button_height - line_height) / 2;
+            tape_overlay_draw_text(label_x, label_y, action_buttons[i].label, scale, spacing, label_color);
+            actions_x += button_width + text_button_gap;
+        }
+
+        cursor_y += text_button_height;
+    } else {
+        cursor_y += section_gap;
+
+        tape_overlay_draw_text(cursor_x, cursor_y, input_prompt, scale, spacing, dim_text_color);
+        cursor_y += line_height + line_gap;
+
+        int input_box_x = origin_x + (panel_width - input_box_width) / 2;
+        tape_overlay_draw_rect(input_box_x, cursor_y, input_box_width, input_box_height, text_button_fill, input_box_border);
+        int input_text_x = input_box_x + (input_box_width - input_line_width) / 2;
+        int input_text_y = cursor_y + (input_box_height - line_height) / 2;
+        tape_overlay_draw_text(input_text_x, input_text_y, input_line, scale, spacing, text_color);
+        cursor_y += input_box_height + line_gap;
+
+        int help_x = origin_x + (panel_width - input_help_width) / 2;
+        tape_overlay_draw_text(help_x, cursor_y, input_help, scale, spacing, dim_text_color);
+        cursor_y += line_height;
+    }
+
+    cursor_y += section_gap;
+
+    int status_x = origin_x + (panel_width - status_width) / 2;
+    tape_overlay_draw_text(status_x, cursor_y, status_line, scale, spacing, status_color);
+    cursor_y += line_height;
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_line_count > 0) {
+        cursor_y += line_gap;
+        for (int i = 0; i < shortcuts_line_count; ++i) {
+            int shortcuts_x = origin_x + (panel_width - shortcuts_line_widths[i]) / 2;
+            tape_overlay_draw_text(shortcuts_x,
+                                   cursor_y,
+                                   shortcuts_lines[i],
+                                   scale,
+                                   spacing,
+                                   dim_text_color);
+            cursor_y += line_height;
+            if (i + 1 < shortcuts_line_count) {
+                cursor_y += line_gap;
+            }
         }
     }
 }
@@ -6017,6 +6919,7 @@ static int tape_recorder_write_output(void) {
 }
 
 static void tape_shutdown(void) {
+    tape_manager_hide();
     tape_pause_playback(&tape_playback, total_t_states);
     tape_recorder_stop_session(total_t_states, 1);
     tape_free_image(&tape_playback.image);
@@ -6120,6 +7023,13 @@ static int tape_handle_control_key(const SDL_Event* event) {
     }
 
     SDL_Keycode key = event->key.keysym.sym;
+    if (key == SDLK_TAB) {
+        if (event->type == SDL_KEYDOWN && !event->key.repeat) {
+            tape_manager_toggle();
+        }
+        return 1;
+    }
+
     if (key != SDLK_F5 && key != SDLK_F6 && key != SDLK_F7 && key != SDLK_F8) {
         return 0;
     }
@@ -6188,18 +7098,40 @@ static int tape_handle_mouse_button(const SDL_Event* event) {
         switch (button->action) {
             case TAPE_CONTROL_ACTION_PLAY:
                 tape_deck_play(total_t_states);
+                if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
+                    tape_manager_set_status("PLAY COMMAND SENT");
+                }
                 break;
             case TAPE_CONTROL_ACTION_STOP:
                 tape_deck_stop(total_t_states);
+                if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
+                    tape_manager_set_status("STOP COMMAND SENT");
+                }
                 break;
             case TAPE_CONTROL_ACTION_REWIND:
                 tape_deck_rewind(total_t_states);
+                if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
+                    tape_manager_set_status("REWIND COMMAND SENT");
+                }
                 break;
             case TAPE_CONTROL_ACTION_RECORD:
                 {
                     SDL_Keymod mods = SDL_GetModState();
                     int append_mode = (mods & KMOD_SHIFT) ? 1 : 0;
                     tape_deck_record(total_t_states, append_mode);
+                    if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
+                        if (tape_recorder.recording) {
+                            if (append_mode) {
+                                tape_manager_set_status("APPEND RECORDING ACTIVE");
+                            } else {
+                                tape_manager_set_status("RECORDING ACTIVE");
+                            }
+                        } else if (tape_recorder.enabled) {
+                            tape_manager_set_status("RECORD COMMAND SENT");
+                        } else {
+                            tape_manager_set_status("NO RECORDER OUTPUT CONFIGURED");
+                        }
+                    }
                 }
                 break;
             case TAPE_CONTROL_ACTION_NONE:
@@ -8659,6 +9591,7 @@ void render_screen(void) {
         }
     }
     tape_render_overlay();
+    tape_render_manager();
     SDL_UpdateTexture(texture, NULL, pixels, TOTAL_WIDTH * sizeof(uint32_t));
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
@@ -8944,6 +9877,8 @@ int main(int argc, char *argv[]) {
     Z80 cpu;
     memset(&cpu, 0, sizeof(cpu));
 
+    tape_set_input_path(NULL);
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
             if (i + 1 >= argc) {
@@ -9032,7 +9967,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             tape_input_format = TAPE_FORMAT_TAP;
-            tape_input_path = argv[++i];
+            tape_set_input_path(argv[++i]);
         } else if (strcmp(argv[i], "--tzx") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -9043,7 +9978,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             tape_input_format = TAPE_FORMAT_TZX;
-            tape_input_path = argv[++i];
+            tape_set_input_path(argv[++i]);
         } else if (strcmp(argv[i], "--wav") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -9054,7 +9989,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             tape_input_format = TAPE_FORMAT_WAV;
-            tape_input_path = argv[++i];
+            tape_set_input_path(argv[++i]);
         } else if (strcmp(argv[i], "--snapshot") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -9106,7 +10041,7 @@ int main(int argc, char *argv[]) {
                 snapshot_input_path = argv[i];
             } else if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
                 tape_input_format = inferred_format;
-                tape_input_path = argv[i];
+                tape_set_input_path(argv[i]);
             } else if (!rom_filename) {
                 rom_filename = argv[i];
                 rom_provided = 1;
@@ -9251,6 +10186,8 @@ int main(int argc, char *argv[]) {
         printf("\n");
     }
 
+    printf("Tape manager: Press Tab to open popup controls\n");
+
     if (audio_available) {
         SDL_LockAudio();
         beeper_reset_audio_state(total_t_states, speaker_output_level);
@@ -9276,6 +10213,10 @@ int main(int argc, char *argv[]) {
                 if (tape_handle_mouse_button(&e)) {
                     continue;
                 }
+            } else if (e.type == SDL_TEXTINPUT) {
+                if (tape_manager_handle_text_input(&e)) {
+                    continue;
+                }
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
                 if (e.type == SDL_KEYDOWN && !e.key.repeat) {
                     SDL_Keycode sym = e.key.keysym.sym;
@@ -9286,6 +10227,9 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 if (tape_handle_control_key(&e)) {
+                    continue;
+                }
+                if (tape_manager_handle_event(&e)) {
                     continue;
                 }
                 int row = -1;
