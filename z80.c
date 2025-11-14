@@ -157,6 +157,7 @@ static const int TAPE_BIT1_PULSE_TSTATES = 1710;
 static const int TAPE_HEADER_PILOT_COUNT = 8063;
 static const int TAPE_DATA_PILOT_COUNT = 3223;
 static const uint64_t TAPE_SILENCE_THRESHOLD_TSTATES = 350000ULL; // 0.1 second
+static const uint64_t TAPE_RECORDER_AUTOSTOP_TSTATES = 7000000ULL; // ~2 seconds
 
 typedef enum {
     TAPE_BLOCK_TYPE_STANDARD,
@@ -291,6 +292,7 @@ typedef struct {
     uint64_t wav_existing_samples;
     uint64_t wav_head_samples;
     int wav_requires_truncate;
+    uint64_t idle_start_tstate;
 } TapeRecorder;
 
 static TapePlaybackState tape_playback = {0};
@@ -6035,6 +6037,7 @@ static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
     tape_free_image(&tape_recorder.recorded);
     tape_recorder_reset_audio();
     tape_recorder_reset_wav_prefix();
+    tape_recorder.idle_start_tstate = 0;
 }
 
 static int tape_recorder_start_session(uint64_t current_t_state, int append_mode) {
@@ -6102,6 +6105,7 @@ static int tape_recorder_start_session(uint64_t current_t_state, int append_mode
     tape_recorder.last_level = -1;
     tape_recorder.block_start_level = 0;
     tape_recorder.position_start_tstate = current_t_state;
+    tape_recorder.idle_start_tstate = 0;
     printf("Tape RECORD%s\n", use_append ? " (append)" : "");
     return 1;
 }
@@ -6121,6 +6125,7 @@ static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_ou
             tape_recorder.position_tstates += current_t_state - tape_recorder.position_start_tstate;
         }
         tape_recorder.position_start_tstate = current_t_state;
+        tape_recorder.idle_start_tstate = 0;
     }
 
     speaker_tape_record_level = 1;
@@ -6657,12 +6662,13 @@ static int tape_decode_pulses_to_block(const TapePulse* pulses, size_t count, ui
     return 1;
 }
 
-static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flush) {
+static int tape_recorder_finalize_block(uint64_t current_t_state, int force_flush) {
     if (!tape_recorder.block_active || tape_recorder.pulse_count == 0) {
         if (force_flush) {
             tape_recorder.block_active = 0;
+            tape_recorder.idle_start_tstate = 0;
         }
-        return;
+        return 0;
     }
 
     uint64_t idle_cycles = 0;
@@ -6671,7 +6677,7 @@ static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flu
     }
 
     if (!force_flush && idle_cycles < TAPE_SILENCE_THRESHOLD_TSTATES) {
-        return;
+        return 0;
     }
 
     uint32_t pause_ms = 1000u;
@@ -6703,6 +6709,13 @@ static void tape_recorder_finalize_block(uint64_t current_t_state, int force_flu
     tape_recorder.block_active = 0;
     tape_recorder.pulse_count = 0;
     tape_recorder.last_transition_tstate = current_t_state;
+    if (force_flush) {
+        tape_recorder.idle_start_tstate = 0;
+    } else {
+        tape_recorder.idle_start_tstate = current_t_state;
+    }
+
+    return 1;
 }
 
 static void tape_recorder_handle_mic(uint64_t t_state, int level) {
@@ -6717,6 +6730,7 @@ static void tape_recorder_handle_mic(uint64_t t_state, int level) {
         tape_recorder.block_start_level = level ? 1 : 0;
         speaker_tape_record_level = level ? 1 : 0;
         speaker_update_output(t_state, 1);
+        tape_recorder.idle_start_tstate = 0;
         return;
     }
 
@@ -6744,7 +6758,17 @@ static void tape_recorder_update(uint64_t current_t_state, int force_flush) {
     if (!tape_recorder.recording && !force_flush) {
         return;
     }
-    tape_recorder_finalize_block(current_t_state, force_flush);
+    (void)tape_recorder_finalize_block(current_t_state, force_flush);
+
+    if (!force_flush && tape_recorder.recording) {
+        uint64_t idle_start = tape_recorder.idle_start_tstate;
+        if (idle_start > 0 && current_t_state > idle_start && tape_recorder.session_dirty) {
+            uint64_t idle_duration = current_t_state - idle_start;
+            if (idle_duration >= TAPE_RECORDER_AUTOSTOP_TSTATES) {
+                tape_recorder_stop_session(current_t_state, 1);
+            }
+        }
+    }
 }
 
 static int tape_recorder_write_output(void) {
