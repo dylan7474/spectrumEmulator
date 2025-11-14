@@ -151,7 +151,7 @@ dump. The emulator records the cassette pulses while the ROM routines execute an
 
 When a recording destination is configured, press **F8** or click the record button to arm the virtual deck. A normal press clears any previous capture, while holding **Shift** (or Shift-clicking the on-screen control) appends the new data to the existing WAV instead. If you have mounted a WAV image without passing `--save-wav`, the record control reuses that file so you can overwrite it or extend it in place.
 
-Once the emulator finishes writing a recording, the deck now stops automatically after a short period of silence and rewinds the shared WAV head to the start, mirroring how the transport halts after a `LOAD` completes.
+Once the emulator finishes writing a recording, the deck now stops automatically after a short period of silence and rewinds the playback counter to the start, mirroring how the transport halts after a `LOAD` completes. The recorder remembers where the previous capture ended, so hitting record again immediately continues from that point; rewind first if you want the next save to overwrite from the beginning instead.
 
 Loading and saving can be combined, allowing you to simultaneously play an input tape and archive new content:
 

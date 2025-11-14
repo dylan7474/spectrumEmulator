@@ -6078,6 +6078,10 @@ static int tape_recorder_start_session(uint64_t current_t_state, int append_mode
         } else {
             tape_recorder.append_data_chunk_offset = 0;
             tape_recorder.append_existing_data_bytes = 0;
+            if (head_tstates == 0 && tape_recorder.position_tstates > 0) {
+                head_tstates = tape_recorder.position_tstates;
+                tape_wav_shared_position_tstates = head_tstates;
+            }
             tape_recorder.position_tstates = head_tstates;
             if (!tape_recorder_prepare_wav_session(head_tstates)) {
                 return 0;
