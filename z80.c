@@ -4285,28 +4285,37 @@ static uint64_t tape_current_elapsed_tstates(void) {
     int shared_wav = (tape_input_format == TAPE_FORMAT_WAV) ||
                      (tape_recorder.output_format == TAPE_OUTPUT_WAV);
 
+    uint64_t elapsed = 0ull;
+
     if (shared_wav) {
         if (tape_recorder.recording) {
-            return tape_recorder_elapsed_tstates(total_t_states);
+            elapsed = tape_recorder_elapsed_tstates(total_t_states);
+        } else if (tape_playback.playing) {
+            elapsed = tape_playback_elapsed_tstates(&tape_playback, total_t_states);
+        } else if (tape_recorder.enabled && tape_recorder.output_format == TAPE_OUTPUT_WAV) {
+            elapsed = tape_recorder.position_tstates;
+        } else {
+            elapsed = tape_wav_shared_position_tstates;
         }
-        if (tape_playback.playing) {
-            return tape_playback_elapsed_tstates(&tape_playback, total_t_states);
-        }
-        if (tape_recorder.enabled && tape_recorder.output_format == TAPE_OUTPUT_WAV) {
-            return tape_recorder.position_tstates;
-        }
-        return tape_wav_shared_position_tstates;
+    } else if (use_recorder_time) {
+        elapsed = tape_recorder_elapsed_tstates(total_t_states);
+    } else if (tape_input_enabled) {
+        elapsed = tape_playback_elapsed_tstates(&tape_playback, total_t_states);
     }
 
-    if (use_recorder_time) {
-        return tape_recorder_elapsed_tstates(total_t_states);
+    if (elapsed == 0ull) {
+        if (tape_playback.position_tstates > 0ull) {
+            elapsed = tape_playback.position_tstates;
+        } else if (tape_recorder.position_tstates > 0ull) {
+            elapsed = tape_recorder.position_tstates;
+        } else if ((tape_input_format == TAPE_FORMAT_WAV ||
+                    tape_recorder.output_format == TAPE_OUTPUT_WAV) &&
+                   tape_wav_shared_position_tstates > 0ull) {
+            elapsed = tape_wav_shared_position_tstates;
+        }
     }
 
-    if (tape_input_enabled) {
-        return tape_playback_elapsed_tstates(&tape_playback, total_t_states);
-    }
-
-    return 0ull;
+    return elapsed;
 }
 
 static void tape_format_counter_text(char* buffer, size_t buffer_size) {
