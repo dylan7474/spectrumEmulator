@@ -516,7 +516,6 @@ static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t 
 static uint64_t tape_playback_elapsed_tstates(const TapePlaybackState* state, uint64_t current_t_state);
 static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
 static void tape_render_overlay(void);
-static void tape_wav_seek_playback(TapePlaybackState* state, uint64_t position_tstates);
 static int speaker_calculate_output_level(void);
 static void speaker_update_output(uint64_t t_state, int emit_event);
 static void toggle_fullscreen(void);
@@ -4041,95 +4040,6 @@ static void tape_rewind_playback(TapePlaybackState* state) {
     tape_reset_playback(state);
 }
 
-static void tape_wav_seek_playback(TapePlaybackState* state, uint64_t position_tstates) {
-    if (!state || state->format != TAPE_FORMAT_WAV) {
-        return;
-    }
-
-    state->playing = 0;
-    state->paused_transition_remaining = 0;
-    state->paused_pause_remaining = 0;
-    state->waveform_index = 0;
-    state->next_transition_tstate = 0;
-    state->last_transition_tstate = 0;
-    state->position_tstates = 0;
-    state->position_start_tstate = 0;
-
-    int initial_level = state->waveform.initial_level ? 1 : 0;
-    state->level = initial_level;
-    tape_ear_state = state->level;
-    speaker_tape_playback_level = tape_ear_state;
-    speaker_update_output(total_t_states, 0);
-
-    if (state->waveform.count == 0) {
-        tape_wav_shared_position_tstates = 0;
-        return;
-    }
-
-    uint64_t total_duration = 0;
-    for (size_t i = 0; i < state->waveform.count; ++i) {
-        total_duration += (uint64_t)state->waveform.pulses[i].duration;
-    }
-
-    uint64_t target = position_tstates;
-    if (target > total_duration) {
-        target = total_duration;
-    }
-
-    uint64_t accumulated = 0;
-    size_t index = 0;
-    while (index < state->waveform.count) {
-        uint64_t duration = (uint64_t)state->waveform.pulses[index].duration;
-        if (duration == 0) {
-            index++;
-            continue;
-        }
-        if (target < accumulated + duration) {
-            break;
-        }
-        accumulated += duration;
-        index++;
-    }
-
-    state->waveform_index = index;
-    if ((index & 1u) != 0u) {
-        state->level = initial_level ? 0 : 1;
-        tape_ear_state = state->level;
-        speaker_tape_playback_level = tape_ear_state;
-        speaker_update_output(total_t_states, 0);
-    }
-
-    state->position_tstates = target;
-    state->position_start_tstate = target;
-    state->last_transition_tstate = target;
-    tape_wav_shared_position_tstates = target;
-
-    if (index < state->waveform.count) {
-        uint64_t duration = (uint64_t)state->waveform.pulses[index].duration;
-        uint64_t consumed = target - accumulated;
-        if (consumed > duration) {
-            consumed = duration;
-        }
-        uint64_t remaining = duration - consumed;
-        if (remaining == 0) {
-            state->waveform_index = index + 1;
-            state->level = state->level ? 0 : 1;
-            tape_ear_state = state->level;
-            speaker_tape_playback_level = tape_ear_state;
-            speaker_update_output(total_t_states, 0);
-            if (state->waveform_index < state->waveform.count) {
-                state->paused_transition_remaining = (uint64_t)state->waveform.pulses[state->waveform_index].duration;
-            } else {
-                state->paused_transition_remaining = 0;
-            }
-        } else {
-            state->paused_transition_remaining = remaining;
-        }
-    } else {
-        state->paused_transition_remaining = 0;
-    }
-}
-
 static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t stop_t_state) {
     if (!state) {
         return;
@@ -6223,7 +6133,7 @@ static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_ou
     }
 
     if (tape_recorder.output_format == TAPE_OUTPUT_WAV) {
-        tape_wav_shared_position_tstates = tape_recorder.position_tstates;
+        tape_wav_shared_position_tstates = 0;
         if (tape_input_format == TAPE_FORMAT_WAV &&
             tape_input_path &&
             tape_recorder.output_path &&
@@ -6233,7 +6143,6 @@ static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_ou
                 tape_input_enabled = 0;
             } else {
                 tape_reset_playback(&tape_playback);
-                tape_wav_seek_playback(&tape_playback, tape_wav_shared_position_tstates);
                 tape_input_enabled = 1;
             }
         }
