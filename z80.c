@@ -4947,13 +4947,15 @@ static void tape_render_manager(void) {
         return;
     }
 
-    const int scale = 2;
+    int scale = 2;
+
+layout_retry:
     const int spacing = scale;
     const int padding = 12;
     const int line_height = TAPE_OVERLAY_FONT_HEIGHT * scale;
     const int line_gap = scale;
     const int section_gap = line_height;
-    const int counter_scale = 3;
+    const int counter_scale = (scale > 1) ? 3 : 2;
     const int counter_padding = scale * 4;
     const int control_button_size = line_height * 2;
     const int control_button_gap = scale * 4;
@@ -5216,6 +5218,11 @@ static void tape_render_manager(void) {
     }
 
     panel_width += padding * 2;
+
+    if (panel_width > TOTAL_WIDTH && scale > 1) {
+        --scale;
+        goto layout_retry;
+    }
 
     int info_height = info_line_count * line_height + (info_line_count - 1) * line_gap;
 
