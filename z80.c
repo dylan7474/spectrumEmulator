@@ -5127,11 +5127,29 @@ static void tape_render_manager(void) {
         action_row_width += button_width;
     }
 
-    char shortcuts_line[192];
-    (void)snprintf(shortcuts_line,
-                   sizeof(shortcuts_line),
-                   "SHORTCUTS: P PLAY  S STOP  W REWIND  R RECORD (SHIFT=APPEND)  L LOAD  E EJECT  TAB/ESC CLOSE");
-    int shortcuts_width = tape_overlay_text_width(shortcuts_line, scale, spacing);
+    const char* shortcuts_lines[3];
+    int shortcuts_line_widths[3];
+    int shortcuts_line_count = 0;
+    int shortcuts_width = 0;
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU) {
+        shortcuts_lines[shortcuts_line_count] =
+            "SHORTCUTS: P PLAY  S STOP  W REWIND  R RECORD";
+        shortcuts_line_widths[shortcuts_line_count] =
+            tape_overlay_text_width(shortcuts_lines[shortcuts_line_count], scale, spacing);
+        if (shortcuts_line_widths[shortcuts_line_count] > shortcuts_width) {
+            shortcuts_width = shortcuts_line_widths[shortcuts_line_count];
+        }
+        shortcuts_line_count++;
+
+        shortcuts_lines[shortcuts_line_count] =
+            "SHIFT+R APPEND  L LOAD  E EJECT  TAB/ESC CLOSE";
+        shortcuts_line_widths[shortcuts_line_count] =
+            tape_overlay_text_width(shortcuts_lines[shortcuts_line_count], scale, spacing);
+        if (shortcuts_line_widths[shortcuts_line_count] > shortcuts_width) {
+            shortcuts_width = shortcuts_line_widths[shortcuts_line_count];
+        }
+        shortcuts_line_count++;
+    }
 
     char input_prompt[48];
     char input_line[PATH_MAX + 4];
@@ -5234,9 +5252,12 @@ static void tape_render_manager(void) {
     panel_height += section_gap;
     panel_height += line_height; // status line
 
-    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_line_count > 0) {
         panel_height += line_gap;
-        panel_height += line_height; // shortcuts
+        panel_height += shortcuts_line_count * line_height;
+        if (shortcuts_line_count > 1) {
+            panel_height += (shortcuts_line_count - 1) * line_gap;
+        }
     }
 
     int origin_x = (TOTAL_WIDTH - panel_width) / 2;
@@ -5374,10 +5395,21 @@ static void tape_render_manager(void) {
     tape_overlay_draw_text(status_x, cursor_y, status_line, scale, spacing, status_color);
     cursor_y += line_height;
 
-    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_line_count > 0) {
         cursor_y += line_gap;
-        int shortcuts_x = origin_x + (panel_width - shortcuts_width) / 2;
-        tape_overlay_draw_text(shortcuts_x, cursor_y, shortcuts_line, scale, spacing, dim_text_color);
+        for (int i = 0; i < shortcuts_line_count; ++i) {
+            int shortcuts_x = origin_x + (panel_width - shortcuts_line_widths[i]) / 2;
+            tape_overlay_draw_text(shortcuts_x,
+                                   cursor_y,
+                                   shortcuts_lines[i],
+                                   scale,
+                                   spacing,
+                                   dim_text_color);
+            cursor_y += line_height;
+            if (i + 1 < shortcuts_line_count) {
+                cursor_y += line_gap;
+            }
+        }
     }
 }
 
