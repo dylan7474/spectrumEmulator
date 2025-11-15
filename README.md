@@ -107,6 +107,13 @@ directory via `--test-rom-dir <dir>`), then rerun the test command to execute th
 treated as a smoke test that fails only when it reports errors, letting the harness run the more exhaustive checks without
 requiring string updates for every upstream release.
 
+Snapshot regression coverage now rides alongside the CPU checks. The harness loads the fixtures in `tests/snapshots/` to verify
+that 48K and 128K `.sna` dumps restore their paging state, that +2A special maps are honoured, and that both compressed V1 and
+extended V3 `.z80` files decompress into the expected RAM images. Supply `--snapshot-test-dir <dir>` to point the harness at
+additional snapshot bundles without touching the bundled set. To keep the repository binary-free, the `.z80` fixtures are stored
+as `.b64` text and the `.sna` cases are synthesised on the fly. The harness automatically materialises everything into
+`tests/snapshots/generated/` before running the tests, so you rarely need to decode them manually.
+
 For convenience a dedicated make target wraps the test invocation:
 
 ```bash
