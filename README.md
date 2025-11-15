@@ -233,9 +233,11 @@ Additional host shortcuts:
 - F5 Play, F6 Stop, F7 Rewind, F8 Record (Shift+F8 appends to the current WAV when available).
 
 ## Roadmap
-- **Snapshot stress tests** – Build automated `.sna`/`.z80` regression suites and
-  compatibility probes so the broadened loader stays reliable across ROM and
-  paging combinations.
+- **Snapshot stress tests (shipped)** – The automated `.sna`/`.z80` regression
+  harness now rides alongside `make test` and exercises both the synthetic
+  fixtures and any user-provided probes in `tests/snapshots/probes/`. Roadmap
+  work here focuses on growing that compatibility shelf with trickier captures
+  so every paging combination keeps its instant boot path.
 - **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
   Interface 2 to broaden controller support for games.
 - **Automation and CI** – Expand the new Linux CI pipeline with Windows builds and long-running cassette regressions so audio,
