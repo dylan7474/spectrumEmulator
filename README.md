@@ -215,7 +215,7 @@ The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary hos
 
 Additional host shortcuts:
 
-- Close the emulator window or use your window manager's close button to exit.
+- Press Escape or close the emulator window to exit.
 - Toggle the internal beeper through the Spectrum's standard `BEEP` command.
 - F5 Play, F6 Stop, F7 Rewind, F8 Record (Shift+F8 appends to the current WAV when available).
 - F11 or Alt+Enter toggles fullscreen mode.

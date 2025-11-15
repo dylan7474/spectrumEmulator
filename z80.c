@@ -10733,6 +10733,10 @@ int main(int argc, char *argv[]) {
                 if (e.type == SDL_KEYDOWN && !e.key.repeat) {
                     SDL_Keycode sym = e.key.keysym.sym;
                     SDL_Keymod mods = e.key.keysym.mod;
+                    if (sym == SDLK_ESCAPE) {
+                        quit = 1;
+                        continue;
+                    }
                     if (sym == SDLK_F11 || (sym == SDLK_RETURN && (mods & KMOD_ALT))) {
                         toggle_fullscreen();
                         continue;
