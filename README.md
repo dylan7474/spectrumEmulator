@@ -191,6 +191,18 @@ loaders that rely on tuned pilot lengths, bespoke tone tables, or raw waveform
 captures play back without falling back to WAV conversion, keeping popular
 demos and fast loaders working straight from their archival images.
 
+### Upcoming compatibility and feature work
+
+To keep 128K-era titles progressing, the next milestones focus on observability, sound, and media coverage:
+
+1. **AY-3-8912 audio path.** The 128K control/data ports are already latched, but the emulator still ignores the register contents when mixing audio. Wiring a simple AY mixer alongside the beeper callback (and exposing gain/pan controls) will unlock the signature 128K soundtracks and help diagnose loaders that poll the chip before continuing.
+
+2. **Paging diagnostics and regression probes.** Instrument `spectrum_apply_memory_configuration()`/`io_write()` with a `--trace-paging` helper (or structured logging) so troublesome 128K programs that "load but never start" can be captured and replayed. Any failing `.z80`/`.sna` should be dropped into `tests/snapshots/probes/` so `make test` covers the scenario automatically.
+
+3. **Broader tape/disk coverage.** The TZX deck currently implements blocks `0x10–0x15`. Extending support to the additional tone/control records (`0x18`, `0x19`, etc.) plus prototyping +3 disk controller I/O will satisfy the media formats many late 128K releases expect.
+
+4. **128K bring-up helpers.** Build UI/CLI affordances—ROM bank pre-flight reports, auto-typing macros that issue `LOAD ""` or poke the 128K menu, and a "bank watch" overlay fed by `current_screen_bank`/`current_paged_bank`—so diagnosing stubborn loaders requires fewer manual steps.
+
 ### Snapshots
 
 Quick-load snapshot support complements the tape deck when you want to launch
