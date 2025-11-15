@@ -10446,6 +10446,76 @@ static bool test_snapshot_z80_v3_extended(const char* override_dir) {
     return registers_ok && refresh_ok && border_ok && interrupt_ok && memory_ok;
 }
 
+static bool snapshot_probe_load_file(const char* path, SnapshotFormat format) {
+    if (!path || format == SNAPSHOT_FORMAT_NONE) {
+        return false;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    border_color_idx = 0u;
+
+    return snapshot_load(path, format, &cpu) ? true : false;
+}
+
+static bool run_snapshot_probes(const char* override_dir) {
+    char probe_dir[PATH_MAX];
+    if (!snapshot_fixture_path(probe_dir, sizeof(probe_dir), override_dir, "probes")) {
+        return true;
+    }
+
+    DIR* dir = opendir(probe_dir);
+    if (!dir) {
+        printf("Snapshot compatibility probes directory %s not found (skipping)\n", probe_dir);
+        return true;
+    }
+
+    printf("Running snapshot compatibility probes in %s...\n", probe_dir);
+
+    bool any_files = false;
+    bool all_passed = true;
+    struct dirent* entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        SnapshotFormat format = snapshot_format_from_extension(entry->d_name);
+        if (format == SNAPSHOT_FORMAT_NONE) {
+            continue;
+        }
+
+        char full_path[PATH_MAX];
+        int required = snprintf(full_path, sizeof(full_path), "%s/%s", probe_dir, entry->d_name);
+        if (required < 0 || (size_t)required >= sizeof(full_path)) {
+            printf("  %-28s SKIP (path too long)\n", entry->d_name);
+            continue;
+        }
+
+        STAT_STRUCT info;
+        if (STAT_FUNC(full_path, &info) != 0 || STAT_ISDIR(info.st_mode)) {
+            continue;
+        }
+
+        any_files = true;
+        bool ok = snapshot_probe_load_file(full_path, format);
+        printf("  %-28s %s\n", entry->d_name, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            all_passed = false;
+        }
+    }
+
+    closedir(dir);
+
+    if (!any_files) {
+        printf("  (no .sna or .z80 files found in %s)\n", probe_dir);
+    }
+
+    return all_passed;
+}
+
 static bool run_snapshot_tests(const char* override_dir) {
     struct {
         const char* name;
@@ -10466,6 +10536,11 @@ static bool run_snapshot_tests(const char* override_dir) {
         if (!ok) {
             all_passed = false;
         }
+    }
+
+    bool probes_ok = run_snapshot_probes(override_dir);
+    if (!probes_ok) {
+        all_passed = false;
     }
 
     return all_passed;
