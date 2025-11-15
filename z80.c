@@ -8,6 +8,22 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define TAPE_GETCWD _getcwd
+#define STAT_STRUCT struct _stat
+#define STAT_FUNC _stat
+#define STAT_ISDIR(mode) (((mode) & _S_IFDIR) != 0)
+#else
+#include <unistd.h>
+#define TAPE_GETCWD getcwd
+#define STAT_STRUCT struct stat
+#define STAT_FUNC stat
+#define STAT_ISDIR(mode) S_ISDIR(mode)
+#endif
 #include <SDL.h>
 
 #ifndef PATH_MAX
@@ -314,13 +330,29 @@ static int tape_debug_logging = 0;
 typedef enum {
     TAPE_MANAGER_MODE_HIDDEN,
     TAPE_MANAGER_MODE_MENU,
-    TAPE_MANAGER_MODE_FILE_INPUT
+    TAPE_MANAGER_MODE_FILE_INPUT,
+    TAPE_MANAGER_MODE_FILE_BROWSER
 } TapeManagerMode;
 
 static TapeManagerMode tape_manager_mode = TAPE_MANAGER_MODE_HIDDEN;
 static char tape_manager_status[128] = "PRESS TAB TO OPEN TAPE MANAGER";
 static char tape_manager_input_buffer[PATH_MAX];
 static size_t tape_manager_input_length = 0u;
+
+#define TAPE_MANAGER_BROWSER_MAX_ENTRIES 256
+#define TAPE_MANAGER_BROWSER_VISIBLE_LINES 10
+
+typedef struct {
+    char name[PATH_MAX];
+    int is_dir;
+    int is_up;
+} TapeBrowserEntry;
+
+static char tape_manager_browser_path[PATH_MAX];
+static TapeBrowserEntry tape_manager_browser_entries[TAPE_MANAGER_BROWSER_MAX_ENTRIES];
+static int tape_manager_browser_entry_count = 0;
+static int tape_manager_browser_selection = 0;
+static int tape_manager_browser_scroll = 0;
 
 static void tape_log(const char* fmt, ...) {
     if (!tape_debug_logging || !fmt) {
@@ -478,6 +510,22 @@ static int tape_waveform_add_with_pending(TapeWaveform* waveform, uint64_t durat
 static int tape_generate_waveform_from_image(const TapeImage* image, TapeWaveform* waveform);
 static int tape_load_wav(const char* path, TapePlaybackState* state);
 static int tape_create_blank_wav(const char* path, uint32_t sample_rate);
+static void tape_manager_browser_normalize_separators(char* path);
+static void tape_manager_browser_strip_trailing_separator(char* path);
+static int tape_manager_browser_parent_path(const char* path, char* out, size_t out_size);
+static int tape_manager_browser_can_go_up(const char* path);
+static int tape_browser_entry_compare(const void* a, const void* b);
+static int tape_manager_browser_join_path(const char* base, const char* name, char* out, size_t out_size);
+static void tape_manager_browser_clamp_selection(void);
+static void tape_manager_browser_move_selection(int delta);
+static void tape_manager_browser_page_selection(int delta);
+static int tape_manager_refresh_browser(const char* directory);
+static void tape_manager_begin_browser(void);
+static void tape_manager_browser_activate_selection(void);
+static void tape_manager_browser_go_parent(void);
+static void tape_manager_browser_extract_directory(const char* path, char* directory, size_t directory_size);
+static int tape_manager_create_blank_tape(const char* path, TapeFormat format);
+static int tape_manager_ensure_path_available(const char* path, TapeFormat format);
 static void tape_recorder_enable(const char* path, TapeOutputFormat format);
 static int tape_recorder_start_session(uint64_t current_t_state, int append_mode);
 static void tape_recorder_stop_session(uint64_t current_t_state, int finalize_output);
@@ -4393,6 +4441,272 @@ static void tape_manager_clear_input(void) {
     }
 }
 
+static void tape_manager_browser_normalize_separators(char* path) {
+    if (!path) {
+        return;
+    }
+    for (char* cursor = path; *cursor; ++cursor) {
+        if (*cursor == '\\') {
+            *cursor = '/';
+        }
+    }
+}
+
+static void tape_manager_browser_strip_trailing_separator(char* path) {
+    if (!path) {
+        return;
+    }
+    size_t length = strlen(path);
+    while (length > 0u) {
+        if (path[length - 1u] != '/') {
+            break;
+        }
+        if (length == 1u) {
+            break;
+        }
+#ifdef _WIN32
+        if (length == 3u && path[1] == ':' && path[2] == '/') {
+            break;
+        }
+#endif
+        path[length - 1u] = '\0';
+        --length;
+    }
+}
+
+static int tape_manager_browser_parent_path(const char* path, char* out, size_t out_size) {
+    if (!path || !out || out_size == 0u) {
+        return 0;
+    }
+
+    size_t length = strlen(path);
+    if (length >= out_size) {
+        length = out_size - 1u;
+    }
+    if (length >= out_size) {
+        length = out_size - 1u;
+    }
+    memcpy(out, path, length);
+    out[length] = '\0';
+    tape_manager_browser_normalize_separators(out);
+    tape_manager_browser_strip_trailing_separator(out);
+
+    size_t current_length = strlen(out);
+    if (current_length == 0u) {
+        (void)snprintf(out, out_size, ".");
+        return 1;
+    }
+    if (strcmp(out, "/") == 0) {
+        return 1;
+    }
+#ifdef _WIN32
+    if (current_length == 2u && out[1] == ':') {
+        out[2] = '/';
+        out[3] = '\0';
+        return 1;
+    }
+    if (current_length == 3u && out[1] == ':' && out[2] == '/') {
+        return 1;
+    }
+#endif
+
+    while (current_length > 0u && out[current_length - 1u] != '/') {
+        --current_length;
+    }
+
+    if (current_length == 0u) {
+        out[0] = '/';
+        out[1] = '\0';
+    } else if (current_length == 1u) {
+        out[1] = '\0';
+    } else {
+        out[current_length - 1u] = '\0';
+        tape_manager_browser_strip_trailing_separator(out);
+        if (out[0] == '\0') {
+            out[0] = '/';
+            out[1] = '\0';
+        }
+#ifdef _WIN32
+        if (strlen(out) == 2u && out[1] == ':') {
+            out[2] = '/';
+            out[3] = '\0';
+        }
+#endif
+    }
+
+    return 1;
+}
+
+static int tape_manager_browser_can_go_up(const char* path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    char parent[PATH_MAX];
+    if (!tape_manager_browser_parent_path(path, parent, sizeof(parent))) {
+        return 0;
+    }
+    return strcmp(parent, path) != 0;
+}
+
+static int tape_browser_entry_compare(const void* a, const void* b) {
+    const TapeBrowserEntry* lhs = (const TapeBrowserEntry*)a;
+    const TapeBrowserEntry* rhs = (const TapeBrowserEntry*)b;
+    if (lhs->is_dir && !rhs->is_dir) {
+        return -1;
+    }
+    if (!lhs->is_dir && rhs->is_dir) {
+        return 1;
+    }
+    return strcmp(lhs->name, rhs->name);
+}
+
+static int tape_manager_browser_join_path(const char* base, const char* name, char* out, size_t out_size) {
+    if (!name || !out || out_size == 0u) {
+        return 0;
+    }
+
+    if (!base || !*base) {
+        base = ".";
+    }
+
+    size_t base_length = strlen(base);
+    int need_separator = 0;
+    if (base_length > 0u && base[base_length - 1u] != '/') {
+        need_separator = 1;
+    }
+
+    int written = snprintf(out, out_size, "%s%s%s", base, need_separator ? "/" : "", name);
+    if (written < 0) {
+        return 0;
+    }
+    if ((size_t)written >= out_size) {
+        return 0;
+    }
+
+    tape_manager_browser_normalize_separators(out);
+    return 1;
+}
+
+static void tape_manager_browser_clamp_selection(void) {
+    if (tape_manager_browser_entry_count <= 0) {
+        tape_manager_browser_selection = 0;
+        tape_manager_browser_scroll = 0;
+        return;
+    }
+
+    if (tape_manager_browser_selection < 0) {
+        tape_manager_browser_selection = 0;
+    }
+    if (tape_manager_browser_selection >= tape_manager_browser_entry_count) {
+        tape_manager_browser_selection = tape_manager_browser_entry_count - 1;
+    }
+
+    if (tape_manager_browser_scroll < 0) {
+        tape_manager_browser_scroll = 0;
+    }
+
+    int max_scroll = tape_manager_browser_entry_count - TAPE_MANAGER_BROWSER_VISIBLE_LINES;
+    if (max_scroll < 0) {
+        max_scroll = 0;
+    }
+    if (tape_manager_browser_scroll > max_scroll) {
+        tape_manager_browser_scroll = max_scroll;
+    }
+
+    if (tape_manager_browser_selection < tape_manager_browser_scroll) {
+        tape_manager_browser_scroll = tape_manager_browser_selection;
+    }
+    if (tape_manager_browser_selection >= tape_manager_browser_scroll + TAPE_MANAGER_BROWSER_VISIBLE_LINES) {
+        tape_manager_browser_scroll = tape_manager_browser_selection - TAPE_MANAGER_BROWSER_VISIBLE_LINES + 1;
+        if (tape_manager_browser_scroll < 0) {
+            tape_manager_browser_scroll = 0;
+        }
+    }
+}
+
+static void tape_manager_browser_move_selection(int delta) {
+    if (tape_manager_browser_entry_count <= 0) {
+        return;
+    }
+
+    int new_selection = tape_manager_browser_selection + delta;
+    if (new_selection < 0) {
+        new_selection = 0;
+    }
+    if (new_selection >= tape_manager_browser_entry_count) {
+        new_selection = tape_manager_browser_entry_count - 1;
+    }
+
+    tape_manager_browser_selection = new_selection;
+    tape_manager_browser_clamp_selection();
+}
+
+static void tape_manager_browser_page_selection(int delta) {
+    if (tape_manager_browser_entry_count <= 0) {
+        return;
+    }
+
+    int amount = delta * TAPE_MANAGER_BROWSER_VISIBLE_LINES;
+    int new_selection = tape_manager_browser_selection + amount;
+    if (new_selection < 0) {
+        new_selection = 0;
+    }
+    if (new_selection >= tape_manager_browser_entry_count) {
+        new_selection = tape_manager_browser_entry_count - 1;
+    }
+
+    tape_manager_browser_selection = new_selection;
+    tape_manager_browser_clamp_selection();
+}
+
+static void tape_manager_browser_extract_directory(const char* path, char* directory, size_t directory_size) {
+    if (!directory || directory_size == 0u) {
+        return;
+    }
+
+    directory[0] = '\0';
+    if (!path || !*path) {
+        return;
+    }
+
+    size_t length = strlen(path);
+    if (length >= directory_size) {
+        length = directory_size - 1u;
+    }
+    if (length >= directory_size) {
+        length = directory_size - 1u;
+    }
+
+    memcpy(directory, path, length);
+    directory[length] = '\0';
+    tape_manager_browser_normalize_separators(directory);
+
+    char* last_separator = strrchr(directory, '/');
+    if (!last_separator) {
+        directory[0] = '.';
+        directory[1] = '\0';
+        return;
+    }
+
+    if (last_separator == directory) {
+        directory[1] = '\0';
+    } else {
+        *last_separator = '\0';
+        tape_manager_browser_strip_trailing_separator(directory);
+        if (directory[0] == '\0') {
+            directory[0] = '.';
+            directory[1] = '\0';
+        }
+    }
+
+#ifdef _WIN32
+    if (strlen(directory) == 2u && directory[1] == ':') {
+        directory[2] = '/';
+        directory[3] = '\0';
+    }
+#endif
+}
+
 static const char* tape_manager_filename(const char* path) {
     if (!path || !*path) {
         return NULL;
@@ -4455,6 +4769,209 @@ static void tape_manager_toggle(void) {
     }
 }
 
+static int tape_manager_refresh_browser(const char* directory) {
+    char target[PATH_MAX];
+    if (directory && *directory) {
+        size_t length = strlen(directory);
+        if (length >= sizeof(target)) {
+            length = sizeof(target) - 1u;
+        }
+        if (length >= sizeof(target)) {
+            length = sizeof(target) - 1u;
+        }
+        memcpy(target, directory, length);
+        target[length] = '\0';
+    } else {
+        if (!TAPE_GETCWD(target, sizeof(target))) {
+            target[0] = '.';
+            target[1] = '\0';
+        }
+    }
+
+    tape_manager_browser_normalize_separators(target);
+    if (target[0] == '\0') {
+        target[0] = '.';
+        target[1] = '\0';
+    }
+
+    DIR* dir = opendir(target);
+    if (!dir) {
+        fprintf(stderr, "Failed to open directory '%s': %s\n", target, strerror(errno));
+        return 0;
+    }
+
+    TapeBrowserEntry entries[TAPE_MANAGER_BROWSER_MAX_ENTRIES];
+    int entry_count = 0;
+
+    struct dirent* dent = NULL;
+    while ((dent = readdir(dir)) != NULL) {
+        if (strcmp(dent->d_name, ".") == 0) {
+            continue;
+        }
+        if (strcmp(dent->d_name, "..") == 0 && !tape_manager_browser_can_go_up(target)) {
+            continue;
+        }
+        if (entry_count >= TAPE_MANAGER_BROWSER_MAX_ENTRIES) {
+            break;
+        }
+
+        char full_path[PATH_MAX];
+        if (!tape_manager_browser_join_path(target, dent->d_name, full_path, sizeof(full_path))) {
+            continue;
+        }
+
+        int is_dir = 0;
+#if defined(DT_DIR)
+        if (dent->d_type == DT_DIR) {
+            is_dir = 1;
+        } else {
+#endif
+            STAT_STRUCT st;
+            if (STAT_FUNC(full_path, &st) == 0 && STAT_ISDIR(st.st_mode)) {
+                is_dir = 1;
+            }
+#if defined(DT_DIR)
+        }
+#endif
+
+        if (!is_dir) {
+            TapeFormat entry_format = tape_format_from_extension(dent->d_name);
+            if (entry_format == TAPE_FORMAT_NONE) {
+                continue;
+            }
+        }
+
+        TapeBrowserEntry* slot = &entries[entry_count++];
+        memset(slot, 0, sizeof(*slot));
+        size_t name_length = strlen(dent->d_name);
+        if (name_length >= sizeof(slot->name)) {
+            name_length = sizeof(slot->name) - 1u;
+        }
+        memcpy(slot->name, dent->d_name, name_length);
+        slot->name[name_length] = '\0';
+        slot->is_dir = is_dir ? 1 : 0;
+        slot->is_up = 0;
+    }
+
+    closedir(dir);
+
+    qsort(entries, entry_count, sizeof(TapeBrowserEntry), tape_browser_entry_compare);
+
+    strncpy(tape_manager_browser_path, target, sizeof(tape_manager_browser_path) - 1u);
+    tape_manager_browser_path[sizeof(tape_manager_browser_path) - 1u] = '\0';
+
+    tape_manager_browser_entry_count = 0;
+
+    if (tape_manager_browser_can_go_up(tape_manager_browser_path)) {
+        TapeBrowserEntry* up = &tape_manager_browser_entries[tape_manager_browser_entry_count++];
+        memset(up, 0, sizeof(*up));
+        up->is_dir = 1;
+        up->is_up = 1;
+        (void)snprintf(up->name, sizeof(up->name), "..");
+    }
+
+    for (int i = 0; i < entry_count && tape_manager_browser_entry_count < TAPE_MANAGER_BROWSER_MAX_ENTRIES; ++i) {
+        tape_manager_browser_entries[tape_manager_browser_entry_count] = entries[i];
+        tape_manager_browser_entry_count++;
+    }
+
+    tape_manager_browser_selection = 0;
+    tape_manager_browser_scroll = 0;
+    tape_manager_browser_clamp_selection();
+
+    return 1;
+}
+
+static void tape_manager_begin_browser(void) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
+        SDL_StopTextInput();
+    }
+
+    char initial_directory[PATH_MAX];
+    initial_directory[0] = '\0';
+
+    if (tape_manager_browser_path[0] != '\0') {
+        strncpy(initial_directory, tape_manager_browser_path, sizeof(initial_directory) - 1u);
+        initial_directory[sizeof(initial_directory) - 1u] = '\0';
+    } else if (tape_input_path && *tape_input_path) {
+        tape_manager_browser_extract_directory(tape_input_path, initial_directory, sizeof(initial_directory));
+    }
+
+    if (!tape_manager_refresh_browser(initial_directory)) {
+        if (!tape_manager_refresh_browser(NULL)) {
+            tape_manager_set_status("FAILED TO OPEN FILE BROWSER");
+            tape_manager_show_menu();
+            return;
+        }
+    }
+
+    tape_manager_mode = TAPE_MANAGER_MODE_FILE_BROWSER;
+    if (tape_manager_browser_entry_count > 0) {
+        tape_manager_set_status("SELECT FILE AND PRESS RETURN");
+    } else {
+        tape_manager_set_status("NO TAPES FOUND IN DIRECTORY");
+    }
+}
+
+static void tape_manager_browser_go_parent(void) {
+    if (tape_manager_browser_path[0] == '\0') {
+        return;
+    }
+    char parent[PATH_MAX];
+    if (!tape_manager_browser_parent_path(tape_manager_browser_path, parent, sizeof(parent))) {
+        return;
+    }
+    if (strcmp(parent, tape_manager_browser_path) == 0) {
+        tape_manager_set_status("ALREADY AT ROOT");
+        return;
+    }
+    if (!tape_manager_refresh_browser(parent)) {
+        tape_manager_set_status("FAILED TO OPEN PARENT");
+        return;
+    }
+    if (tape_manager_browser_entry_count > 0) {
+        tape_manager_set_status("SELECT FILE AND PRESS RETURN");
+    } else {
+        tape_manager_set_status("NO TAPES FOUND IN DIRECTORY");
+    }
+}
+
+static void tape_manager_browser_activate_selection(void) {
+    if (tape_manager_browser_entry_count <= 0) {
+        return;
+    }
+    if (tape_manager_browser_selection < 0 || tape_manager_browser_selection >= tape_manager_browser_entry_count) {
+        return;
+    }
+
+    const TapeBrowserEntry* entry = &tape_manager_browser_entries[tape_manager_browser_selection];
+    if (entry->is_up) {
+        tape_manager_browser_go_parent();
+        return;
+    }
+
+    char full_path[PATH_MAX];
+    if (!tape_manager_browser_join_path(tape_manager_browser_path, entry->name, full_path, sizeof(full_path))) {
+        tape_manager_set_status("PATH TOO LONG");
+        return;
+    }
+
+    if (entry->is_dir) {
+        if (!tape_manager_refresh_browser(full_path)) {
+            tape_manager_set_status("FAILED TO OPEN DIRECTORY");
+            return;
+        }
+        if (tape_manager_browser_entry_count > 0) {
+            tape_manager_set_status("SELECT FILE AND PRESS RETURN");
+        } else {
+            tape_manager_set_status("NO TAPES FOUND IN DIRECTORY");
+        }
+        return;
+    }
+
+    (void)tape_manager_load_path(full_path);
+}
+
 static void tape_manager_begin_path_input(void) {
     size_t length = 0u;
     if (tape_input_path && *tape_input_path) {
@@ -4503,6 +5020,93 @@ static void tape_manager_eject_tape(void) {
     printf("Tape ejected\n");
 }
 
+static int tape_manager_create_blank_tape(const char* path, TapeFormat format) {
+    if (!path || format == TAPE_FORMAT_NONE) {
+        return 0;
+    }
+
+    switch (format) {
+        case TAPE_FORMAT_TAP:
+            {
+                FILE* tf = fopen(path, "wb");
+                if (!tf) {
+                    fprintf(stderr, "Failed to create TAP file '%s': %s\n", path, strerror(errno));
+                    return 0;
+                }
+                if (fclose(tf) != 0) {
+                    fprintf(stderr, "Failed to finalize TAP file '%s': %s\n", path, strerror(errno));
+                    return 0;
+                }
+                printf("Created empty TAP tape %s\n", path);
+                return 1;
+            }
+        case TAPE_FORMAT_TZX:
+            {
+                FILE* tf = fopen(path, "wb");
+                if (!tf) {
+                    fprintf(stderr, "Failed to create TZX file '%s': %s\n", path, strerror(errno));
+                    return 0;
+                }
+                uint8_t header[10] = {'Z','X','T','a','p','e','!',0x1A,0x01,0x14};
+                if (fwrite(header, sizeof(header), 1, tf) != 1) {
+                    fprintf(stderr, "Failed to write TZX header to '%s'\n", path);
+                    fclose(tf);
+                    return 0;
+                }
+                if (fclose(tf) != 0) {
+                    fprintf(stderr, "Failed to finalize TZX file '%s': %s\n", path, strerror(errno));
+                    return 0;
+                }
+                printf("Created empty TZX tape %s\n", path);
+                return 1;
+            }
+        case TAPE_FORMAT_WAV:
+            {
+                uint32_t sample_rate = (audio_sample_rate > 0) ? (uint32_t)audio_sample_rate : 44100u;
+                if (!tape_create_blank_wav(path, sample_rate)) {
+                    return 0;
+                }
+                return 1;
+            }
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+static int tape_manager_ensure_path_available(const char* path, TapeFormat format) {
+    if (!path || format == TAPE_FORMAT_NONE) {
+        return 0;
+    }
+
+    const char* base_name = tape_manager_filename(path);
+    if (!base_name) {
+        base_name = path;
+    }
+
+    STAT_STRUCT st;
+    if (STAT_FUNC(path, &st) == 0) {
+        if (STAT_ISDIR(st.st_mode)) {
+            tape_manager_set_status("PATH IS A DIRECTORY");
+            return 0;
+        }
+        return 1;
+    }
+
+    if (errno != ENOENT) {
+        tape_manager_set_status("FAILED TO ACCESS %s (%s)", base_name, strerror(errno));
+        return 0;
+    }
+
+    if (!tape_manager_create_blank_tape(path, format)) {
+        tape_manager_set_status("FAILED TO CREATE %s", base_name);
+        return 0;
+    }
+
+    return 1;
+}
+
 static int tape_manager_load_path(const char* path) {
     if (!path || !*path) {
         tape_manager_set_status("NO FILE SPECIFIED");
@@ -4512,6 +5116,10 @@ static int tape_manager_load_path(const char* path) {
     TapeFormat format = tape_format_from_extension(path);
     if (format == TAPE_FORMAT_NONE) {
         tape_manager_set_status("UNSUPPORTED TAPE FORMAT");
+        return 0;
+    }
+
+    if (!tape_manager_ensure_path_available(path, format)) {
         return 0;
     }
 
@@ -4642,12 +5250,57 @@ static int tape_manager_handle_event(const SDL_Event* event) {
         }
     }
 
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) {
+        switch (key) {
+            case SDLK_ESCAPE:
+                tape_manager_show_menu();
+                tape_manager_set_status("BROWSE CANCELLED");
+                return 1;
+            case SDLK_RETURN:
+            case SDLK_KP_ENTER:
+                tape_manager_browser_activate_selection();
+                return 1;
+            case SDLK_UP:
+                tape_manager_browser_move_selection(-1);
+                return 1;
+            case SDLK_DOWN:
+                tape_manager_browser_move_selection(1);
+                return 1;
+            case SDLK_PAGEUP:
+                tape_manager_browser_page_selection(-1);
+                return 1;
+            case SDLK_PAGEDOWN:
+                tape_manager_browser_page_selection(1);
+                return 1;
+            case SDLK_HOME:
+                if (tape_manager_browser_entry_count > 0) {
+                    tape_manager_browser_selection = 0;
+                    tape_manager_browser_clamp_selection();
+                }
+                return 1;
+            case SDLK_END:
+                if (tape_manager_browser_entry_count > 0) {
+                    tape_manager_browser_selection = tape_manager_browser_entry_count - 1;
+                    tape_manager_browser_clamp_selection();
+                }
+                return 1;
+            case SDLK_BACKSPACE:
+                tape_manager_browser_go_parent();
+                return 1;
+            default:
+                return 1;
+        }
+    }
+
     switch (key) {
         case SDLK_ESCAPE:
             tape_manager_hide();
             return 1;
         case SDLK_l:
             tape_manager_begin_path_input();
+            return 1;
+        case SDLK_b:
+            tape_manager_begin_browser();
             return 1;
         case SDLK_e:
             tape_manager_eject_tape();
@@ -4845,13 +5498,15 @@ layout_retry:
 
     struct TapeManagerActionButton action_buttons[] = {
         {"LOAD", 1},
+        {"BROWSE", 1},
         {"EJECT", (tape_input_enabled || tape_input_format != TAPE_FORMAT_NONE) ? 1 : 0},
         {"CLOSE", 1}
     };
+    const int action_button_count = (int)(sizeof(action_buttons) / sizeof(action_buttons[0]));
 
-    int action_button_widths[3];
+    int action_button_widths[action_button_count];
     int action_row_width = 0;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < action_button_count; ++i) {
         int label_width = tape_overlay_text_width(action_buttons[i].label, scale, spacing);
         int button_width = label_width + text_button_padding * 2;
         action_button_widths[i] = button_width;
@@ -4861,8 +5516,8 @@ layout_retry:
         action_row_width += button_width;
     }
 
-    const char* shortcuts_lines[3];
-    int shortcuts_line_widths[3];
+    const char* shortcuts_lines[4] = {0};
+    int shortcuts_line_widths[4] = {0};
     int shortcuts_line_count = 0;
     int shortcuts_width = 0;
     if (tape_manager_mode == TAPE_MANAGER_MODE_MENU) {
@@ -4876,7 +5531,25 @@ layout_retry:
         shortcuts_line_count++;
 
         shortcuts_lines[shortcuts_line_count] =
-            "SHIFT+R APPEND  L LOAD  E EJECT  TAB/ESC CLOSE";
+            "SHIFT+R APPEND  L LOAD  B BROWSE  E EJECT  TAB/ESC CLOSE";
+        shortcuts_line_widths[shortcuts_line_count] =
+            tape_overlay_text_width(shortcuts_lines[shortcuts_line_count], scale, spacing);
+        if (shortcuts_line_widths[shortcuts_line_count] > shortcuts_width) {
+            shortcuts_width = shortcuts_line_widths[shortcuts_line_count];
+        }
+        shortcuts_line_count++;
+    } else if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) {
+        shortcuts_lines[shortcuts_line_count] =
+            "ARROWS MOVE  RETURN OPEN/LOAD  BACKSPACE UP";
+        shortcuts_line_widths[shortcuts_line_count] =
+            tape_overlay_text_width(shortcuts_lines[shortcuts_line_count], scale, spacing);
+        if (shortcuts_line_widths[shortcuts_line_count] > shortcuts_width) {
+            shortcuts_width = shortcuts_line_widths[shortcuts_line_count];
+        }
+        shortcuts_line_count++;
+
+        shortcuts_lines[shortcuts_line_count] =
+            "ESC CANCEL  TAB CLOSE";
         shortcuts_line_widths[shortcuts_line_count] =
             tape_overlay_text_width(shortcuts_lines[shortcuts_line_count], scale, spacing);
         if (shortcuts_line_widths[shortcuts_line_count] > shortcuts_width) {
@@ -4893,6 +5566,12 @@ layout_retry:
     int input_box_width = 0;
     int input_help_width = 0;
 
+    char browser_path_line[PATH_MAX + 32];
+    int browser_path_width = 0;
+    int browser_list_width = 0;
+    int browser_visible_lines = 0;
+    const char* browser_empty_line = "NO TAPES FOUND";
+
     if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
         (void)snprintf(input_prompt, sizeof(input_prompt), "LOAD TAPE PATH:");
         (void)snprintf(input_line, sizeof(input_line), "> %s", tape_manager_input_buffer);
@@ -4901,6 +5580,39 @@ layout_retry:
         input_line_width = tape_overlay_text_width(input_line, scale, spacing);
         input_box_width = input_line_width + input_box_padding * 2;
         input_help_width = tape_overlay_text_width(input_help, scale, spacing);
+    }
+
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) {
+        const char* directory_display = (tape_manager_browser_path[0] != '\0') ?
+                                        tape_manager_browser_path : ".";
+        (void)snprintf(browser_path_line, sizeof(browser_path_line), "BROWSE: %s", directory_display);
+        browser_path_width = tape_overlay_text_width(browser_path_line, scale, spacing);
+
+        int start = tape_manager_browser_scroll;
+        int end = start + TAPE_MANAGER_BROWSER_VISIBLE_LINES;
+        if (end > tape_manager_browser_entry_count) {
+            end = tape_manager_browser_entry_count;
+        }
+        browser_visible_lines = end - start;
+        if (browser_visible_lines > 0) {
+            for (int i = start; i < end; ++i) {
+                const TapeBrowserEntry* entry = &tape_manager_browser_entries[i];
+                const char* name = entry->is_up ? ".." : entry->name;
+                const char* suffix = entry->is_dir ? "/" : "";
+                char entry_line[PATH_MAX + 16];
+                char marker = (i == tape_manager_browser_selection) ? '>' : ' ';
+                (void)snprintf(entry_line, sizeof(entry_line), "%c %s%s", marker, name, suffix);
+                int width = tape_overlay_text_width(entry_line, scale, spacing);
+                if (width > browser_list_width) {
+                    browser_list_width = width;
+                }
+            }
+        } else {
+            int width = tape_overlay_text_width(browser_empty_line, scale, spacing);
+            if (width > browser_list_width) {
+                browser_list_width = width;
+            }
+        }
     }
 
     const int info_line_count = 3;
@@ -4931,7 +5643,17 @@ layout_retry:
     if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && action_row_width > panel_width) {
         panel_width = action_row_width;
     }
-    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_width > panel_width) {
+    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) {
+        if (browser_path_width > panel_width) {
+            panel_width = browser_path_width;
+        }
+        if (browser_list_width > panel_width) {
+            panel_width = browser_list_width;
+        }
+    }
+    if ((tape_manager_mode == TAPE_MANAGER_MODE_MENU ||
+         tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) &&
+        shortcuts_width > panel_width) {
         panel_width = shortcuts_width;
     }
     if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
@@ -4972,19 +5694,27 @@ layout_retry:
 
         panel_height += section_gap;
         panel_height += text_button_height;
-    } else {
+    } else if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
         panel_height += section_gap;
         panel_height += line_height; // input prompt
         panel_height += line_gap;
         panel_height += input_box_height;
         panel_height += line_gap;
         panel_height += line_height; // input help
+    } else {
+        panel_height += section_gap;
+        panel_height += line_height; // browser path
+        panel_height += line_gap;
+        int browser_lines = (browser_visible_lines > 0) ? browser_visible_lines : 1;
+        panel_height += browser_lines * line_height;
     }
 
     panel_height += section_gap;
     panel_height += line_height; // status line
 
-    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_line_count > 0) {
+    if ((tape_manager_mode == TAPE_MANAGER_MODE_MENU ||
+         tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) &&
+        shortcuts_line_count > 0) {
         panel_height += line_gap;
         panel_height += shortcuts_line_count * line_height;
         if (shortcuts_line_count > 1) {
@@ -5084,7 +5814,7 @@ layout_retry:
 
         int actions_x = origin_x + (panel_width - action_row_width) / 2;
         int action_y = cursor_y;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < action_button_count; ++i) {
             uint32_t fill_color = action_buttons[i].enabled ? text_button_fill : text_button_disabled_fill;
             uint32_t label_color = action_buttons[i].enabled ? text_color : dim_text_color;
             int button_width = action_button_widths[i];
@@ -5097,7 +5827,7 @@ layout_retry:
         }
 
         cursor_y += text_button_height;
-    } else {
+    } else if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
         cursor_y += section_gap;
 
         tape_overlay_draw_text(cursor_x, cursor_y, input_prompt, scale, spacing, dim_text_color);
@@ -5113,6 +5843,34 @@ layout_retry:
         int help_x = origin_x + (panel_width - input_help_width) / 2;
         tape_overlay_draw_text(help_x, cursor_y, input_help, scale, spacing, dim_text_color);
         cursor_y += line_height;
+    } else {
+        cursor_y += section_gap;
+
+        tape_overlay_draw_text(cursor_x, cursor_y, browser_path_line, scale, spacing, dim_text_color);
+        cursor_y += line_height + line_gap;
+
+        int start = tape_manager_browser_scroll;
+        int end = start + TAPE_MANAGER_BROWSER_VISIBLE_LINES;
+        if (end > tape_manager_browser_entry_count) {
+            end = tape_manager_browser_entry_count;
+        }
+
+        if (end > start) {
+            for (int i = start; i < end; ++i) {
+                const TapeBrowserEntry* entry = &tape_manager_browser_entries[i];
+                const char* name = entry->is_up ? ".." : entry->name;
+                const char* suffix = entry->is_dir ? "/" : "";
+                char entry_line[PATH_MAX + 16];
+                char marker = (i == tape_manager_browser_selection) ? '>' : ' ';
+                (void)snprintf(entry_line, sizeof(entry_line), "%c %s%s", marker, name, suffix);
+                uint32_t entry_color = (i == tape_manager_browser_selection) ? title_color : text_color;
+                tape_overlay_draw_text(cursor_x, cursor_y, entry_line, scale, spacing, entry_color);
+                cursor_y += line_height;
+            }
+        } else {
+            tape_overlay_draw_text(cursor_x, cursor_y, browser_empty_line, scale, spacing, dim_text_color);
+            cursor_y += line_height;
+        }
     }
 
     cursor_y += section_gap;
@@ -5121,7 +5879,9 @@ layout_retry:
     tape_overlay_draw_text(status_x, cursor_y, status_line, scale, spacing, status_color);
     cursor_y += line_height;
 
-    if (tape_manager_mode == TAPE_MANAGER_MODE_MENU && shortcuts_line_count > 0) {
+    if ((tape_manager_mode == TAPE_MANAGER_MODE_MENU ||
+         tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) &&
+        shortcuts_line_count > 0) {
         cursor_y += line_gap;
         for (int i = 0; i < shortcuts_line_count; ++i) {
             int shortcuts_x = origin_x + (panel_width - shortcuts_line_widths[i]) / 2;
