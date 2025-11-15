@@ -10127,6 +10127,49 @@ static int snapshot_fixture_generate_sna_plus2a_special(const char* output_path)
     return ok;
 }
 
+static int snapshot_fixture_generate_sna_plus3_rompaging(const char* output_path) {
+    FILE* out = fopen(output_path, "wb");
+    if (!out) {
+        fprintf(stderr, "Failed to create +3 SNA fixture '%s': %s\n", output_path, strerror(errno));
+        return 0;
+    }
+
+    static const uint8_t bank_patterns[8] = {0x00u, 0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u};
+
+    uint8_t header[27];
+    snapshot_fixture_fill_standard_header(header);
+    int ok = (fwrite(header, 1u, sizeof(header), out) == sizeof(header));
+    ok = ok && snapshot_fixture_write_ram_block(out, 0x90u, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0xA0u, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0xB0u, 0x4000u);
+    uint8_t pc_bytes[2] = {0x00u, 0x40u};
+    if (ok) {
+        ok = (fwrite(pc_bytes, 1u, sizeof(pc_bytes), out) == sizeof(pc_bytes));
+    }
+    uint8_t ports[2] = {0x14u, 0x00u};
+    if (ok) {
+        ok = (fwrite(ports, 1u, sizeof(ports), out) == sizeof(ports));
+    }
+    for (int bank = 0; ok && bank < 8; ++bank) {
+        ok = snapshot_fixture_write_ram_block(out, bank_patterns[bank], 0x4000u);
+    }
+    uint8_t port_1ffd = 0x01u;
+    if (ok) {
+        ok = (fwrite(&port_1ffd, 1u, 1u, out) == 1u);
+    }
+
+    if (fclose(out) != 0) {
+        ok = 0;
+    }
+
+    if (!ok) {
+        fprintf(stderr, "Failed to synthesise +3 SNA fixture '%s'\n", output_path);
+        remove(output_path);
+    }
+
+    return ok;
+}
+
 static int snapshot_fixture_generate_sna(const char* filename, const char* output_path) {
     if (!filename || !output_path) {
         return 0;
@@ -10140,6 +10183,9 @@ static int snapshot_fixture_generate_sna(const char* filename, const char* outpu
     }
     if (strcmp(filename, "plus2a-special.sna") == 0) {
         return snapshot_fixture_generate_sna_plus2a_special(output_path);
+    }
+    if (strcmp(filename, "plus3-rompaging.sna") == 0) {
+        return snapshot_fixture_generate_sna_plus3_rompaging(output_path);
     }
     return 0;
 }
@@ -10357,6 +10403,59 @@ static bool test_snapshot_sna_plus2a_special(const char* override_dir) {
     return model_ok && paging_ok && mapping_ok && memory_ok;
 }
 
+static bool test_snapshot_sna_plus3_rom(const char* override_dir) {
+    char path[512];
+    if (!snapshot_fixture_resolve(path, sizeof(path), override_dir, "plus3-rompaging.sna")) {
+        printf("    failed to prepare fixture plus3-rompaging.sna\n");
+        return false;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
+    memory_clear();
+    spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
+    border_color_idx = 0u;
+
+    uint8_t previous_rom_count = rom_page_count;
+    rom_page_count = 4u;
+
+    spectrum_model = SPECTRUM_MODEL_PLUS3;
+    bool loaded = snapshot_load(path, SNAPSHOT_FORMAT_SNA, &cpu);
+
+    rom_page_count = previous_rom_count;
+
+    if (!loaded) {
+        return false;
+    }
+
+    bool model_ok = (spectrum_model == SPECTRUM_MODEL_PLUS3);
+    bool rom_ok = (current_rom_page == 3u) && (spectrum_pages[0].type == MEMORY_PAGE_ROM);
+    bool paging_ok = (paging_disabled == 0) &&
+                     (current_paged_bank == 4u) &&
+                     (gate_array_7ffd_state == 0x14u) &&
+                     (gate_array_1ffd_state == 0x01u);
+    bool screen_ok = (current_screen_bank == 5u);
+    bool memory_ok = memory_block_matches(0x4000u, 0x55u) &&
+                     memory_block_matches(0x8000u, 0x22u) &&
+                     memory_block_matches(0xC000u, 0x44u);
+
+    if (!memory_ok || !model_ok || !rom_ok || !paging_ok || !screen_ok) {
+        printf("    +3 SNA debug: model=%s rom=%u bank=%u screen=%u 7FFD=%02X 1FFD=%02X mem=%02X/%02X/%02X\n",
+               spectrum_model_to_string(spectrum_model),
+               (unsigned)current_rom_page,
+               (unsigned)current_paged_bank,
+               (unsigned)current_screen_bank,
+               (unsigned)gate_array_7ffd_state,
+               (unsigned)gate_array_1ffd_state,
+               memory[0x4000],
+               memory[0x8000],
+               memory[0xC000]);
+    }
+
+    return model_ok && rom_ok && paging_ok && screen_ok && memory_ok;
+}
+
 static bool test_snapshot_z80_v1_compressed(const char* override_dir) {
     char path[512];
     if (!snapshot_fixture_resolve(path, sizeof(path), override_dir, "v1-compressed.z80")) {
@@ -10524,6 +10623,7 @@ static bool run_snapshot_tests(const char* override_dir) {
         {"SNA 48K register restore", test_snapshot_sna_48k},
         {"SNA 128K locked paging", test_snapshot_sna_128k_locked},
         {"SNA +2A special map", test_snapshot_sna_plus2a_special},
+        {"SNA +3 ROM paging", test_snapshot_sna_plus3_rom},
         {"Z80 V1 compressed RAM", test_snapshot_z80_v1_compressed},
         {"Z80 V3 extended header", test_snapshot_z80_v3_extended},
     };
