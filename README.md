@@ -229,6 +229,13 @@ CPU resumes execution with the restored memory image, and prints the recovered
 program counter, stack pointer, and interrupt mode to stderr for quick
 diagnostics when a file refuses to boot.
 
+Version 2/3 `.z80` snapshots now honour the 128K hardware hint and the last
+gate-array writes captured in the extended header. The loader repopulates all
+eight RAM banks from the paged blocks, reapplies the recorded `0x7FFD`/`0x1FFD`
+values to restore the current screen and paged bank, and reconfigures the
+emulator as a 128K/+2A/+3 model when requested so 128K games resume execution
+instead of falling back to 48K BASIC.
+
 ## Controls
 The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary host-to-Spectrum key mapping is:
 
