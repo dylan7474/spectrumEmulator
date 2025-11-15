@@ -14,6 +14,13 @@ base64 -d tests/snapshots/<fixture>.b64 > tests/snapshots/generated/<fixture>
 Remove the generated files (or the entire `generated/` directory) if you need to
 force a clean rebuild.
 
+The synthesised `.sna` fixtures cover:
+
+- `48k-basic.sna` – baseline paging and register restore.
+- `128k-locked-bank5.sna` – locked 7FFD bank-5 paging state.
+- `plus2a-special.sna` – +2A/+3 special mapping (1FFD bit 2) coverage.
+- `plus3-rompaging.sna` – +3 ROM selection and standard paging verification.
+
 ## Compatibility probes
 
 Real `.sna`/`.z80` captures can be exercised without baking them into the
