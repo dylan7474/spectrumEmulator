@@ -9711,6 +9711,766 @@ static bool test_128k_contention_penalty(void) {
     return ok;
 }
 
+static const char snapshot_fixture_default_dir[] = "tests/snapshots";
+
+static int snapshot_fixture_path(char* buffer,
+                                 size_t capacity,
+                                 const char* override_dir,
+                                 const char* filename) {
+    if (!buffer || capacity == 0u || !filename) {
+        return 0;
+    }
+
+    const char* base = snapshot_fixture_default_dir;
+    if (override_dir && override_dir[0] != '\0') {
+        base = override_dir;
+    }
+
+    int required = snprintf(buffer, capacity, "%s/%s", base, filename);
+    if (required < 0 || (size_t)required >= capacity) {
+        return 0;
+    }
+    return 1;
+}
+
+static int snapshot_fixture_file_exists(const char* path) {
+    if (!path) {
+        return 0;
+    }
+    FILE* file = fopen(path, "rb");
+    if (!file) {
+        return 0;
+    }
+    fclose(file);
+    return 1;
+}
+
+static int snapshot_fixture_ensure_directory(const char* path) {
+    if (!path || path[0] == '\0') {
+        return 0;
+    }
+#ifdef _WIN32
+    if (_mkdir(path) == 0 || errno == EEXIST) {
+        return 1;
+    }
+#else
+    if (mkdir(path, 0777) == 0 || errno == EEXIST) {
+        return 1;
+    }
+#endif
+    fprintf(stderr, "Failed to create directory '%s': %s\n", path, strerror(errno));
+    return 0;
+}
+
+static int snapshot_fixture_uses_default_dir(const char* override_dir) {
+    if (!override_dir || override_dir[0] == '\0') {
+        return 1;
+    }
+    return strcmp(override_dir, snapshot_fixture_default_dir) == 0;
+}
+
+static int snapshot_fixture_decode_base64(const char* source_path, const char* output_path) {
+    FILE* input = fopen(source_path, "rb");
+    if (!input) {
+        fprintf(stderr, "Failed to open Base64 snapshot '%s': %s\n", source_path, strerror(errno));
+        return 0;
+    }
+
+    if (fseek(input, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Failed to seek within Base64 snapshot '%s'\n", source_path);
+        fclose(input);
+        return 0;
+    }
+
+    long raw_size = ftell(input);
+    if (raw_size < 0) {
+        fprintf(stderr, "Failed to determine size of Base64 snapshot '%s'\n", source_path);
+        fclose(input);
+        return 0;
+    }
+    if (fseek(input, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "Failed to rewind Base64 snapshot '%s'\n", source_path);
+        fclose(input);
+        return 0;
+    }
+
+    char* buffer = (char*)malloc((size_t)raw_size);
+    if (!buffer) {
+        fprintf(stderr, "Out of memory decoding Base64 snapshot '%s'\n", source_path);
+        fclose(input);
+        return 0;
+    }
+
+    size_t read = fread(buffer, 1u, (size_t)raw_size, input);
+    fclose(input);
+    if (read != (size_t)raw_size) {
+        fprintf(stderr, "Failed to read Base64 snapshot '%s'\n", source_path);
+        free(buffer);
+        return 0;
+    }
+
+    size_t cleaned_length = 0u;
+    for (size_t i = 0; i < read; ++i) {
+        unsigned char ch = (unsigned char)buffer[i];
+        if (ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ') {
+            continue;
+        }
+        buffer[cleaned_length++] = (char)ch;
+    }
+
+    if ((cleaned_length % 4u) != 0u) {
+        fprintf(stderr, "Base64 snapshot '%s' has invalid length\n", source_path);
+        free(buffer);
+        return 0;
+    }
+
+    FILE* output = fopen(output_path, "wb");
+    if (!output) {
+        fprintf(stderr, "Failed to create snapshot fixture '%s': %s\n", output_path, strerror(errno));
+        free(buffer);
+        return 0;
+    }
+
+    int success = 1;
+    for (size_t i = 0; i < cleaned_length; i += 4u) {
+        unsigned char c0 = (unsigned char)buffer[i + 0u];
+        unsigned char c1 = (unsigned char)buffer[i + 1u];
+        unsigned char c2 = (unsigned char)buffer[i + 2u];
+        unsigned char c3 = (unsigned char)buffer[i + 3u];
+
+        if (c0 == '=' || c1 == '=') {
+            success = 0;
+            break;
+        }
+
+        int v0;
+        int v1;
+        int v2 = -1;
+        int v3 = -1;
+
+        if (c0 >= 'A' && c0 <= 'Z') {
+            v0 = (int)(c0 - 'A');
+        } else if (c0 >= 'a' && c0 <= 'z') {
+            v0 = (int)(c0 - 'a' + 26);
+        } else if (c0 >= '0' && c0 <= '9') {
+            v0 = (int)(c0 - '0' + 52);
+        } else if (c0 == '+') {
+            v0 = 62;
+        } else if (c0 == '/') {
+            v0 = 63;
+        } else {
+            success = 0;
+            break;
+        }
+
+        if (c1 >= 'A' && c1 <= 'Z') {
+            v1 = (int)(c1 - 'A');
+        } else if (c1 >= 'a' && c1 <= 'z') {
+            v1 = (int)(c1 - 'a' + 26);
+        } else if (c1 >= '0' && c1 <= '9') {
+            v1 = (int)(c1 - '0' + 52);
+        } else if (c1 == '+') {
+            v1 = 62;
+        } else if (c1 == '/') {
+            v1 = 63;
+        } else {
+            success = 0;
+            break;
+        }
+
+        if (c2 != '=') {
+            if (c2 >= 'A' && c2 <= 'Z') {
+                v2 = (int)(c2 - 'A');
+            } else if (c2 >= 'a' && c2 <= 'z') {
+                v2 = (int)(c2 - 'a' + 26);
+            } else if (c2 >= '0' && c2 <= '9') {
+                v2 = (int)(c2 - '0' + 52);
+            } else if (c2 == '+') {
+                v2 = 62;
+            } else if (c2 == '/') {
+                v2 = 63;
+            } else {
+                success = 0;
+                break;
+            }
+        }
+
+        if (c3 != '=') {
+            if (c3 >= 'A' && c3 <= 'Z') {
+                v3 = (int)(c3 - 'A');
+            } else if (c3 >= 'a' && c3 <= 'z') {
+                v3 = (int)(c3 - 'a' + 26);
+            } else if (c3 >= '0' && c3 <= '9') {
+                v3 = (int)(c3 - '0' + 52);
+            } else if (c3 == '+') {
+                v3 = 62;
+            } else if (c3 == '/') {
+                v3 = 63;
+            } else {
+                success = 0;
+                break;
+            }
+        }
+
+        uint32_t triple = ((uint32_t)v0 << 18) | ((uint32_t)v1 << 12);
+        if (c2 != '=') {
+            triple |= ((uint32_t)v2 << 6);
+        }
+        if (c3 != '=') {
+            triple |= (uint32_t)v3;
+        }
+
+        fputc((int)((triple >> 16) & 0xFFu), output);
+        if (c2 != '=') {
+            fputc((int)((triple >> 8) & 0xFFu), output);
+            if (c3 != '=') {
+                fputc((int)(triple & 0xFFu), output);
+            }
+        } else if (c3 != '=') {
+            success = 0;
+            break;
+        }
+
+        if ((c2 == '=' || c3 == '=') && (i + 4u) != cleaned_length) {
+            success = 0;
+            break;
+        }
+    }
+
+    free(buffer);
+
+    if (fclose(output) != 0) {
+        fprintf(stderr, "Failed to finalize snapshot fixture '%s': %s\n", output_path, strerror(errno));
+        success = 0;
+    }
+
+    if (!success) {
+        fprintf(stderr, "Failed to decode Base64 snapshot '%s'\n", source_path);
+        remove(output_path);
+    }
+
+    return success;
+}
+
+static int snapshot_fixture_generate_base64(const char* filename, const char* output_path) {
+    if (!filename || !output_path) {
+        return 0;
+    }
+
+    char encoded_name[256];
+    int encoded_len = snprintf(encoded_name, sizeof(encoded_name), "%s.b64", filename);
+    if (encoded_len < 0 || (size_t)encoded_len >= sizeof(encoded_name)) {
+        return 0;
+    }
+
+    char encoded_path[PATH_MAX];
+    if (!snapshot_fixture_path(encoded_path, sizeof(encoded_path), NULL, encoded_name)) {
+        return 0;
+    }
+
+    if (!snapshot_fixture_file_exists(encoded_path)) {
+        return 0;
+    }
+
+    return snapshot_fixture_decode_base64(encoded_path, output_path);
+}
+
+static void snapshot_fixture_fill_standard_header(uint8_t header[27]) {
+    static const uint8_t template[27] = {
+        0x3F,       // I
+        0x22, 0x11, // HL'
+        0x44, 0x33, // DE'
+        0x66, 0x55, // BC'
+        0x88, 0x77, // AF'
+        0xAA, 0x99, // HL
+        0xCC, 0xBB, // DE
+        0xEE, 0xDD, // BC
+        0x34, 0x12, // IY
+        0x78, 0x56, // IX
+        0x01,       // IFF2
+        0xA5,       // R
+        0xE1, 0xF0, // AF
+        0xE0, 0xFF, // SP
+        0x02,       // IM
+        0x04        // Border colour
+    };
+    memcpy(header, template, sizeof(template));
+}
+
+static int snapshot_fixture_write_ram_block(FILE* out, uint8_t value, size_t size) {
+    if (!out || size == 0u) {
+        return 0;
+    }
+
+    uint8_t block[0x4000];
+    size_t chunk = sizeof(block);
+    while (size > 0u) {
+        size_t to_write = (size < chunk) ? size : chunk;
+        memset(block, value, to_write);
+        if (fwrite(block, 1u, to_write, out) != to_write) {
+            return 0;
+        }
+        size -= to_write;
+    }
+    return 1;
+}
+
+static int snapshot_fixture_generate_sna_48k(const char* output_path) {
+    FILE* out = fopen(output_path, "wb");
+    if (!out) {
+        fprintf(stderr, "Failed to create 48K SNA fixture '%s': %s\n", output_path, strerror(errno));
+        return 0;
+    }
+
+    uint8_t header[27];
+    snapshot_fixture_fill_standard_header(header);
+    int ok = (fwrite(header, 1u, sizeof(header), out) == sizeof(header));
+    ok = ok && snapshot_fixture_write_ram_block(out, 0x10u, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0x20u, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0x30u, 0x4000u);
+    uint8_t pc_bytes[2] = {0x00u, 0x40u};
+    if (ok) {
+        ok = (fwrite(pc_bytes, 1u, sizeof(pc_bytes), out) == sizeof(pc_bytes));
+    }
+
+    if (fclose(out) != 0) {
+        ok = 0;
+    }
+
+    if (!ok) {
+        fprintf(stderr, "Failed to synthesise 48K SNA fixture '%s'\n", output_path);
+        remove(output_path);
+    }
+
+    return ok;
+}
+
+static int snapshot_fixture_generate_sna_128k_locked(const char* output_path) {
+    FILE* out = fopen(output_path, "wb");
+    if (!out) {
+        fprintf(stderr, "Failed to create 128K SNA fixture '%s': %s\n", output_path, strerror(errno));
+        return 0;
+    }
+
+    static const uint8_t bank_patterns[8] = {0x00u, 0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u};
+
+    uint8_t header[27];
+    snapshot_fixture_fill_standard_header(header);
+    int ok = (fwrite(header, 1u, sizeof(header), out) == sizeof(header));
+    ok = ok && snapshot_fixture_write_ram_block(out, 0x55u, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0x22u, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0x55u, 0x4000u);
+    uint8_t pc_bytes[2] = {0x00u, 0x40u};
+    if (ok) {
+        ok = (fwrite(pc_bytes, 1u, sizeof(pc_bytes), out) == sizeof(pc_bytes));
+    }
+    uint8_t ports[2] = {0x25u, 0x00u};
+    if (ok) {
+        ok = (fwrite(ports, 1u, sizeof(ports), out) == sizeof(ports));
+    }
+    for (int bank = 0; ok && bank < 8; ++bank) {
+        ok = snapshot_fixture_write_ram_block(out, bank_patterns[bank], 0x4000u);
+    }
+
+    if (fclose(out) != 0) {
+        ok = 0;
+    }
+
+    if (!ok) {
+        fprintf(stderr, "Failed to synthesise 128K SNA fixture '%s'\n", output_path);
+        remove(output_path);
+    }
+
+    return ok;
+}
+
+static int snapshot_fixture_generate_sna_plus2a_special(const char* output_path) {
+    FILE* out = fopen(output_path, "wb");
+    if (!out) {
+        fprintf(stderr, "Failed to create +2A SNA fixture '%s': %s\n", output_path, strerror(errno));
+        return 0;
+    }
+
+    static const uint8_t bank_patterns[8] = {0x00u, 0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u};
+
+    uint8_t header[27];
+    snapshot_fixture_fill_standard_header(header);
+    int ok = (fwrite(header, 1u, sizeof(header), out) == sizeof(header));
+    ok = ok && snapshot_fixture_write_ram_block(out, 0xAAu, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0xBBu, 0x4000u);
+    ok = ok && snapshot_fixture_write_ram_block(out, 0xCCu, 0x4000u);
+    uint8_t pc_bytes[2] = {0x00u, 0x40u};
+    if (ok) {
+        ok = (fwrite(pc_bytes, 1u, sizeof(pc_bytes), out) == sizeof(pc_bytes));
+    }
+    uint8_t ports[2] = {0x02u, 0x00u};
+    if (ok) {
+        ok = (fwrite(ports, 1u, sizeof(ports), out) == sizeof(ports));
+    }
+    for (int bank = 0; ok && bank < 8; ++bank) {
+        ok = snapshot_fixture_write_ram_block(out, bank_patterns[bank], 0x4000u);
+    }
+    uint8_t port_1ffd = 0x05u;
+    if (ok) {
+        ok = (fwrite(&port_1ffd, 1u, 1u, out) == 1u);
+    }
+
+    if (fclose(out) != 0) {
+        ok = 0;
+    }
+
+    if (!ok) {
+        fprintf(stderr, "Failed to synthesise +2A SNA fixture '%s'\n", output_path);
+        remove(output_path);
+    }
+
+    return ok;
+}
+
+static int snapshot_fixture_generate_sna(const char* filename, const char* output_path) {
+    if (!filename || !output_path) {
+        return 0;
+    }
+
+    if (strcmp(filename, "48k-basic.sna") == 0) {
+        return snapshot_fixture_generate_sna_48k(output_path);
+    }
+    if (strcmp(filename, "128k-locked-bank5.sna") == 0) {
+        return snapshot_fixture_generate_sna_128k_locked(output_path);
+    }
+    if (strcmp(filename, "plus2a-special.sna") == 0) {
+        return snapshot_fixture_generate_sna_plus2a_special(output_path);
+    }
+    return 0;
+}
+
+static int snapshot_fixture_generate_default(char* buffer,
+                                             size_t capacity,
+                                             const char* filename) {
+    if (!buffer || capacity == 0u || !filename) {
+        return 0;
+    }
+
+    char generated_dir[PATH_MAX];
+    if (!snapshot_fixture_path(generated_dir, sizeof(generated_dir), snapshot_fixture_default_dir, "generated")) {
+        return 0;
+    }
+
+    if (!snapshot_fixture_ensure_directory(generated_dir)) {
+        return 0;
+    }
+
+    if (!snapshot_fixture_path(buffer, capacity, generated_dir, filename)) {
+        return 0;
+    }
+
+    if (snapshot_fixture_generate_sna(filename, buffer)) {
+        return 1;
+    }
+
+    if (snapshot_fixture_generate_base64(filename, buffer)) {
+        return 1;
+    }
+
+    fprintf(stderr, "Snapshot fixture '%s' is missing (no generator or Base64 source)\n", filename);
+    remove(buffer);
+    return 0;
+}
+
+static int snapshot_fixture_resolve(char* buffer,
+                                    size_t capacity,
+                                    const char* override_dir,
+                                    const char* filename) {
+    if (!snapshot_fixture_path(buffer, capacity, override_dir, filename)) {
+        return 0;
+    }
+
+    if (snapshot_fixture_file_exists(buffer)) {
+        return 1;
+    }
+
+    if (!snapshot_fixture_uses_default_dir(override_dir)) {
+        fprintf(stderr, "Snapshot fixture '%s' not found in '%s'\n", filename, override_dir);
+        return 0;
+    }
+
+    return snapshot_fixture_generate_default(buffer, capacity, filename);
+}
+
+static bool memory_block_matches(uint16_t base, uint8_t value) {
+    static const uint16_t offsets[] = {0x0000u, 0x1FFFu, 0x3FFFu};
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+        uint16_t addr = (uint16_t)(base + offsets[i]);
+        if (memory[addr] != value) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_snapshot_sna_48k(const char* override_dir) {
+    char path[512];
+    if (!snapshot_fixture_resolve(path, sizeof(path), override_dir, "48k-basic.sna")) {
+        printf("    failed to prepare fixture 48k-basic.sna\n");
+        return false;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    border_color_idx = 0u;
+
+    if (!snapshot_load(path, SNAPSHOT_FORMAT_SNA, &cpu)) {
+        return false;
+    }
+
+    bool main_regs_ok = (cpu.reg_A == 0xF0u) && (cpu.reg_F == 0xE1u) &&
+                        (cpu.reg_B == 0xDDu) && (cpu.reg_C == 0xEEu) &&
+                        (cpu.reg_D == 0xBBu) && (cpu.reg_E == 0xCCu) &&
+                        (cpu.reg_H == 0x99u) && (cpu.reg_L == 0xAAu);
+    bool alt_regs_ok = (cpu.alt_reg_A == 0x77u) && (cpu.alt_reg_F == 0x88u) &&
+                       (cpu.alt_reg_B == 0x55u) && (cpu.alt_reg_C == 0x66u) &&
+                       (cpu.alt_reg_D == 0x33u) && (cpu.alt_reg_E == 0x44u) &&
+                       (cpu.alt_reg_H == 0x11u) && (cpu.alt_reg_L == 0x22u);
+    bool special_regs_ok = (cpu.reg_I == 0x3Fu) && (cpu.reg_R == 0xA5u) &&
+                           (cpu.reg_IX == 0x5678u) && (cpu.reg_IY == 0x1234u) &&
+                           (cpu.reg_SP == 0xFFE0u) && (cpu.reg_PC == 0x4000u);
+    bool interrupt_state_ok = (cpu.iff1 == 1) && (cpu.iff2 == 1) && (cpu.interruptMode == 2);
+    bool model_ok = (spectrum_model == SPECTRUM_MODEL_48K) &&
+                    (current_paged_bank == 7u) &&
+                    (current_rom_page == 0u) &&
+                    (paging_disabled == 0);
+    bool border_ok = (border_color_idx == 0x04u);
+    bool memory_ok = memory_block_matches(0x4000u, 0x10u) &&
+                     memory_block_matches(0x8000u, 0x20u) &&
+                     memory_block_matches(0xC000u, 0x30u);
+
+    if (!memory_ok) {
+        printf("    48K SNA memory mismatch: %02X %02X %02X\n",
+               memory[0x4000], memory[0x8000], memory[0xC000]);
+    }
+    if (!main_regs_ok || !alt_regs_ok || !special_regs_ok || !interrupt_state_ok || !model_ok || !border_ok) {
+        printf("    48K SNA state debug: A=%02X F=%02X PC=%04X SP=%04X IFF1=%d IFF2=%d model=%s border=%u\n",
+               cpu.reg_A,
+               cpu.reg_F,
+               cpu.reg_PC,
+               cpu.reg_SP,
+               cpu.iff1,
+               cpu.iff2,
+               spectrum_model_to_string(spectrum_model),
+               (unsigned)border_color_idx);
+    }
+
+    return main_regs_ok && alt_regs_ok && special_regs_ok && interrupt_state_ok &&
+           model_ok && border_ok && memory_ok;
+}
+
+static bool test_snapshot_sna_128k_locked(const char* override_dir) {
+    char path[512];
+    if (!snapshot_fixture_resolve(path, sizeof(path), override_dir, "128k-locked-bank5.sna")) {
+        printf("    failed to prepare fixture 128k-locked-bank5.sna\n");
+        return false;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    border_color_idx = 0u;
+
+    if (!snapshot_load(path, SNAPSHOT_FORMAT_SNA, &cpu)) {
+        return false;
+    }
+
+    bool model_ok = (spectrum_model == SPECTRUM_MODEL_128K);
+    bool paging_ok = (paging_disabled == 1) &&
+                     (gate_array_7ffd_state == 0x25u) &&
+                     (current_paged_bank == 5u) &&
+                     (current_screen_bank == 5u) &&
+                     (gate_array_1ffd_state == 0u);
+    bool memory_ok = memory_block_matches(0x4000u, 0x55u) &&
+                     memory_block_matches(0x8000u, 0x22u) &&
+                     memory_block_matches(0xC000u, 0x55u);
+
+    if (!memory_ok || !paging_ok || !model_ok) {
+        printf("    128K SNA debug: model=%s paging=%d bank=%u screen=%u rom=%u 0x4000=%02X 0x8000=%02X 0xC000=%02X\n",
+               spectrum_model_to_string(spectrum_model),
+               paging_disabled,
+               (unsigned)current_paged_bank,
+               (unsigned)current_screen_bank,
+               (unsigned)current_rom_page,
+               memory[0x4000],
+               memory[0x8000],
+               memory[0xC000]);
+    }
+
+    return model_ok && paging_ok && memory_ok;
+}
+
+static bool test_snapshot_sna_plus2a_special(const char* override_dir) {
+    char path[512];
+    if (!snapshot_fixture_resolve(path, sizeof(path), override_dir, "plus2a-special.sna")) {
+        printf("    failed to prepare fixture plus2a-special.sna\n");
+        return false;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    border_color_idx = 0u;
+
+    if (!snapshot_load(path, SNAPSHOT_FORMAT_SNA, &cpu)) {
+        return false;
+    }
+
+    bool model_ok = (spectrum_model == SPECTRUM_MODEL_PLUS2A);
+    bool paging_ok = (gate_array_7ffd_state == 0x02u) &&
+                     (gate_array_1ffd_state == 0x05u) &&
+                     (paging_disabled == 0) &&
+                     (current_paged_bank == 2u);
+    bool mapping_ok = (spectrum_pages[0].type == MEMORY_PAGE_RAM && spectrum_pages[0].index == 4u) &&
+                      (spectrum_pages[1].type == MEMORY_PAGE_RAM && spectrum_pages[1].index == 5u) &&
+                      (spectrum_pages[2].type == MEMORY_PAGE_RAM && spectrum_pages[2].index == 6u) &&
+                      (spectrum_pages[3].type == MEMORY_PAGE_RAM && spectrum_pages[3].index == 7u);
+    bool memory_ok = memory_block_matches(0x0000u, 0x44u) &&
+                     memory_block_matches(0x4000u, 0x55u) &&
+                     memory_block_matches(0x8000u, 0x66u) &&
+                     memory_block_matches(0xC000u, 0x77u);
+
+    if (!memory_ok || !mapping_ok || !paging_ok || !model_ok) {
+        printf("    +2A SNA debug: model=%s 7FFD=%02X 1FFD=%02X pages=%u/%u/%u/%u mem=%02X/%02X/%02X/%02X\n",
+               spectrum_model_to_string(spectrum_model),
+               (unsigned)gate_array_7ffd_state,
+               (unsigned)gate_array_1ffd_state,
+               spectrum_pages[0].index,
+               spectrum_pages[1].index,
+               spectrum_pages[2].index,
+               spectrum_pages[3].index,
+               memory[0x0000],
+               memory[0x4000],
+               memory[0x8000],
+               memory[0xC000]);
+    }
+
+    return model_ok && paging_ok && mapping_ok && memory_ok;
+}
+
+static bool test_snapshot_z80_v1_compressed(const char* override_dir) {
+    char path[512];
+    if (!snapshot_fixture_resolve(path, sizeof(path), override_dir, "v1-compressed.z80")) {
+        printf("    failed to prepare fixture v1-compressed.z80\n");
+        return false;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    border_color_idx = 0u;
+
+    if (!snapshot_load(path, SNAPSHOT_FORMAT_Z80, &cpu)) {
+        return false;
+    }
+
+    bool registers_ok = (cpu.reg_A == 0x11u) && (cpu.reg_F == 0x22u) &&
+                        (cpu.reg_B == 0x44u) && (cpu.reg_C == 0x33u) &&
+                        (cpu.reg_D == 0x88u) && (cpu.reg_E == 0x77u) &&
+                        (cpu.reg_H == 0x66u) && (cpu.reg_L == 0x55u);
+    bool alt_ok = (cpu.alt_reg_A == 0xFFu) && (cpu.alt_reg_F == 0x00u) &&
+                  (cpu.alt_reg_B == 0xAAu) && (cpu.alt_reg_C == 0x99u) &&
+                  (cpu.alt_reg_D == 0xCCu) && (cpu.alt_reg_E == 0xBBu) &&
+                  (cpu.alt_reg_H == 0xEEu) && (cpu.alt_reg_L == 0xDDu);
+    bool special_ok = (cpu.reg_I == 0x99u) && (cpu.reg_R == 0xFFu) &&
+                      (cpu.reg_IX == 0x2468u) && (cpu.reg_IY == 0x1357u) &&
+                      (cpu.reg_SP == 0xD432u) && (cpu.reg_PC == 0x9ABCu);
+    bool interrupt_ok = (cpu.iff1 == 1) && (cpu.iff2 == 0) && (cpu.interruptMode == 1);
+    bool border_ok = (border_color_idx == 5u);
+    bool memory_ok = memory_block_matches(0x4000u, 0x41u) &&
+                     memory_block_matches(0x8000u, 0x52u) &&
+                     memory_block_matches(0xC000u, 0x63u);
+
+    if (!memory_ok || !registers_ok || !alt_ok || !special_ok || !interrupt_ok || !border_ok) {
+        printf("    Z80 V1 debug: A=%02X F=%02X PC=%04X R=%02X border=%u mem=%02X/%02X/%02X\n",
+               cpu.reg_A,
+               cpu.reg_F,
+               cpu.reg_PC,
+               cpu.reg_R,
+               (unsigned)border_color_idx,
+               memory[0x4000],
+               memory[0x8000],
+               memory[0xC000]);
+    }
+
+    return registers_ok && alt_ok && special_ok && interrupt_ok && border_ok && memory_ok;
+}
+
+static bool test_snapshot_z80_v3_extended(const char* override_dir) {
+    char path[512];
+    if (!snapshot_fixture_resolve(path, sizeof(path), override_dir, "v3-128k.z80")) {
+        printf("    failed to prepare fixture v3-128k.z80\n");
+        return false;
+    }
+
+    Z80 cpu;
+    cpu_reset_state(&cpu);
+    spectrum_configure_model(SPECTRUM_MODEL_48K);
+    memory_clear();
+    border_color_idx = 0u;
+
+    if (!snapshot_load(path, SNAPSHOT_FORMAT_Z80, &cpu)) {
+        return false;
+    }
+
+    bool registers_ok = (cpu.reg_A == 0x11u) && (cpu.reg_F == 0x22u) &&
+                        (cpu.reg_PC == 0x8BADu) && (cpu.reg_SP == 0xD432u);
+    bool refresh_ok = (cpu.reg_R == 0x7Fu) && (cpu.reg_I == 0x99u);
+    bool border_ok = (border_color_idx == 5u);
+    bool interrupt_ok = (cpu.iff1 == 1) && (cpu.iff2 == 0) && (cpu.interruptMode == 1);
+    bool memory_ok = memory_block_matches(0x4000u, 0x10u) &&
+                     memory_block_matches(0x8000u, 0x20u) &&
+                     memory_block_matches(0xC000u, 0x30u);
+
+    if (!memory_ok || !registers_ok || !refresh_ok || !border_ok || !interrupt_ok) {
+        printf("    Z80 V3 debug: PC=%04X SP=%04X R=%02X border=%u mem=%02X/%02X/%02X\n",
+               cpu.reg_PC,
+               cpu.reg_SP,
+               cpu.reg_R,
+               (unsigned)border_color_idx,
+               memory[0x4000],
+               memory[0x8000],
+               memory[0xC000]);
+    }
+
+    return registers_ok && refresh_ok && border_ok && interrupt_ok && memory_ok;
+}
+
+static bool run_snapshot_tests(const char* override_dir) {
+    struct {
+        const char* name;
+        bool (*fn)(const char* dir);
+    } tests[] = {
+        {"SNA 48K register restore", test_snapshot_sna_48k},
+        {"SNA 128K locked paging", test_snapshot_sna_128k_locked},
+        {"SNA +2A special map", test_snapshot_sna_plus2a_special},
+        {"Z80 V1 compressed RAM", test_snapshot_z80_v1_compressed},
+        {"Z80 V3 extended header", test_snapshot_z80_v3_extended},
+    };
+
+    printf("Running snapshot loader tests...\n");
+    bool all_passed = true;
+    for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
+        bool ok = tests[i].fn(override_dir);
+        printf("  %-28s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            all_passed = false;
+        }
+    }
+
+    return all_passed;
+}
+
 static bool run_unit_tests(void) {
     struct {
         const char* name;
@@ -9873,9 +10633,10 @@ static void toggle_fullscreen(void) {
     SDL_ShowCursor(window_fullscreen ? SDL_DISABLE : SDL_ENABLE);
 }
 
-static int run_cpu_tests(const char* rom_dir) {
+static int run_cpu_tests(const char* rom_dir, const char* snapshot_dir) {
     bool unit_pass = run_unit_tests();
-    bool overall = unit_pass;
+    bool snapshot_pass = run_snapshot_tests(snapshot_dir);
+    bool overall = unit_pass && snapshot_pass;
 
     const struct {
         const char* filename;
@@ -9927,7 +10688,8 @@ static void print_usage(const char* prog) {
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
             "[--snapshot <sna_or_z80>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
-            "[--test-rom-dir <dir>] [--run-tests] [--fullscreen] [rom_file]\n",
+            "[--test-rom-dir <dir>] [--snapshot-test-dir <dir>] "
+            "[--run-tests] [--fullscreen] [rom_file]\n",
             prog);
 }
 
@@ -10386,6 +11148,7 @@ int main(int argc, char *argv[]) {
     int rom_provided = 0;
     int run_tests = 0;
     const char* test_rom_dir = "tests/roms";
+    const char* snapshot_test_dir = "tests/snapshots";
     int launch_fullscreen = 0;
     Z80 cpu;
     memset(&cpu, 0, sizeof(cpu));
@@ -10544,6 +11307,12 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             test_rom_dir = argv[++i];
+        } else if (strcmp(argv[i], "--snapshot-test-dir") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            snapshot_test_dir = argv[++i];
         } else if (strcmp(argv[i], "--run-tests") == 0) {
             run_tests = 1;
         } else if (strcmp(argv[i], "--fullscreen") == 0) {
@@ -10569,7 +11338,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (run_tests) {
-        return run_cpu_tests(test_rom_dir);
+        return run_cpu_tests(test_rom_dir, snapshot_test_dir);
     }
 
     if (!rom_filename) {
