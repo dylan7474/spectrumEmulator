@@ -26,6 +26,10 @@
 #endif
 #include <SDL.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -149,6 +153,7 @@ static const double BEEPER_IDLE_RESET_SAMPLES = 512.0;
 static const double BEEPER_REWIND_TOLERANCE_SAMPLES = 8.0;
 int audio_sample_rate = 44100;
 int audio_available = 0;
+static int audio_channel_count = 1;
 
 static double beeper_max_latency_samples = 256.0;
 static double beeper_latency_throttle_samples = 320.0;
@@ -163,6 +168,41 @@ static const int16_t TAPE_WAV_AMPLITUDE = 20000;
 static int speaker_tape_playback_level = 1;
 static int speaker_tape_record_level = 1;
 static int speaker_output_level = 1;
+
+static const double AY_CLOCK_HZ = 1750000.0;
+static double ay_cycles_per_sample = 0.0;
+static double ay_global_gain = 6000.0;
+static double ay_channel_pan[3] = {-0.75, 0.0, 0.75};
+static const double ay_volume_table[16] = {
+    0.0000, 0.0049, 0.0098, 0.0205,
+    0.0390, 0.0600, 0.0901, 0.1353,
+    0.1900, 0.2700, 0.3900, 0.5600,
+    0.8000, 1.1500, 1.6500, 2.3000
+};
+
+typedef struct {
+    double tone_period[3];
+    double tone_counter[3];
+    int tone_output[3];
+    double noise_period;
+    double noise_counter;
+    uint32_t noise_lfsr;
+    int noise_output;
+    double envelope_period;
+    double envelope_counter;
+    uint8_t envelope_volume;
+    int envelope_direction;
+    int envelope_hold;
+    int envelope_alternate;
+    int envelope_continue;
+    int envelope_active;
+} AyState;
+
+static AyState ay_state;
+static double ay_hp_last_input_left = 0.0;
+static double ay_hp_last_output_left = 0.0;
+static double ay_hp_last_input_right = 0.0;
+static double ay_hp_last_output_right = 0.0;
 
 // --- Tape Constants ---
 static const int TAPE_PILOT_PULSE_TSTATES = 2168;
@@ -568,12 +608,18 @@ static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
 static void tape_render_overlay(void);
 static int speaker_calculate_output_level(void);
 static void speaker_update_output(uint64_t t_state, int emit_event);
+static void ay_reset_state(void);
+static void ay_set_sample_rate(int sample_rate);
+static void ay_mix_sample(double elapsed_cycles, double* left_out, double* right_out);
+static void ay_write_register(uint8_t reg, uint8_t value);
+static int ay_parse_pan_spec(const char* spec);
 static void toggle_fullscreen(void);
 static void ula_queue_port_value(uint8_t value);
 static void ula_process_port_events(uint64_t current_t_state);
 
 static FILE* audio_dump_file = NULL;
 static uint32_t audio_dump_data_bytes = 0;
+static uint16_t audio_dump_channels = 1;
 
 #define BEEPER_EVENT_CAPACITY 8192
 
@@ -1324,7 +1370,7 @@ static size_t beeper_catch_up_to(double catch_up_position, double playback_posit
 static double beeper_current_latency_samples(void);
 static double beeper_latency_threshold(void);
 static Uint32 beeper_recommended_throttle_delay(double latency_samples);
-static int audio_dump_start(const char* path, uint32_t sample_rate);
+static int audio_dump_start(const char* path, uint32_t sample_rate, uint16_t channels);
 static void audio_dump_write_samples(const Sint16* samples, size_t count);
 static void audio_dump_finish(void);
 static void audio_dump_abort(void);
@@ -1620,6 +1666,7 @@ static void spectrum_configure_model(SpectrumModel model) {
     ay_selected_register = 0u;
     ay_register_latched = 0;
     memset(ay_registers, 0, sizeof(ay_registers));
+    ay_reset_state();
     current_screen_bank = 5u;
     current_rom_page = 0u;
     current_paged_bank = (model == SPECTRUM_MODEL_48K) ? 7u : 0u;
@@ -1909,8 +1956,8 @@ static void audio_dump_write_uint32(uint8_t* dst, uint32_t value) {
     dst[3] = (uint8_t)((value >> 24) & 0xFFu);
 }
 
-static int audio_dump_start(const char* path, uint32_t sample_rate) {
-    if (!path) {
+static int audio_dump_start(const char* path, uint32_t sample_rate, uint16_t channels) {
+    if (!path || channels == 0u) {
         return 0;
     }
 
@@ -1921,6 +1968,7 @@ static int audio_dump_start(const char* path, uint32_t sample_rate) {
     }
 
     audio_dump_data_bytes = 0;
+    audio_dump_channels = channels;
 
     uint8_t header[44];
     memset(header, 0, sizeof(header));
@@ -1931,11 +1979,12 @@ static int audio_dump_start(const char* path, uint32_t sample_rate) {
     memcpy(header + 12, "fmt ", 4);
     audio_dump_write_uint32(header + 16, 16u); // PCM chunk size
     audio_dump_write_uint16(header + 20, 1u);  // PCM format
-    audio_dump_write_uint16(header + 22, 1u);  // mono
+    audio_dump_write_uint16(header + 22, channels);
     audio_dump_write_uint32(header + 24, sample_rate);
-    uint32_t byte_rate = sample_rate * 2u; // mono, 16-bit
+    uint32_t byte_rate = sample_rate * channels * (uint32_t)sizeof(Sint16);
     audio_dump_write_uint32(header + 28, byte_rate);
-    audio_dump_write_uint16(header + 32, 2u); // block align
+    uint16_t block_align = (uint16_t)(channels * (uint16_t)sizeof(Sint16));
+    audio_dump_write_uint16(header + 32, block_align);
     audio_dump_write_uint16(header + 34, 16u); // bits per sample
     memcpy(header + 36, "data", 4);
     audio_dump_write_uint32(header + 40, 0u);
@@ -3896,6 +3945,347 @@ static void speaker_update_output(uint64_t t_state, int emit_event) {
             beeper_push_event(t_state, new_level);
         }
     }
+}
+
+static double ay_clamp_pan(double value) {
+    if (value < -1.0) {
+        return -1.0;
+    }
+    if (value > 1.0) {
+        return 1.0;
+    }
+    return value;
+}
+
+static void ay_compute_pan_gains(double pan, double* left_gain, double* right_gain) {
+    if (!left_gain || !right_gain) {
+        return;
+    }
+    double clamped = ay_clamp_pan(pan);
+    double angle = (clamped + 1.0) * (M_PI * 0.25);
+    *left_gain = cos(angle);
+    *right_gain = sin(angle);
+}
+
+static double ay_highpass(double input, double* last_input, double* last_output) {
+    if (!last_input || !last_output) {
+        return 0.0;
+    }
+    double filtered = input - *last_input + BEEPER_HP_ALPHA * (*last_output);
+    *last_input = input;
+    *last_output = filtered;
+    return filtered;
+}
+
+static void ay_refresh_tone_period(int channel) {
+    if (channel < 0 || channel > 2) {
+        return;
+    }
+    uint8_t low = ay_registers[channel * 2];
+    uint8_t high = (uint8_t)(ay_registers[channel * 2 + 1] & 0x0Fu);
+    uint16_t period = (uint16_t)low | ((uint16_t)high << 8);
+    if (period == 0u) {
+        period = 1u;
+    }
+    double cycles = (double)period * 16.0;
+    ay_state.tone_period[channel] = cycles;
+    if (ay_state.tone_counter[channel] <= 0.0 || ay_state.tone_counter[channel] > cycles) {
+        ay_state.tone_counter[channel] = cycles;
+    }
+}
+
+static void ay_refresh_noise_period(void) {
+    uint8_t value = (uint8_t)(ay_registers[6] & 0x1Fu);
+    if (value == 0u) {
+        value = 1u;
+    }
+    double cycles = (double)value * 16.0;
+    ay_state.noise_period = cycles;
+    if (ay_state.noise_counter <= 0.0 || ay_state.noise_counter > cycles) {
+        ay_state.noise_counter = cycles;
+    }
+}
+
+static void ay_refresh_envelope_period(void) {
+    uint16_t period = (uint16_t)ay_registers[11] | ((uint16_t)ay_registers[12] << 8);
+    if (period == 0u) {
+        period = 1u;
+    }
+    double cycles = (double)period * 256.0;
+    ay_state.envelope_period = cycles;
+    if (ay_state.envelope_counter <= 0.0 || ay_state.envelope_counter > cycles) {
+        ay_state.envelope_counter = cycles;
+    }
+}
+
+static void ay_restart_envelope(void) {
+    uint8_t shape = (uint8_t)(ay_registers[13] & 0x0Fu);
+    ay_state.envelope_continue = (shape >> 3) & 0x01;
+    ay_state.envelope_direction = ((shape >> 2) & 0x01) ? 1 : -1;
+    ay_state.envelope_alternate = (shape >> 1) & 0x01;
+    ay_state.envelope_hold = shape & 0x01;
+    if (!ay_state.envelope_continue) {
+        ay_state.envelope_hold = 1;
+        ay_state.envelope_alternate = 0;
+    }
+    ay_state.envelope_volume = (uint8_t)((ay_state.envelope_direction > 0) ? 0u : 15u);
+    ay_state.envelope_active = 1;
+    if (ay_state.envelope_counter <= 0.0) {
+        ay_state.envelope_counter = ay_state.envelope_period > 0.0 ? ay_state.envelope_period : 1.0;
+    }
+}
+
+static void ay_handle_envelope_limit(void) {
+    if (!ay_state.envelope_continue) {
+        ay_state.envelope_active = 0;
+        ay_state.envelope_volume = (uint8_t)((ay_state.envelope_direction > 0) ? 15u : 0u);
+        return;
+    }
+
+    if (ay_state.envelope_hold) {
+        ay_state.envelope_active = 0;
+        if (ay_state.envelope_alternate) {
+            ay_state.envelope_direction = -ay_state.envelope_direction;
+        }
+        ay_state.envelope_volume = (uint8_t)((ay_state.envelope_direction > 0) ? 15u : 0u);
+        return;
+    }
+
+    if (ay_state.envelope_alternate) {
+        ay_state.envelope_direction = -ay_state.envelope_direction;
+    }
+    ay_state.envelope_volume = (uint8_t)((ay_state.envelope_direction > 0) ? 0u : 15u);
+}
+
+static void ay_step_envelope(void) {
+    if (!ay_state.envelope_active) {
+        return;
+    }
+    if (ay_state.envelope_direction > 0) {
+        if (ay_state.envelope_volume < 15u) {
+            ++ay_state.envelope_volume;
+            return;
+        }
+    } else {
+        if (ay_state.envelope_volume > 0u) {
+            --ay_state.envelope_volume;
+            return;
+        }
+    }
+    ay_handle_envelope_limit();
+}
+
+static void ay_step_generators(double elapsed_cycles) {
+    for (int ch = 0; ch < 3; ++ch) {
+        double period = ay_state.tone_period[ch];
+        if (period <= 0.0) {
+            ay_state.tone_output[ch] = 1;
+            ay_state.tone_counter[ch] = 1.0;
+            continue;
+        }
+        double counter = ay_state.tone_counter[ch] - elapsed_cycles;
+        while (counter <= 0.0) {
+            counter += period;
+            ay_state.tone_output[ch] ^= 1;
+        }
+        ay_state.tone_counter[ch] = counter;
+    }
+
+    double noise_period = ay_state.noise_period > 0.0 ? ay_state.noise_period : 1.0;
+    double noise_counter = ay_state.noise_counter - elapsed_cycles;
+    while (noise_counter <= 0.0) {
+        noise_counter += noise_period;
+        uint32_t lfsr = ay_state.noise_lfsr & 0x1FFFFu;
+        uint32_t feedback = (uint32_t)(((lfsr ^ (lfsr >> 3)) & 0x01u));
+        lfsr = (lfsr >> 1) | (feedback << 16);
+        if (lfsr == 0u) {
+            lfsr = 0x1FFFFu;
+        }
+        ay_state.noise_lfsr = lfsr & 0x1FFFFu;
+        ay_state.noise_output = (int)(lfsr & 0x01u);
+    }
+    ay_state.noise_counter = noise_counter;
+
+    double env_period = ay_state.envelope_period > 0.0 ? ay_state.envelope_period : 1.0;
+    double env_counter = ay_state.envelope_counter - elapsed_cycles;
+    while (env_counter <= 0.0) {
+        env_counter += env_period;
+        ay_step_envelope();
+    }
+    ay_state.envelope_counter = env_counter;
+}
+
+static double ay_channel_volume_value(int channel) {
+    if (channel < 0 || channel > 2) {
+        return 0.0;
+    }
+    uint8_t reg = ay_registers[8 + channel];
+    if (reg & 0x10u) {
+        return ay_volume_table[ay_state.envelope_volume & 0x0Fu];
+    }
+    return ay_volume_table[reg & 0x0Fu];
+}
+
+static double ay_channel_level(int channel) {
+    uint8_t mixer = ay_registers[7];
+    int tone_disabled = (mixer >> channel) & 0x01;
+    int noise_disabled = (mixer >> (channel + 3)) & 0x01;
+    int tone = tone_disabled ? 1 : ay_state.tone_output[channel];
+    int noise = noise_disabled ? 1 : ay_state.noise_output;
+    int active = tone & noise;
+    if (!active) {
+        return 0.0;
+    }
+    return ay_channel_volume_value(channel);
+}
+
+static void ay_reset_state_internal(void) {
+    memset(&ay_state, 0, sizeof(ay_state));
+    ay_state.noise_lfsr = 0x1FFFFu;
+    ay_state.noise_output = 1;
+    for (int ch = 0; ch < 3; ++ch) {
+        ay_refresh_tone_period(ch);
+        ay_state.tone_output[ch] = 0;
+    }
+    ay_refresh_noise_period();
+    ay_refresh_envelope_period();
+    ay_restart_envelope();
+    ay_hp_last_input_left = 0.0;
+    ay_hp_last_output_left = 0.0;
+    ay_hp_last_input_right = 0.0;
+    ay_hp_last_output_right = 0.0;
+}
+
+static void ay_reset_state(void) {
+    int locked = 0;
+    if (audio_available) {
+        SDL_LockAudio();
+        locked = 1;
+    }
+    ay_reset_state_internal();
+    if (locked) {
+        SDL_UnlockAudio();
+    }
+}
+
+static void ay_set_sample_rate(int sample_rate) {
+    if (sample_rate <= 0) {
+        ay_cycles_per_sample = 0.0;
+        return;
+    }
+    ay_cycles_per_sample = AY_CLOCK_HZ / (double)sample_rate;
+}
+
+static void ay_mix_sample(double elapsed_cycles, double* left_out, double* right_out) {
+    if (!left_out || !right_out) {
+        return;
+    }
+    if (ay_cycles_per_sample <= 0.0) {
+        *left_out = 0.0;
+        *right_out = 0.0;
+        return;
+    }
+
+    double step_cycles = (elapsed_cycles > 0.0) ? elapsed_cycles : ay_cycles_per_sample;
+    ay_step_generators(step_cycles);
+
+    double left = 0.0;
+    double right = 0.0;
+    for (int ch = 0; ch < 3; ++ch) {
+        double level = ay_channel_level(ch);
+        if (level <= 0.0) {
+            continue;
+        }
+        double pan_left = 0.0;
+        double pan_right = 0.0;
+        ay_compute_pan_gains(ay_channel_pan[ch], &pan_left, &pan_right);
+        left += level * pan_left;
+        right += level * pan_right;
+    }
+
+    double filtered_left = ay_highpass(left, &ay_hp_last_input_left, &ay_hp_last_output_left);
+    double filtered_right = ay_highpass(right, &ay_hp_last_input_right, &ay_hp_last_output_right);
+
+    *left_out = filtered_left * ay_global_gain;
+    *right_out = filtered_right * ay_global_gain;
+}
+
+static void ay_write_register(uint8_t reg, uint8_t value) {
+    uint8_t index = (uint8_t)(reg & 0x0Fu);
+    ay_registers[index] = value;
+    int locked = 0;
+    if (audio_available) {
+        SDL_LockAudio();
+        locked = 1;
+    }
+    switch (index) {
+        case 0:
+        case 1:
+            ay_refresh_tone_period(0);
+            break;
+        case 2:
+        case 3:
+            ay_refresh_tone_period(1);
+            break;
+        case 4:
+        case 5:
+            ay_refresh_tone_period(2);
+            break;
+        case 6:
+            ay_refresh_noise_period();
+            break;
+        case 11:
+        case 12:
+            ay_refresh_envelope_period();
+            break;
+        case 13:
+            ay_restart_envelope();
+            break;
+        default:
+            break;
+    }
+    if (locked) {
+        SDL_UnlockAudio();
+    }
+}
+
+static int ay_parse_pan_spec(const char* spec) {
+    if (!spec) {
+        return 0;
+    }
+    double parsed[3];
+    size_t index = 0;
+    const char* cursor = spec;
+    while (index < 3) {
+        while (*cursor && isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            return 0;
+        }
+        char* endptr = NULL;
+        double value = strtod(cursor, &endptr);
+        if (endptr == cursor) {
+            return 0;
+        }
+        parsed[index++] = ay_clamp_pan(value);
+        cursor = endptr;
+        while (*cursor && isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+        if (index < 3) {
+            if (*cursor != ',' && *cursor != ';' && *cursor != '/') {
+                return 0;
+            }
+            ++cursor;
+        } else if (*cursor != '\0') {
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        ay_channel_pan[i] = parsed[i];
+    }
+    return 1;
 }
 
 static void tape_reset_playback(TapePlaybackState* state) {
@@ -7923,7 +8313,7 @@ void io_write(uint16_t port, uint8_t value) {
         }
         if (ay_port == 0x8000u) {
             uint8_t reg = (uint8_t)(ay_selected_register & 0x0Fu);
-            ay_registers[reg] = value;
+            ay_write_register(reg, value);
             ay_register_latched = 1;
             return;
         }
@@ -10860,6 +11250,7 @@ static void print_usage(const char* prog) {
             "[--model <48k|128k|plus2a|plus3> | --48k | --128k | --plus2a | --plus3] "
             "[--contention <48k|128k|plus2a|plus3>] "
             "[--peripheral <none|if1|plus3>] "
+            "[--ay-gain <multiplier>] [--ay-pan <left,center,right>] "
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
             "[--snapshot <sna_or_z80>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
@@ -10885,21 +11276,28 @@ int init_sdl(void) {
     SDL_zero(wanted_spec);
     wanted_spec.freq = 44100;
     wanted_spec.format = AUDIO_S16SYS;
-    wanted_spec.channels = 1;
+    wanted_spec.channels = 2;
     wanted_spec.samples = 512;
     wanted_spec.callback = audio_callback;
     wanted_spec.userdata = NULL;
 
     if (SDL_OpenAudio(&wanted_spec, &have_spec) < 0) {
         fprintf(stderr, "Failed to open audio: %s\n", SDL_GetError());
+        ay_set_sample_rate(0);
         beeper_set_latency_limit(256.0);
     } else {
-        if (have_spec.format != AUDIO_S16SYS || have_spec.channels != 1) {
+        if (have_spec.format != AUDIO_S16SYS || have_spec.channels < 1 || have_spec.channels > 2) {
             fprintf(stderr, "Unexpected audio format (format=%d, channels=%d). Audio disabled.\n", have_spec.format, have_spec.channels);
             SDL_CloseAudio();
+            ay_set_sample_rate(0);
             beeper_set_latency_limit(256.0);
         } else {
             audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
+            ay_set_sample_rate(audio_sample_rate);
+            audio_channel_count = (have_spec.channels > 0) ? have_spec.channels : wanted_spec.channels;
+            if (audio_channel_count <= 0) {
+                audio_channel_count = 1;
+            }
             audio_available = 1;
             beeper_cycles_per_sample = CPU_CLOCK_HZ / (double)audio_sample_rate;
             double latency_limit = have_spec.samples > 0 ? (double)have_spec.samples : (double)wanted_spec.samples;
@@ -10915,7 +11313,9 @@ int init_sdl(void) {
                 beeper_latency_trim_samples);
             beeper_reset_audio_state(total_t_states, speaker_output_level);
             if (audio_dump_path && !audio_dump_file) {
-                if (!audio_dump_start(audio_dump_path, (uint32_t)audio_sample_rate)) {
+                if (!audio_dump_start(audio_dump_path,
+                                      (uint32_t)audio_sample_rate,
+                                      (uint16_t)audio_channel_count)) {
                     audio_dump_path = NULL;
                 }
             }
@@ -10932,6 +11332,7 @@ void cleanup_sdl(void) {
         audio_available = 0;
         beeper_set_latency_limit(256.0);
     }
+    ay_set_sample_rate(0);
     audio_dump_finish();
     if (texture) {
         SDL_DestroyTexture(texture);
@@ -11065,13 +11466,18 @@ int map_sdl_key_to_spectrum(SDL_Keycode k, int* r, uint8_t* m) {
 void audio_callback(void* userdata, Uint8* stream, int len) {
     Sint16* buffer = (Sint16*)stream;
     int num_samples = len / (int)sizeof(Sint16);
+    int channels = audio_channel_count > 0 ? audio_channel_count : 1;
+    if (channels <= 0) {
+        channels = 1;
+    }
+    int num_frames = (channels > 0) ? (num_samples / channels) : 0;
     double cycles_per_sample = beeper_cycles_per_sample;
     double playback_position = beeper_playback_position;
     double last_input = beeper_hp_last_input;
     double last_output = beeper_hp_last_output;
     int level = beeper_playback_level;
 
-    if (cycles_per_sample <= 0.0) {
+    if (cycles_per_sample <= 0.0 || num_frames <= 0) {
         memset(buffer, 0, (size_t)len);
         return;
     }
@@ -11083,7 +11489,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
             if (idle_samples >= BEEPER_IDLE_RESET_SAMPLES) {
                 memset(buffer, 0, (size_t)len);
 
-                double new_position = playback_position + cycles_per_sample * (double)num_samples;
+                double new_position = playback_position + cycles_per_sample * (double)num_frames;
                 double writer_cursor = beeper_writer_cursor;
                 double writer_lag_samples = 0.0;
                 if (cycles_per_sample > 0.0) {
@@ -11112,7 +11518,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
                 last_input = baseline;
                 last_output = 0.0;
 
-                audio_dump_write_samples(buffer, (size_t)num_samples);
+                audio_dump_write_samples(buffer, (size_t)(num_frames * channels));
 
                 beeper_playback_level = level;
                 beeper_playback_position = new_position;
@@ -11134,7 +11540,7 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
         }
     }
 
-    for (int i = 0; i < num_samples; ++i) {
+    for (int frame = 0; frame < num_frames; ++frame) {
         double target_position = playback_position + cycles_per_sample;
 
         while (beeper_event_head != beeper_event_tail &&
@@ -11148,18 +11554,37 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
         double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
         last_input = raw_sample;
         last_output = filtered_sample;
+        double ay_left = 0.0;
+        double ay_right = 0.0;
+        ay_mix_sample(ay_cycles_per_sample, &ay_left, &ay_right);
+        double left_value = filtered_sample + ay_left;
+        double right_value = filtered_sample + ay_right;
+        double mono_value = filtered_sample + 0.5 * (ay_left + ay_right);
 
-        if (filtered_sample > 32767.0) {
-            filtered_sample = 32767.0;
-        } else if (filtered_sample < -32768.0) {
-            filtered_sample = -32768.0;
+        double output_left = (channels > 1) ? left_value : mono_value;
+        double output_right = (channels > 1) ? right_value : mono_value;
+
+        if (output_left > 32767.0) {
+            output_left = 32767.0;
+        } else if (output_left < -32768.0) {
+            output_left = -32768.0;
         }
-        buffer[i] = (Sint16)lrint(filtered_sample);
 
+        if (output_right > 32767.0) {
+            output_right = 32767.0;
+        } else if (output_right < -32768.0) {
+            output_right = -32768.0;
+        }
+
+        Sint16* frame_ptr = &buffer[frame * channels];
+        frame_ptr[0] = (Sint16)lrint(output_left);
+        if (channels > 1) {
+            frame_ptr[1] = (Sint16)lrint(output_right);
+        }
         playback_position = target_position;
     }
 
-    audio_dump_write_samples(buffer, (size_t)num_samples);
+    audio_dump_write_samples(buffer, (size_t)(num_frames * channels));
 
     beeper_playback_level = level;
     beeper_playback_position = playback_position;
@@ -11401,6 +11826,24 @@ int main(int argc, char *argv[]) {
                 spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_PLUS3);
             } else {
                 fprintf(stderr, "Unknown peripheral contention profile: %s\n", peripheral_value);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--ay-gain") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            ay_global_gain = strtod(argv[++i], NULL);
+            if (ay_global_gain < 0.0) {
+                ay_global_gain = 0.0;
+            }
+        } else if (strcmp(argv[i], "--ay-pan") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            if (!ay_parse_pan_spec(argv[++i])) {
+                fprintf(stderr, "Invalid AY pan specification. Use three comma-separated values within [-1,1].\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "--beeper-log") == 0) {
