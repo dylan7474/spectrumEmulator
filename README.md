@@ -127,6 +127,10 @@ make test
 
 The harness now checks NMI stack semantics alongside the 128K paging and contention paths, keeping the shared interrupt model honest as the emulator evolves. Recent additions exercise the floating bus sampler, the +2A/+3 contention masks, the late gate-array ROM pager, the calibrated +2A/+3 contention slot offset, and both Interface 1 and +3 peripheral wait-state emulations so future timing tweaks remain compatible. A GitHub Actions workflow (`.github/workflows/ci.yml`) runs `make` and `make test` on every push and pull request so timing regressions are flagged automatically.
 
+#### Snapshot stress-test roadmap
+
+Snapshot stress tests are now part of the default regression story—`make test` (or `./z80 --run-tests`) automatically runs the synthetic `.sna`/`.z80` fixtures alongside every probe found in `tests/snapshots/probes/`. With the automated harness shipped, the roadmap focus shifts to growing that compatibility shelf. Keep feeding it with awkward paging captures (late +3 special maps, Interface 1 wait-state dumps, 48K edge cases, etc.) so that every instant-boot path stays covered. Feel free to keep personal bundles elsewhere and point the harness at them with `--snapshot-test-dir <dir>`; just mirror the `probes/` subfolder layout and the loader will pick them up without further glue.
+
 ### Loading and saving tapes
 
 Real-time cassette emulation is available for standard `.tap` dumps, `.tzx` images that use standard speed data blocks, and mono PCM `.wav` captures. Supply
