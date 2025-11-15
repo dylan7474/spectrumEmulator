@@ -6,5 +6,6 @@
 - Keep the snapshot loader documentation aligned with the actual `.z80` header parsing and decompression behaviour.
 - Make sure README tape deck documentation stays in sync with changes to the loader border graphics and the Tab-invoked tape manager so users know how the status indicators behave.
 - Keep the Tab-invoked tape manager workflow documented in `README.md` whenever the runtime loader or popup controls change.
+- Document host-facing affordances such as Escape-to-exit handling and the `--fullscreen` launch switch in `README.md` when they change.
 - Shell scripts must use `#!/usr/bin/env bash` and start with `set -euo pipefail`.
 - Keep the late gate-array contention tables and +3 peripheral wait-state tests in sync with the documented behaviour whenever timing changes are made.
