@@ -10,3 +10,4 @@
 - Shell scripts must use `#!/usr/bin/env bash` and start with `set -euo pipefail`.
 - Keep the late gate-array contention tables and +3 peripheral wait-state tests in sync with the documented behaviour whenever timing changes are made.
 - Keep the snapshot stress-test docs (`README.md` and `tests/snapshots/README.md`) aligned with the compatibility probe harness so users always know how to feed new `.sna`/`.z80` suites into `tests/snapshots/probes/`.
+- Keep the README roadmap entries (especially the snapshot stress-test section) current so contributors know which compatibility probes and paging scenarios still need coverage.

@@ -29,3 +29,15 @@ invocation (or `make test`) will attempt to load each file after the synthetic
 fixtures run. The loader auto-detects the extension, so no extra configuration is
 required. When you need to exercise snapshots that live elsewhere, pass
 `--snapshot-test-dir <dir>` and place your files inside `<dir>/probes/`.
+
+## Growing the compatibility shelf
+
+With the harness riding alongside every `make test` invocation, roadmap progress
+comes from expanding the probe library. Populate `tests/snapshots/probes/` with
+real-world captures that stress tricky paging paths—late +3 DOS boot states,
+Interface 1 wait-state experiments, 48K floating-bus samples, and so on. The
+test output tags each probe PASS/FAIL so you can quickly spot regressions and
+decide whether a new snapshot belongs in the shared corpus. When a probe needs
+to stay private, mirror the same `probes/` structure inside your
+`--snapshot-test-dir` folder and the harness will treat it identically without
+checking it into the repository.
