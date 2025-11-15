@@ -20,6 +20,7 @@ The synthesised `.sna` fixtures cover:
 - `128k-locked-bank5.sna` – locked 7FFD bank-5 paging state.
 - `plus2a-special.sna` – +2A/+3 special mapping (1FFD bit 2) coverage.
 - `plus3-rompaging.sna` – +3 ROM selection and standard paging verification.
+- `v3-128k.z80` – Version 3 `.z80` header path that restores 128K paging, the last 7FFD write, and the 128K model hint.
 
 ## Compatibility probes
 
