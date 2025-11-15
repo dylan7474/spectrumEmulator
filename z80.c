@@ -9927,7 +9927,7 @@ static void print_usage(const char* prog) {
             "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
             "[--snapshot <sna_or_z80>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
-            "[--test-rom-dir <dir>] [--run-tests] [rom_file]\n",
+            "[--test-rom-dir <dir>] [--run-tests] [--fullscreen] [rom_file]\n",
             prog);
 }
 
@@ -10386,6 +10386,7 @@ int main(int argc, char *argv[]) {
     int rom_provided = 0;
     int run_tests = 0;
     const char* test_rom_dir = "tests/roms";
+    int launch_fullscreen = 0;
     Z80 cpu;
     memset(&cpu, 0, sizeof(cpu));
 
@@ -10545,6 +10546,8 @@ int main(int argc, char *argv[]) {
             test_rom_dir = argv[++i];
         } else if (strcmp(argv[i], "--run-tests") == 0) {
             run_tests = 1;
+        } else if (strcmp(argv[i], "--fullscreen") == 0) {
+            launch_fullscreen = 1;
         } else {
             SnapshotFormat inferred_snapshot = snapshot_format_from_extension(argv[i]);
             TapeFormat inferred_format = tape_format_from_extension(argv[i]);
@@ -10669,6 +10672,10 @@ int main(int argc, char *argv[]) {
     speaker_output_level = speaker_calculate_output_level();
 
     if(!init_sdl()){tape_shutdown();cleanup_sdl();return 1;}
+
+    if (launch_fullscreen && !window_fullscreen) {
+        toggle_fullscreen();
+    }
 
     if (snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
         cpu.reg_PC = 0x0000;

@@ -216,9 +216,9 @@ The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary hos
 Additional host shortcuts:
 
 - Press Escape or close the emulator window to exit.
+- Launch the emulator with `--fullscreen` to start in desktop fullscreen mode; F11 or Alt+Enter toggles fullscreen at runtime.
 - Toggle the internal beeper through the Spectrum's standard `BEEP` command.
 - F5 Play, F6 Stop, F7 Rewind, F8 Record (Shift+F8 appends to the current WAV when available).
-- F11 or Alt+Enter toggles fullscreen mode.
 
 ## Roadmap
 - **Snapshot stress tests** – Build automated `.sna`/`.z80` regression suites and
