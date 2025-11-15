@@ -114,6 +114,11 @@ additional snapshot bundles without touching the bundled set. To keep the reposi
 as `.b64` text and the `.sna` cases are synthesised on the fly. The harness automatically materialises everything into
 `tests/snapshots/generated/` before running the tests, so you rarely need to decode them manually.
 
+To stress-test the broadened loader against real-world captures, drop `.sna` or `.z80` files into `tests/snapshots/probes/` (or
+the `probes/` folder inside your custom `--snapshot-test-dir`). The compatibility pass that runs alongside the synthetic suite
+will attempt to load every snapshot found there, reporting PASS/FAIL outcomes without needing to edit the harness. It's an easy
+way to keep regression coverage in sync with tricky paging setups pulled from your own collection.
+
 For convenience a dedicated make target wraps the test invocation:
 
 ```bash
