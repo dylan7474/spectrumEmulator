@@ -57,7 +57,7 @@ The new memory mapper also understands the full 128 KB family. Provide the paire
 
 When a complete 32 KB image is supplied for the early 128K machines the loader automatically populates both ROM banks. If you only provide a single 16 KB bank (for example `128-0.rom`) the emulator now searches for a matching sibling such as `128-1.rom` or `128_1.rom` in the same directory before mirroring the first page. The loader also inspects the paired dumps for the "128K" menu credits and the Sinclair Research BASIC banner so it can swap them into the canonical order, accepting either uppercase or mixed-case banners in the process. Even when every required bank arrives with an explicit numeric suffix the loader double-checks the canonical order and overrides conflicting hints, so mismatched pairs like `128-0`/`128-1` still boot straight into the menu instead of falling back to 48K BASIC. If the menu strings are missing but exactly one bank still looks like the 48K ROM, the loader simply assumes the remaining bank must be the 128K menu and keeps the boot order correct. Every ROM boot now prints a breakdown of the detected banks, their source files, and any menu/BASIC signatures so you can verify that the paging logic spotted the right images before the CPU starts executing. The +2A/+3 models accept a 64 KB dump and split it into all four 16 KB ROMs so the DOS pair can be paged in through port `0x1FFD`. The late gate-array emulation also honours the all-RAM and special paging modes, bringing the bank-switching quirks used by CP/M and +3DOS utilities in line with the real hardware. You can force the classic configuration at any time with `--model 48k` or `--48k`.
 The extended models share the revised ULA contention and interrupt handling code with the 48 KB machines, so bank paging, screen switching, and NMIs now follow the 128K timing quirks expected by diagnostics suites.
-The AY-3-8912 control and data ports are latched even when audio output is disabled, allowing the 128K boot ROM to probe the sound chip registers successfully and remain in the built-in menu instead of immediately returning to the 48K BASIC ROM.
+128K models now synthesise the AY-3-8912 audio stream alongside the classic beeper so menu music, in-game soundtracks, and loader probes hear the full 3-channel mix. The mixer defaults to a stereo image that biases channel A to the left, channel B down the middle, and channel C to the right while the beeper remains centred.
 
 Contention timing can be tuned without changing the core model. Pass `--contention <profile>` to pick from the original 48K bus sharing, the 128K "toastrack/+2" pattern, or the later +2A/+3 gate array behaviour. The late gate-array timings now honour the diagnostic-verified one-tick offset used by the +2A/+3 family, so screen fetch contention lines up with hardware-level tests:
 
@@ -74,6 +74,10 @@ For audio debugging you can mirror the generated beeper samples to a WAV file wi
 ```
 
 The WAV stream is captured directly from the audio callback, allowing offline analysis with tools such as Audacity.
+
+### AY gain and pan controls
+
+Use `--ay-gain <value>` to scale the AY contribution relative to the beeper and tape monitor channels. The default gain keeps the three tone channels from clipping when a loud beeper pulse is present, but you can raise or lower the multiplier to match your host speakers. Stereo rigs can also customise the hard-wired channel layout with `--ay-pan <left,center,right>`, supplying comma-separated values in the `[-1, 1]` range for channels A, B, and C respectively (for example `--ay-pan -1,0.1,0.9`). The beeper output remains centred, and mono hosts automatically downmix the AY pair by averaging the panned result.
 
 If you need to troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the detailed latency logs that are now
 disabled by default:
@@ -195,9 +199,7 @@ demos and fast loaders working straight from their archival images.
 
 To keep 128K-era titles progressing, the next milestones focus on observability, sound, and media coverage:
 
-1. **AY-3-8912 audio path.** The 128K control/data ports are already latched, but the emulator still ignores the register contents when mixing audio. Wiring a simple AY mixer alongside the beeper callback (and exposing gain/pan controls) will unlock the signature 128K soundtracks and help diagnose loaders that poll the chip before continuing.
-
-2. **Paging diagnostics and regression probes.** Instrument `spectrum_apply_memory_configuration()`/`io_write()` with a `--trace-paging` helper (or structured logging) so troublesome 128K programs that "load but never start" can be captured and replayed. Any failing `.z80`/`.sna` should be dropped into `tests/snapshots/probes/` so `make test` covers the scenario automatically.
+1. **Paging diagnostics and regression probes.** Instrument `spectrum_apply_memory_configuration()`/`io_write()` with a `--trace-paging` helper (or structured logging) so troublesome 128K programs that "load but never start" can be captured and replayed. Any failing `.z80`/`.sna` should be dropped into `tests/snapshots/probes/` so `make test` covers the scenario automatically.
 
 3. **Broader tape/disk coverage.** The TZX deck currently implements blocks `0x10–0x15`. Extending support to the additional tone/control records (`0x18`, `0x19`, etc.) plus prototyping +3 disk controller I/O will satisfy the media formats many late 128K releases expect.
 
