@@ -79,8 +79,11 @@ The WAV stream is captured directly from the audio callback, allowing offline an
 
 Use `--ay-gain <value>` to scale the AY contribution relative to the beeper and tape monitor channels. The default gain keeps the three tone channels from clipping when a loud beeper pulse is present, but you can raise or lower the multiplier to match your host speakers. Stereo rigs can also customise the hard-wired channel layout with `--ay-pan <left,center,right>`, supplying comma-separated values in the `[-1, 1]` range for channels A, B, and C respectively (for example `--ay-pan -1,0.1,0.9`). The beeper output remains centred, and mono hosts automatically downmix the AY pair by averaging the panned result.
 
-If you need to troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the detailed latency logs that are now
-disabled by default:
+All diagnostic output (including tape debug traces, paging maps, register dumps,
+and RAM hash logs) now writes to `z80.log` in the current working directory so
+long sessions do not scroll past your terminal buffer. If you need to
+troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the
+detailed latency logs that are now disabled by default:
 
 ```bash
 ./z80 --beeper-log path/to/48k.rom

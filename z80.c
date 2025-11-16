@@ -357,6 +357,8 @@ static TapeRecorder tape_recorder = {0};
 static int tape_ear_state = 1;
 static int tape_input_enabled = 0;
 
+static FILE* spectrum_log_file = NULL;
+
 typedef enum {
     TAPE_DECK_STATUS_IDLE,
     TAPE_DECK_STATUS_PLAY,
@@ -371,6 +373,21 @@ static int paging_debug_logging = 0;
 static int paging_log_registers = 0;
 static int ram_hash_logging = 0;
 static Z80* paging_cpu_state = NULL;
+
+static void spectrum_init_log_output(void) {
+    if (spectrum_log_file) {
+        return;
+    }
+
+    FILE* file = freopen("z80.log", "w", stderr);
+    if (file) {
+        setvbuf(file, NULL, _IOLBF, 0);
+        spectrum_log_file = file;
+        return;
+    }
+
+    spectrum_log_file = stderr;
+}
 
 static void spectrum_log_cpu_state(uint64_t tstate);
 static void spectrum_log_ram_hashes(const char* reason);
@@ -12033,6 +12050,8 @@ int main(int argc, char *argv[]) {
     Z80 cpu;
     memset(&cpu, 0, sizeof(cpu));
     paging_cpu_state = &cpu;
+
+    spectrum_init_log_output();
 
     tape_set_input_path(NULL);
 
