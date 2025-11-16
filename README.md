@@ -102,7 +102,15 @@ which screen buffer is active, making it easier to spot custom loaders that
 leave the machine paged into the wrong bank. Each entry includes the t-state at
 which the port write occurred so you can correlate paging activity with loader
 loops or breakpoint traps. Because the trace is plain text it can be shared
-without uploading the original game image.
+without uploading the original game image. Add `--paging-log-regs` if you also
+want a register snapshot for every paging write (PC, SP, AF/BC/DE/HL, IX/IY,
+IFF1, IM, and HALT) so you can see which code path issued the change.
+
+For cases where you need to compare memory contents without shipping a binary
+dump, `--ram-hash-log` prints a per-bank FNV-1a hash of all eight 16 KB RAM
+banks (plus the active screen, paging disable latch, and gate-array state).
+Hashes are emitted when the flag is parsed and again when the emulator exits,
+so you can capture post-loader RAM state as text.
 
 ## Testing
 
