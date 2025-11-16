@@ -79,8 +79,12 @@ The WAV stream is captured directly from the audio callback, allowing offline an
 
 Use `--ay-gain <value>` to scale the AY contribution relative to the beeper and tape monitor channels. The default gain keeps the three tone channels from clipping when a loud beeper pulse is present, but you can raise or lower the multiplier to match your host speakers. Stereo rigs can also customise the hard-wired channel layout with `--ay-pan <left,center,right>`, supplying comma-separated values in the `[-1, 1]` range for channels A, B, and C respectively (for example `--ay-pan -1,0.1,0.9`). The beeper output remains centred, and mono hosts automatically downmix the AY pair by averaging the panned result.
 
-If you need to troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the detailed latency logs that are now
-disabled by default:
+All diagnostic output (including tape debug traces, paging maps, register dumps,
+and RAM hash logs) now writes to `z80.log` in the current working directory so
+long sessions do not scroll past your terminal buffer. Both stdout and stderr
+are redirected and line-buffered in that file at startup. If you need to
+troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the
+detailed latency logs that are now disabled by default:
 
 ```bash
 ./z80 --beeper-log path/to/48k.rom
@@ -94,6 +98,23 @@ and TZX images expose the expected filenames and data ordering:
 ```bash
 ./z80 --tap loader.tap --tape-debug
 ```
+
+When 128K titles refuse to start after loading from tape, pass `--paging-log`
+to trace every write to ports `0x7FFD` and `0x1FFD` along with the resulting
+ROM/RAM map. The text log shows which banks are visible in each 16 KB slot and
+which screen buffer is active, making it easier to spot custom loaders that
+leave the machine paged into the wrong bank. Each entry includes the t-state at
+which the port write occurred so you can correlate paging activity with loader
+loops or breakpoint traps. Because the trace is plain text it can be shared
+without uploading the original game image. Add `--paging-log-regs` if you also
+want a register snapshot for every paging write (PC, SP, AF/BC/DE/HL, IX/IY,
+IFF1, IM, and HALT) so you can see which code path issued the change.
+
+For cases where you need to compare memory contents without shipping a binary
+dump, `--ram-hash-log` prints a per-bank FNV-1a hash of all eight 16 KB RAM
+banks (plus the active screen, paging disable latch, and gate-array state).
+Hashes are emitted when the flag is parsed and again when the emulator exits,
+so you can capture post-loader RAM state as text.
 
 ## Testing
 

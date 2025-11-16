@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -356,6 +357,8 @@ static TapeRecorder tape_recorder = {0};
 static int tape_ear_state = 1;
 static int tape_input_enabled = 0;
 
+static FILE* spectrum_log_file = NULL;
+
 typedef enum {
     TAPE_DECK_STATUS_IDLE,
     TAPE_DECK_STATUS_PLAY,
@@ -366,6 +369,35 @@ typedef enum {
 
 static TapeDeckStatus tape_deck_status = TAPE_DECK_STATUS_IDLE;
 static int tape_debug_logging = 0;
+static int paging_debug_logging = 0;
+static int paging_log_registers = 0;
+static int ram_hash_logging = 0;
+static Z80* paging_cpu_state = NULL;
+
+static void spectrum_init_log_output(void) {
+    if (spectrum_log_file) {
+        return;
+    }
+
+    FILE* stdout_file = freopen("z80.log", "w", stdout);
+    if (stdout_file) {
+        setvbuf(stdout_file, NULL, _IOLBF, 0);
+    }
+
+    const char* stderr_mode = stdout_file ? "a" : "w";
+    FILE* stderr_file = freopen("z80.log", stderr_mode, stderr);
+    if (stderr_file) {
+        setvbuf(stderr_file, NULL, _IOLBF, 0);
+        spectrum_log_file = stderr_file;
+        return;
+    }
+
+    spectrum_log_file = stdout_file ? stdout_file : stderr;
+}
+
+static void spectrum_log_cpu_state(uint64_t tstate);
+static void spectrum_log_ram_hashes(const char* reason);
+static uint32_t spectrum_hash_buffer(const uint8_t* data, size_t length);
 
 typedef enum {
     TAPE_MANAGER_MODE_HIDDEN,
@@ -407,6 +439,72 @@ static void tape_log(const char* fmt, ...) {
 }
 
 static uint64_t tape_wav_shared_position_tstates = 0;
+
+static void paging_log(const char* fmt, ...) {
+    if (!paging_debug_logging || !fmt) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    fputs("[PAGE] ", stderr);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
+
+static void spectrum_format_page_label(const SpectrumMemoryPage* page, char* out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    if (!page) {
+        snprintf(out, out_size, "<null>");
+        return;
+    }
+
+    switch (page->type) {
+        case MEMORY_PAGE_ROM:
+            snprintf(out, out_size, "ROM%u", (unsigned)page->index);
+            break;
+        case MEMORY_PAGE_RAM:
+            snprintf(out, out_size, "RAM%u", (unsigned)page->index);
+            break;
+        default:
+            snprintf(out, out_size, "None");
+            break;
+    }
+}
+
+static void spectrum_log_paging_state(const char* reason,
+                                      uint16_t port,
+                                      uint8_t value,
+                                      uint64_t tstate) {
+    if (!paging_debug_logging) {
+        return;
+    }
+
+    char labels[4][8];
+    for (int i = 0; i < 4; ++i) {
+        spectrum_format_page_label(&spectrum_pages[i], labels[i], sizeof(labels[i]));
+    }
+
+    paging_log("%s t=%" PRIu64 " model=%s port=0x%04X value=0x%02X 7FFD=0x%02X 1FFD=0x%02X disabled=%d\n",
+               reason ? reason : "paging",
+               (uint64_t)tstate,
+               spectrum_model_to_string(spectrum_model),
+               (unsigned)port,
+               (unsigned)value,
+               (unsigned)gate_array_7ffd_state,
+               (unsigned)gate_array_1ffd_state,
+               paging_disabled);
+    paging_log("    map: 0=%s 1=%s 2=%s 3=%s screen=%u\n",
+               labels[0],
+               labels[1],
+               labels[2],
+               labels[3],
+               (unsigned)current_screen_bank);
+    spectrum_log_cpu_state(tstate);
+}
 
 typedef enum {
     TAPE_CONTROL_ACTION_NONE = 0,
@@ -1658,6 +1756,45 @@ static void spectrum_apply_memory_configuration(void) {
     spectrum_update_contention_flags();
 }
 
+static uint32_t spectrum_hash_buffer(const uint8_t* data, size_t length) {
+    const uint32_t fnv_offset = 2166136261u;
+    const uint32_t fnv_prime = 16777619u;
+    uint32_t hash = fnv_offset;
+
+    if (!data) {
+        return hash;
+    }
+
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= data[i];
+        hash *= fnv_prime;
+    }
+
+    return hash;
+}
+
+static void spectrum_log_ram_hashes(const char* reason) {
+    if (!ram_hash_logging) {
+        return;
+    }
+
+    const char* tag = reason ? reason : "ram";
+    fprintf(stderr,
+            "[RAM ] %s hashes 7FFD=%02X 1FFD=%02X disabled=%d screen=%u",
+            tag,
+            (unsigned)gate_array_7ffd_state,
+            (unsigned)gate_array_1ffd_state,
+            paging_disabled,
+            (unsigned)current_screen_bank);
+
+    for (int bank = 0; bank < 8; ++bank) {
+        uint32_t hash = spectrum_hash_buffer(ram_pages[bank], 0x4000u);
+        fprintf(stderr, " bank%u=%08X", bank, hash);
+    }
+
+    fputc('\n', stderr);
+}
+
 static void spectrum_configure_model(SpectrumModel model) {
     spectrum_model = model;
     paging_disabled = 0;
@@ -1691,6 +1828,7 @@ static void spectrum_configure_model(SpectrumModel model) {
     }
     spectrum_reset_floating_bus();
     spectrum_apply_memory_configuration();
+    spectrum_log_paging_state("model configure", 0u, 0u, total_t_states);
 }
 
 static inline void apply_memory_contention(uint16_t addr) {
@@ -8418,12 +8556,13 @@ static void beeper_push_event(uint64_t t_state, int level) {
 }
 
 void io_write(uint16_t port, uint8_t value) {
+    uint64_t access_t_state = total_t_states;
     if ((port & 1) == 0) { // ULA Port FE
         ula_queue_port_value(value);
     }
 
     if ((port & 1) != 0) {
-        uint64_t access_t_state = spectrum_current_access_tstate();
+        access_t_state = spectrum_current_access_tstate();
         apply_port_contention(access_t_state);
     }
 
@@ -8455,6 +8594,9 @@ void io_write(uint16_t port, uint8_t value) {
                 paging_disabled = 1;
             }
             spectrum_apply_memory_configuration();
+            spectrum_log_paging_state("write 0x7FFD", port, value, access_t_state);
+        } else {
+            spectrum_log_paging_state("ignored 0x7FFD", port, value, access_t_state);
         }
         return;
     }
@@ -8464,6 +8606,9 @@ void io_write(uint16_t port, uint8_t value) {
         if (!paging_disabled) {
             gate_array_1ffd_state = (uint8_t)(value & 0x07u);
             spectrum_apply_memory_configuration();
+            spectrum_log_paging_state("write 0x1FFD", port, value, access_t_state);
+        } else {
+            spectrum_log_paging_state("ignored 0x1FFD", port, value, access_t_state);
         }
         return;
     }
@@ -8522,6 +8667,32 @@ static inline int parity_even(uint8_t value) {
     value ^= (uint8_t)(value >> 2);
     value ^= (uint8_t)(value >> 1);
     return (value & 1u) == 0u;
+}
+
+static void spectrum_log_cpu_state(uint64_t tstate) {
+    if (!paging_debug_logging || !paging_log_registers || !paging_cpu_state) {
+        return;
+    }
+
+    const Z80* cpu = paging_cpu_state;
+    uint16_t af = (uint16_t)((cpu->reg_A << 8) | cpu->reg_F);
+    uint16_t bc = (uint16_t)((cpu->reg_B << 8) | cpu->reg_C);
+    uint16_t de = (uint16_t)((cpu->reg_D << 8) | cpu->reg_E);
+    uint16_t hl = (uint16_t)((cpu->reg_H << 8) | cpu->reg_L);
+    paging_log(
+        "    cpu: t=%" PRIu64 " PC=%04X SP=%04X AF=%04X BC=%04X DE=%04X HL=%04X IX=%04X IY=%04X IFF1=%d IM=%d HALT=%d\n",
+        tstate,
+        (unsigned)cpu->reg_PC,
+        (unsigned)cpu->reg_SP,
+        (unsigned)af,
+        (unsigned)bc,
+        (unsigned)de,
+        (unsigned)hl,
+        (unsigned)cpu->reg_IX,
+        (unsigned)cpu->reg_IY,
+        cpu->iff1,
+        cpu->interruptMode,
+        cpu->halted);
 }
 
 static inline void set_block_io_flags(Z80* cpu, uint8_t value, uint8_t offset, uint8_t new_b) {
@@ -11378,7 +11549,7 @@ static int run_cpu_tests(const char* rom_dir, const char* snapshot_dir) {
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] "
+            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] [--paging-log] [--paging-log-regs] [--ram-hash-log] "
             "[--model <48k|128k|plus2a|plus3> | --48k | --128k | --plus2a | --plus3] "
             "[--contention <48k|128k|plus2a|plus3>] "
             "[--peripheral <none|if1|plus3>] "
@@ -11884,6 +12055,9 @@ int main(int argc, char *argv[]) {
     int launch_fullscreen = 0;
     Z80 cpu;
     memset(&cpu, 0, sizeof(cpu));
+    paging_cpu_state = &cpu;
+
+    spectrum_init_log_output();
 
     tape_set_input_path(NULL);
 
@@ -11983,6 +12157,16 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--tape-debug") == 0) {
             tape_debug_logging = 1;
             tape_log("Tape debug logging enabled\n");
+        } else if (strcmp(argv[i], "--paging-log") == 0) {
+            paging_debug_logging = 1;
+            spectrum_log_paging_state("paging debug enabled", 0u, 0u, total_t_states);
+        } else if (strcmp(argv[i], "--paging-log-regs") == 0) {
+            paging_debug_logging = 1;
+            paging_log_registers = 1;
+            spectrum_log_paging_state("paging register logging enabled", 0u, 0u, total_t_states);
+        } else if (strcmp(argv[i], "--ram-hash-log") == 0) {
+            ram_hash_logging = 1;
+            spectrum_log_ram_hashes("startup");
         } else if (strcmp(argv[i], "--tap") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -12393,6 +12577,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    spectrum_log_ram_hashes("exit");
     printf("Emulation finished.\nFinal State:\nPC:%04X SP:%04X AF:%04X BC:%04X DE:%04X HL:%04X IX:%04X IY:%04X\n",cpu.reg_PC,cpu.reg_SP,get_AF(&cpu),get_BC(&cpu),get_DE(&cpu),get_HL(&cpu),cpu.reg_IX,cpu.reg_IY);
     tape_shutdown();
     cleanup_sdl(); return 0;
