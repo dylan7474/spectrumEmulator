@@ -81,7 +81,8 @@ Use `--ay-gain <value>` to scale the AY contribution relative to the beeper and 
 
 All diagnostic output (including tape debug traces, paging maps, register dumps,
 and RAM hash logs) now writes to `z80.log` in the current working directory so
-long sessions do not scroll past your terminal buffer. If you need to
+long sessions do not scroll past your terminal buffer. Both stdout and stderr
+are redirected and line-buffered in that file at startup. If you need to
 troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the
 detailed latency logs that are now disabled by default:
 

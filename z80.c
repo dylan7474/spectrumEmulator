@@ -379,14 +379,20 @@ static void spectrum_init_log_output(void) {
         return;
     }
 
-    FILE* file = freopen("z80.log", "w", stderr);
-    if (file) {
-        setvbuf(file, NULL, _IOLBF, 0);
-        spectrum_log_file = file;
+    FILE* stdout_file = freopen("z80.log", "w", stdout);
+    if (stdout_file) {
+        setvbuf(stdout_file, NULL, _IOLBF, 0);
+    }
+
+    const char* stderr_mode = stdout_file ? "a" : "w";
+    FILE* stderr_file = freopen("z80.log", stderr_mode, stderr);
+    if (stderr_file) {
+        setvbuf(stderr_file, NULL, _IOLBF, 0);
+        spectrum_log_file = stderr_file;
         return;
     }
 
-    spectrum_log_file = stderr;
+    spectrum_log_file = stdout_file ? stdout_file : stderr;
 }
 
 static void spectrum_log_cpu_state(uint64_t tstate);
