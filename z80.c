@@ -366,6 +366,7 @@ typedef enum {
 
 static TapeDeckStatus tape_deck_status = TAPE_DECK_STATUS_IDLE;
 static int tape_debug_logging = 0;
+static int paging_debug_logging = 0;
 
 typedef enum {
     TAPE_MANAGER_MODE_HIDDEN,
@@ -407,6 +408,67 @@ static void tape_log(const char* fmt, ...) {
 }
 
 static uint64_t tape_wav_shared_position_tstates = 0;
+
+static void paging_log(const char* fmt, ...) {
+    if (!paging_debug_logging || !fmt) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    fputs("[PAGE] ", stderr);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
+
+static void spectrum_format_page_label(const SpectrumMemoryPage* page, char* out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    if (!page) {
+        snprintf(out, out_size, "<null>");
+        return;
+    }
+
+    switch (page->type) {
+        case MEMORY_PAGE_ROM:
+            snprintf(out, out_size, "ROM%u", (unsigned)page->index);
+            break;
+        case MEMORY_PAGE_RAM:
+            snprintf(out, out_size, "RAM%u", (unsigned)page->index);
+            break;
+        default:
+            snprintf(out, out_size, "None");
+            break;
+    }
+}
+
+static void spectrum_log_paging_state(const char* reason, uint16_t port, uint8_t value) {
+    if (!paging_debug_logging) {
+        return;
+    }
+
+    char labels[4][8];
+    for (int i = 0; i < 4; ++i) {
+        spectrum_format_page_label(&spectrum_pages[i], labels[i], sizeof(labels[i]));
+    }
+
+    paging_log("%s model=%s port=0x%04X value=0x%02X 7FFD=0x%02X 1FFD=0x%02X disabled=%d\n",
+               reason ? reason : "paging",
+               spectrum_model_to_string(spectrum_model),
+               (unsigned)port,
+               (unsigned)value,
+               (unsigned)gate_array_7ffd_state,
+               (unsigned)gate_array_1ffd_state,
+               paging_disabled);
+    paging_log("    map: 0=%s 1=%s 2=%s 3=%s screen=%u\n",
+               labels[0],
+               labels[1],
+               labels[2],
+               labels[3],
+               (unsigned)current_screen_bank);
+}
 
 typedef enum {
     TAPE_CONTROL_ACTION_NONE = 0,
@@ -1691,6 +1753,7 @@ static void spectrum_configure_model(SpectrumModel model) {
     }
     spectrum_reset_floating_bus();
     spectrum_apply_memory_configuration();
+    spectrum_log_paging_state("model configure", 0u, 0u);
 }
 
 static inline void apply_memory_contention(uint16_t addr) {
@@ -8455,6 +8518,9 @@ void io_write(uint16_t port, uint8_t value) {
                 paging_disabled = 1;
             }
             spectrum_apply_memory_configuration();
+            spectrum_log_paging_state("write 0x7FFD", port, value);
+        } else {
+            spectrum_log_paging_state("ignored 0x7FFD", port, value);
         }
         return;
     }
@@ -8464,6 +8530,9 @@ void io_write(uint16_t port, uint8_t value) {
         if (!paging_disabled) {
             gate_array_1ffd_state = (uint8_t)(value & 0x07u);
             spectrum_apply_memory_configuration();
+            spectrum_log_paging_state("write 0x1FFD", port, value);
+        } else {
+            spectrum_log_paging_state("ignored 0x1FFD", port, value);
         }
         return;
     }
@@ -11378,7 +11447,7 @@ static int run_cpu_tests(const char* rom_dir, const char* snapshot_dir) {
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] "
+            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] [--paging-log] "
             "[--model <48k|128k|plus2a|plus3> | --48k | --128k | --plus2a | --plus3] "
             "[--contention <48k|128k|plus2a|plus3>] "
             "[--peripheral <none|if1|plus3>] "
@@ -11983,6 +12052,9 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--tape-debug") == 0) {
             tape_debug_logging = 1;
             tape_log("Tape debug logging enabled\n");
+        } else if (strcmp(argv[i], "--paging-log") == 0) {
+            paging_debug_logging = 1;
+            spectrum_log_paging_state("paging debug enabled", 0u, 0u);
         } else if (strcmp(argv[i], "--tap") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
