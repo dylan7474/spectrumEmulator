@@ -99,8 +99,10 @@ When 128K titles refuse to start after loading from tape, pass `--paging-log`
 to trace every write to ports `0x7FFD` and `0x1FFD` along with the resulting
 ROM/RAM map. The text log shows which banks are visible in each 16 KB slot and
 which screen buffer is active, making it easier to spot custom loaders that
-leave the machine paged into the wrong bank. Because the trace is plain text it
-can be shared without uploading the original game image.
+leave the machine paged into the wrong bank. Each entry includes the t-state at
+which the port write occurred so you can correlate paging activity with loader
+loops or breakpoint traps. Because the trace is plain text it can be shared
+without uploading the original game image.
 
 ## Testing
 

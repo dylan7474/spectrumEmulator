@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -444,7 +445,10 @@ static void spectrum_format_page_label(const SpectrumMemoryPage* page, char* out
     }
 }
 
-static void spectrum_log_paging_state(const char* reason, uint16_t port, uint8_t value) {
+static void spectrum_log_paging_state(const char* reason,
+                                      uint16_t port,
+                                      uint8_t value,
+                                      uint64_t tstate) {
     if (!paging_debug_logging) {
         return;
     }
@@ -454,8 +458,9 @@ static void spectrum_log_paging_state(const char* reason, uint16_t port, uint8_t
         spectrum_format_page_label(&spectrum_pages[i], labels[i], sizeof(labels[i]));
     }
 
-    paging_log("%s model=%s port=0x%04X value=0x%02X 7FFD=0x%02X 1FFD=0x%02X disabled=%d\n",
+    paging_log("%s t=%" PRIu64 " model=%s port=0x%04X value=0x%02X 7FFD=0x%02X 1FFD=0x%02X disabled=%d\n",
                reason ? reason : "paging",
+               (uint64_t)tstate,
                spectrum_model_to_string(spectrum_model),
                (unsigned)port,
                (unsigned)value,
@@ -1753,7 +1758,7 @@ static void spectrum_configure_model(SpectrumModel model) {
     }
     spectrum_reset_floating_bus();
     spectrum_apply_memory_configuration();
-    spectrum_log_paging_state("model configure", 0u, 0u);
+    spectrum_log_paging_state("model configure", 0u, 0u, total_t_states);
 }
 
 static inline void apply_memory_contention(uint16_t addr) {
@@ -8481,12 +8486,13 @@ static void beeper_push_event(uint64_t t_state, int level) {
 }
 
 void io_write(uint16_t port, uint8_t value) {
+    uint64_t access_t_state = total_t_states;
     if ((port & 1) == 0) { // ULA Port FE
         ula_queue_port_value(value);
     }
 
     if ((port & 1) != 0) {
-        uint64_t access_t_state = spectrum_current_access_tstate();
+        access_t_state = spectrum_current_access_tstate();
         apply_port_contention(access_t_state);
     }
 
@@ -8518,9 +8524,9 @@ void io_write(uint16_t port, uint8_t value) {
                 paging_disabled = 1;
             }
             spectrum_apply_memory_configuration();
-            spectrum_log_paging_state("write 0x7FFD", port, value);
+            spectrum_log_paging_state("write 0x7FFD", port, value, access_t_state);
         } else {
-            spectrum_log_paging_state("ignored 0x7FFD", port, value);
+            spectrum_log_paging_state("ignored 0x7FFD", port, value, access_t_state);
         }
         return;
     }
@@ -8530,9 +8536,9 @@ void io_write(uint16_t port, uint8_t value) {
         if (!paging_disabled) {
             gate_array_1ffd_state = (uint8_t)(value & 0x07u);
             spectrum_apply_memory_configuration();
-            spectrum_log_paging_state("write 0x1FFD", port, value);
+            spectrum_log_paging_state("write 0x1FFD", port, value, access_t_state);
         } else {
-            spectrum_log_paging_state("ignored 0x1FFD", port, value);
+            spectrum_log_paging_state("ignored 0x1FFD", port, value, access_t_state);
         }
         return;
     }
@@ -12054,7 +12060,7 @@ int main(int argc, char *argv[]) {
             tape_log("Tape debug logging enabled\n");
         } else if (strcmp(argv[i], "--paging-log") == 0) {
             paging_debug_logging = 1;
-            spectrum_log_paging_state("paging debug enabled", 0u, 0u);
+            spectrum_log_paging_state("paging debug enabled", 0u, 0u, total_t_states);
         } else if (strcmp(argv[i], "--tap") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
