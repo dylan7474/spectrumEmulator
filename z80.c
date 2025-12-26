@@ -6044,6 +6044,9 @@ layout_retry:
     const uint32_t text_button_disabled_fill = 0x242424FFu;
     const uint32_t text_button_border = 0xFFFFFFFFu;
     const uint32_t input_box_border = 0x6FA7FFFFu;
+    const uint32_t browser_selection_fill = 0x2A6FAAFFu;
+    const uint32_t browser_selection_border = 0x9FD0FFFFu;
+    const uint32_t browser_selection_text = 0xFFFFFFFFu;
 
     const char* deck_state_text = "IDLE";
     if (tape_recorder.recording) {
@@ -6223,6 +6226,7 @@ layout_retry:
     int browser_list_width = 0;
     int browser_visible_lines = 0;
     const char* browser_empty_line = "NO TAPES FOUND";
+    const int browser_selection_padding = 2 * scale;
 
     if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
         (void)snprintf(input_prompt, sizeof(input_prompt), "LOAD TAPE PATH:");
@@ -6254,13 +6258,15 @@ layout_retry:
                 char entry_line[PATH_MAX + 16];
                 char marker = (i == tape_manager_browser_selection) ? '>' : ' ';
                 (void)snprintf(entry_line, sizeof(entry_line), "%c %s%s", marker, name, suffix);
-                int width = tape_overlay_text_width(entry_line, scale, spacing);
+                int width = tape_overlay_text_width(entry_line, scale, spacing) +
+                            browser_selection_padding * 2;
                 if (width > browser_list_width) {
                     browser_list_width = width;
                 }
             }
         } else {
-            int width = tape_overlay_text_width(browser_empty_line, scale, spacing);
+            int width = tape_overlay_text_width(browser_empty_line, scale, spacing) +
+                        browser_selection_padding * 2;
             if (width > browser_list_width) {
                 browser_list_width = width;
             }
@@ -6515,7 +6521,16 @@ layout_retry:
                 char entry_line[PATH_MAX + 16];
                 char marker = (i == tape_manager_browser_selection) ? '>' : ' ';
                 (void)snprintf(entry_line, sizeof(entry_line), "%c %s%s", marker, name, suffix);
-                uint32_t entry_color = (i == tape_manager_browser_selection) ? title_color : text_color;
+                uint32_t entry_color = (i == tape_manager_browser_selection) ? browser_selection_text : text_color;
+                if (i == tape_manager_browser_selection) {
+                    int highlight_x = cursor_x - browser_selection_padding;
+                    tape_overlay_draw_rect(highlight_x,
+                                           cursor_y,
+                                           browser_list_width,
+                                           line_height,
+                                           browser_selection_fill,
+                                           browser_selection_border);
+                }
                 tape_overlay_draw_text(cursor_x, cursor_y, entry_line, scale, spacing, entry_color);
                 cursor_y += line_height;
             }
