@@ -45,6 +45,12 @@ Launch the compiled executable from the command line. By default the emulator po
 ./z80 path/to/48k.rom
 ```
 
+On POSIX hosts you can install the emulator into `/usr/local/bin` with:
+
+```bash
+make install
+```
+
 The emulator now creates a user data root at `~/.z80/` (or the equivalent home directory on your platform) with `roms/`, `software/`, and `snapshots/` subfolders for firmware, tape images, and snapshot files. If no ROM is specified the loader first checks `~/.z80/roms/48.rom` and falls back to the bundled `48.rom` in the project root if it is missing. The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
 
 The new memory mapper also understands the full 128 KB family. Provide the paired ROM image and select the model explicitly (the shorthand flags `--128k`, `--plus2a`, and `--plus3` work the same way):

@@ -4,6 +4,8 @@ PKG_CONFIG ?= pkg-config
 
 TARGET := z80
 SRCS := z80.c
+PREFIX ?= /usr/local
+BINDIR := $(PREFIX)/bin
 
 # Allow callers to provide custom SDL2 flags via the environment. Otherwise try
 # pkg-config first, then fall back to sdl2-config if available.
@@ -51,4 +53,7 @@ test: $(TARGET)
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all run test clean
+install: $(TARGET)
+	install -m 0755 $(TARGET) $(BINDIR)/$(TARGET)
+
+.PHONY: all run test clean install
