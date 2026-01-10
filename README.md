@@ -45,7 +45,13 @@ Launch the compiled executable from the command line. By default the emulator po
 ./z80 path/to/48k.rom
 ```
 
-If no ROM is specified the bundled `48.rom` image in the project root is used automatically. The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
+On POSIX hosts you can install the emulator into `/usr/local/bin` with:
+
+```bash
+make install
+```
+
+The emulator now creates a user data root at `~/.z80/` (or the equivalent home directory on your platform) with `roms/`, `software/`, and `snapshots/` subfolders for firmware, tape images, and snapshot files. If no ROM is specified the loader first checks `~/.z80/roms/48.rom` and falls back to the bundled `48.rom` in the project root if it is missing. The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
 
 The new memory mapper also understands the full 128 KB family. Provide the paired ROM image and select the model explicitly (the shorthand flags `--128k`, `--plus2a`, and `--plus3` work the same way):
 
@@ -172,6 +178,8 @@ infers `.tap`, `.tzx`, and `.wav` formats from positional arguments, so running
 `./z80 digitized.wav` loads the bundled ROM and cues the specified tape at
 startup.
 
+If you supply only a filename (no path), the loader searches `~/.z80/software/` before falling back to the current working directory. Tape recordings configured with `--save-tap` or `--save-wav` also default to `~/.z80/software/` when you pass just a filename, and the tape manager's browser starts there by default.
+
 Loaded tapes remain cued at the start. Press **F5** to begin playback when the Spectrum is ready to `LOAD`, use **F6** to pause/stop, and tap **F7** to rewind to the beginning at any time. Playback now resumes from the last head position instead of rewinding automatically, so multi-part programs can continue loading sequential blocks. When the tape reaches the end, press **F7** before hitting play again to restart from the top.
 
 Press **Tab** at any time to summon the tape manager popup. The centered overlay pauses Spectrum key routing and renders a deck-style control panel with the loaded tape, the active recorder destination, and a large digital counter. The illuminated play/stop/rewind/record buttons respond to clicks, while the shortcut strip along the bottom lists the **P**, **S**, **W**, and **R** bindings (hold **Shift** with **R** to append to an existing WAV). A second row highlights the Load, Browse, Eject, and Close actions and the same shortcut strip calls out their keyboard equivalents so the available gestures stay visible without duplicating labels. Press **L** to open the inline file prompt, type or paste a `.tap`, `.tzx`, or `.wav` path, then hit **Return** to mount it immediately; entering the name of a new file automatically creates an empty container in the chosen format so you can prepare blank tapes for recording without leaving the emulator. Hit **B** to enter the built-in file browser, navigate with the arrow keys, press **Return** to load the highlighted tape (shown with a filled highlight bar), and tap **Backspace** to climb to the parent directory. **Esc** cancels the prompt or browser and **Tab** closes the manager from any mode. The status strip updates after every command so you can confirm deck changes without leaving the overlay, and the text automatically scales down when needed so the panel always fits on-screen.
@@ -238,6 +246,8 @@ registers and RAM restored from the saved state. 128K `.sna` files automatically
 recover the last `0x7FFD` and (when present) `0x1FFD` gate-array writes so the
 loader can select the 128K, +2A, or +3 models as needed without user
 intervention, giving every machine an instant boot path.
+
+When you supply just a snapshot filename (no path), the loader also checks `~/.z80/snapshots/` so you can keep a consistent personal library without typing full paths.
 
 Recent fixes corrected the Version 1 `.z80` header parser so the compression
 flag, the high bit of the `R` register, and the surrounding register fields are
