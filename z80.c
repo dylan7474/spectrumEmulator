@@ -34,6 +34,259 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+#ifdef _WIN32
+#define PATH_SEPARATOR '\\'
+#else
+#define PATH_SEPARATOR '/'
+#endif
+
+static char spectrum_user_dir[PATH_MAX];
+static char spectrum_user_roms_dir[PATH_MAX];
+static char spectrum_user_software_dir[PATH_MAX];
+static char spectrum_user_snapshots_dir[PATH_MAX];
+static char snapshot_input_path_storage[PATH_MAX];
+static char tape_output_path_storage[PATH_MAX];
+
+static int spectrum_is_path_separator(char value) {
+    return value == '/' || value == '\\';
+}
+
+static int spectrum_path_is_absolute(const char* path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    if (spectrum_is_path_separator(path[0])) {
+        return 1;
+    }
+#ifdef _WIN32
+    if (isalpha((unsigned char)path[0]) && path[1] == ':' && spectrum_is_path_separator(path[2])) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+static int spectrum_path_has_separator(const char* path) {
+    if (!path) {
+        return 0;
+    }
+    for (const char* p = path; *p; ++p) {
+        if (spectrum_is_path_separator(*p)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int spectrum_file_exists(const char* path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    STAT_STRUCT st;
+    if (STAT_FUNC(path, &st) != 0) {
+        return 0;
+    }
+    return !STAT_ISDIR(st.st_mode);
+}
+
+static int spectrum_join_path(const char* base, const char* name, char* out, size_t out_size) {
+    if (!base || !*base || !name || !*name || !out || out_size == 0u) {
+        return 0;
+    }
+    size_t base_len = strlen(base);
+    while (base_len > 0u && spectrum_is_path_separator(base[base_len - 1u])) {
+        base_len--;
+    }
+    size_t name_len = strlen(name);
+    size_t name_offset = 0u;
+    while (name_offset < name_len && spectrum_is_path_separator(name[name_offset])) {
+        name_offset++;
+    }
+    name_len -= name_offset;
+    if (base_len + 1u + name_len + 1u > out_size) {
+        return 0;
+    }
+    memcpy(out, base, base_len);
+    out[base_len] = PATH_SEPARATOR;
+    memcpy(out + base_len + 1u, name + name_offset, name_len);
+    out[base_len + 1u + name_len] = '\0';
+    return 1;
+}
+
+static int spectrum_make_directory(const char* path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    STAT_STRUCT st;
+    if (STAT_FUNC(path, &st) == 0) {
+        if (STAT_ISDIR(st.st_mode)) {
+            return 1;
+        }
+        fprintf(stderr, "Path exists but is not a directory: %s\n", path);
+        return 0;
+    }
+#ifdef _WIN32
+    if (_mkdir(path) == 0 || errno == EEXIST) {
+        return 1;
+    }
+#else
+    if (mkdir(path, 0755) == 0 || errno == EEXIST) {
+        return 1;
+    }
+#endif
+    fprintf(stderr, "Failed to create directory '%s': %s\n", path, strerror(errno));
+    return 0;
+}
+
+static int spectrum_ensure_directory_tree(const char* path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    size_t length = strlen(path);
+    if (length >= PATH_MAX) {
+        return 0;
+    }
+    char temp[PATH_MAX];
+    memcpy(temp, path, length + 1u);
+    size_t start = 0u;
+#ifdef _WIN32
+    if (length >= 2u && temp[1] == ':') {
+        start = 2u;
+    }
+#endif
+    for (size_t i = start + 1u; i <= length; ++i) {
+        if (i == length || spectrum_is_path_separator(temp[i])) {
+            char saved = temp[i];
+            temp[i] = '\0';
+            if (temp[0] != '\0') {
+#ifdef _WIN32
+                if (!(strlen(temp) == 2u && temp[1] == ':')) {
+                    if (!spectrum_make_directory(temp)) {
+                        return 0;
+                    }
+                }
+#else
+                if (!spectrum_make_directory(temp)) {
+                    return 0;
+                }
+#endif
+            }
+            temp[i] = saved;
+        }
+    }
+    return 1;
+}
+
+static int spectrum_get_home_directory(char* out, size_t out_size) {
+    if (!out || out_size == 0u) {
+        return 0;
+    }
+    const char* home = getenv("HOME");
+#ifdef _WIN32
+    if (!home || !*home) {
+        home = getenv("USERPROFILE");
+    }
+    if ((!home || !*home)) {
+        const char* drive = getenv("HOMEDRIVE");
+        const char* path = getenv("HOMEPATH");
+        if (drive && *drive && path && *path) {
+            size_t drive_len = strlen(drive);
+            size_t path_len = strlen(path);
+            if (drive_len + path_len + 1u > out_size) {
+                return 0;
+            }
+            memcpy(out, drive, drive_len);
+            memcpy(out + drive_len, path, path_len);
+            out[drive_len + path_len] = '\0';
+            return 1;
+        }
+    }
+#endif
+    if (!home || !*home) {
+        return 0;
+    }
+    size_t home_len = strlen(home);
+    if (home_len + 1u > out_size) {
+        return 0;
+    }
+    memcpy(out, home, home_len + 1u);
+    return 1;
+}
+
+static void spectrum_init_user_paths(void) {
+    spectrum_user_dir[0] = '\0';
+    spectrum_user_roms_dir[0] = '\0';
+    spectrum_user_software_dir[0] = '\0';
+    spectrum_user_snapshots_dir[0] = '\0';
+
+    char home[PATH_MAX];
+    if (!spectrum_get_home_directory(home, sizeof(home))) {
+        return;
+    }
+    if (!spectrum_join_path(home, ".z80", spectrum_user_dir, sizeof(spectrum_user_dir))) {
+        return;
+    }
+    if (!spectrum_join_path(spectrum_user_dir, "roms", spectrum_user_roms_dir, sizeof(spectrum_user_roms_dir))) {
+        return;
+    }
+    if (!spectrum_join_path(spectrum_user_dir, "software", spectrum_user_software_dir, sizeof(spectrum_user_software_dir))) {
+        return;
+    }
+    if (!spectrum_join_path(spectrum_user_dir, "snapshots", spectrum_user_snapshots_dir, sizeof(spectrum_user_snapshots_dir))) {
+        return;
+    }
+    if (!spectrum_ensure_directory_tree(spectrum_user_dir)) {
+        return;
+    }
+    if (!spectrum_ensure_directory_tree(spectrum_user_roms_dir)) {
+        return;
+    }
+    if (!spectrum_ensure_directory_tree(spectrum_user_software_dir)) {
+        return;
+    }
+    (void)spectrum_ensure_directory_tree(spectrum_user_snapshots_dir);
+}
+
+static const char* spectrum_resolve_input_path(const char* path,
+                                               const char* base_dir,
+                                               char* storage,
+                                               size_t storage_size) {
+    if (!path || !*path) {
+        return NULL;
+    }
+    if (!base_dir || !*base_dir) {
+        return path;
+    }
+    if (spectrum_path_is_absolute(path) || spectrum_path_has_separator(path)) {
+        return path;
+    }
+    if (spectrum_file_exists(path)) {
+        return path;
+    }
+    if (!spectrum_join_path(base_dir, path, storage, storage_size)) {
+        return path;
+    }
+    return storage;
+}
+
+static const char* spectrum_resolve_output_path(const char* path,
+                                                const char* base_dir,
+                                                char* storage,
+                                                size_t storage_size) {
+    if (!path || !*path) {
+        return NULL;
+    }
+    if (!base_dir || !*base_dir) {
+        return path;
+    }
+    if (spectrum_path_is_absolute(path) || spectrum_path_has_separator(path)) {
+        return path;
+    }
+    if (!spectrum_join_path(base_dir, path, storage, storage_size)) {
+        return path;
+    }
+    return storage;
+}
 
 // --- Z80 Flag Register Bits ---
 #define FLAG_C  (1 << 0) // Carry Flag
@@ -4154,6 +4407,21 @@ static TapeFormat tape_format_from_extension(const char* path) {
     return TAPE_FORMAT_NONE;
 }
 
+static void snapshot_set_input_path(const char* path) {
+    if (path && *path) {
+        size_t length = strlen(path);
+        if (length >= sizeof(snapshot_input_path_storage)) {
+            length = sizeof(snapshot_input_path_storage) - 1u;
+        }
+        memcpy(snapshot_input_path_storage, path, length);
+        snapshot_input_path_storage[length] = '\0';
+        snapshot_input_path = snapshot_input_path_storage;
+    } else {
+        snapshot_input_path_storage[0] = '\0';
+        snapshot_input_path = NULL;
+    }
+}
+
 static void tape_set_input_path(const char* path) {
     if (path && *path) {
         size_t length = strlen(path);
@@ -5545,6 +5813,9 @@ static void tape_manager_begin_browser(void) {
     if (tape_manager_browser_path[0] != '\0') {
         strncpy(initial_directory, tape_manager_browser_path, sizeof(initial_directory) - 1u);
         initial_directory[sizeof(initial_directory) - 1u] = '\0';
+    } else if (spectrum_user_software_dir[0] != '\0') {
+        strncpy(initial_directory, spectrum_user_software_dir, sizeof(initial_directory) - 1u);
+        initial_directory[sizeof(initial_directory) - 1u] = '\0';
     } else if (tape_input_path && *tape_input_path) {
         tape_manager_browser_extract_directory(tape_input_path, initial_directory, sizeof(initial_directory));
     }
@@ -5632,6 +5903,16 @@ static void tape_manager_begin_path_input(void) {
             length = sizeof(tape_manager_input_buffer) - 1u;
         }
         memcpy(tape_manager_input_buffer, tape_input_path, length);
+    } else if (spectrum_user_software_dir[0] != '\0') {
+        length = strlen(spectrum_user_software_dir);
+        if (length >= sizeof(tape_manager_input_buffer)) {
+            length = sizeof(tape_manager_input_buffer) - 1u;
+        }
+        memcpy(tape_manager_input_buffer, spectrum_user_software_dir, length);
+        if (length + 1u < sizeof(tape_manager_input_buffer)) {
+            tape_manager_input_buffer[length] = PATH_SEPARATOR;
+            length++;
+        }
     }
     tape_manager_input_buffer[length] = '\0';
     tape_manager_input_length = length;
@@ -5765,13 +6046,23 @@ static int tape_manager_load_path(const char* path) {
         return 0;
     }
 
-    TapeFormat format = tape_format_from_extension(path);
+    char resolved[PATH_MAX];
+    const char* target = path;
+    if (spectrum_user_software_dir[0] != '\0' &&
+        !spectrum_path_is_absolute(path) &&
+        !spectrum_path_has_separator(path)) {
+        if (spectrum_join_path(spectrum_user_software_dir, path, resolved, sizeof(resolved))) {
+            target = resolved;
+        }
+    }
+
+    TapeFormat format = tape_format_from_extension(target);
     if (format == TAPE_FORMAT_NONE) {
         tape_manager_set_status("UNSUPPORTED TAPE FORMAT");
         return 0;
     }
 
-    if (!tape_manager_ensure_path_available(path, format)) {
+    if (!tape_manager_ensure_path_available(target, format)) {
         return 0;
     }
 
@@ -5779,7 +6070,7 @@ static int tape_manager_load_path(const char* path) {
     memset(&new_state, 0, sizeof(new_state));
 
     if (format == TAPE_FORMAT_WAV) {
-        if (!tape_load_wav(path, &new_state)) {
+        if (!tape_load_wav(target, &new_state)) {
             tape_free_image(&new_state.image);
             tape_waveform_reset(&new_state.waveform);
             tape_manager_set_status("FAILED TO LOAD WAV TAPE");
@@ -5787,7 +6078,7 @@ static int tape_manager_load_path(const char* path) {
         }
     } else {
         new_state.format = format;
-        if (!tape_load_image(path, format, &new_state.image)) {
+        if (!tape_load_image(target, format, &new_state.image)) {
             tape_free_image(&new_state.image);
             tape_manager_set_status("FAILED TO LOAD TAPE IMAGE");
             return 0;
@@ -5810,7 +6101,7 @@ static int tape_manager_load_path(const char* path) {
 
     tape_playback = new_state;
     tape_input_format = format;
-    tape_set_input_path(path);
+    tape_set_input_path(target);
 
     if (format == TAPE_FORMAT_WAV) {
         tape_playback.use_waveform_playback = 0;
@@ -7284,8 +7575,15 @@ static int tape_recorder_prepare_wav_session(uint64_t head_tstates) {
 }
 
 static void tape_recorder_enable(const char* path, TapeOutputFormat format) {
-    tape_recorder.output_path = path;
-    tape_recorder.enabled = path ? 1 : 0;
+    if (!path || !*path) {
+        tape_output_path_storage[0] = '\0';
+    }
+    const char* resolved = spectrum_resolve_output_path(path,
+                                                        spectrum_user_software_dir,
+                                                        tape_output_path_storage,
+                                                        sizeof(tape_output_path_storage));
+    tape_recorder.output_path = resolved;
+    tape_recorder.enabled = resolved ? 1 : 0;
     tape_recorder.output_format = format;
     tape_recorder.block_active = 0;
     tape_recorder.last_transition_tstate = 0;
@@ -12073,8 +12371,10 @@ int main(int argc, char *argv[]) {
     paging_cpu_state = &cpu;
 
     spectrum_init_log_output();
+    spectrum_init_user_paths();
 
     tape_set_input_path(NULL);
+    snapshot_set_input_path(NULL);
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--audio-dump") == 0) {
@@ -12224,7 +12524,7 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Only one snapshot image may be specified\n");
                 return 1;
             }
-            snapshot_input_path = argv[++i];
+            snapshot_set_input_path(argv[++i]);
             snapshot_input_format = snapshot_format_from_extension(snapshot_input_path);
             if (snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
                 fprintf(stderr, "Unsupported snapshot type for '%s'\n", snapshot_input_path);
@@ -12271,7 +12571,7 @@ int main(int argc, char *argv[]) {
             TapeFormat inferred_format = tape_format_from_extension(argv[i]);
             if (inferred_snapshot != SNAPSHOT_FORMAT_NONE && snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
                 snapshot_input_format = inferred_snapshot;
-                snapshot_input_path = argv[i];
+                snapshot_set_input_path(argv[i]);
             } else if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
                 tape_input_format = inferred_format;
                 tape_set_input_path(argv[i]);
@@ -12290,15 +12590,56 @@ int main(int argc, char *argv[]) {
         return run_cpu_tests(test_rom_dir, snapshot_test_dir);
     }
 
+    if (snapshot_input_path) {
+        const char* resolved_snapshot = spectrum_resolve_input_path(snapshot_input_path,
+                                                                     spectrum_user_snapshots_dir,
+                                                                     snapshot_input_path_storage,
+                                                                     sizeof(snapshot_input_path_storage));
+        snapshot_set_input_path(resolved_snapshot);
+    }
+
+    if (tape_input_path) {
+        const char* resolved_tape = spectrum_resolve_input_path(tape_input_path,
+                                                                spectrum_user_software_dir,
+                                                                tape_input_path_storage,
+                                                                sizeof(tape_input_path_storage));
+        tape_set_input_path(resolved_tape);
+    }
+
+    char rom_default_path[PATH_MAX];
+    rom_default_path[0] = '\0';
+    char rom_resolved_path[PATH_MAX];
+    rom_resolved_path[0] = '\0';
     if (!rom_filename) {
         rom_filename = default_rom_filename;
+        if (spectrum_user_roms_dir[0] != '\0' &&
+            spectrum_join_path(spectrum_user_roms_dir, default_rom_filename,
+                               rom_default_path, sizeof(rom_default_path))) {
+            rom_filename = rom_default_path;
+        }
+    }
+
+    if (rom_filename && spectrum_user_roms_dir[0] != '\0' &&
+        !spectrum_path_is_absolute(rom_filename) &&
+        !spectrum_path_has_separator(rom_filename) &&
+        !spectrum_file_exists(rom_filename)) {
+        if (spectrum_join_path(spectrum_user_roms_dir, rom_filename,
+                               rom_resolved_path, sizeof(rom_resolved_path))) {
+            rom_filename = rom_resolved_path;
+        }
     }
 
     FILE* rf = fopen(rom_filename, "rb");
     char *rom_fallback_path = NULL;
     const char *rom_log_path = rom_filename;
+    if (!rf && !rom_provided && strcmp(rom_filename, default_rom_filename) != 0) {
+        rf = fopen(default_rom_filename, "rb");
+        if (rf) {
+            rom_log_path = default_rom_filename;
+        }
+    }
     if (!rf && !rom_provided) {
-        rom_fallback_path = build_executable_relative_path(argv[0], rom_filename);
+        rom_fallback_path = build_executable_relative_path(argv[0], default_rom_filename);
         if (rom_fallback_path) {
             rf = fopen(rom_fallback_path, "rb");
             if (rf) {
