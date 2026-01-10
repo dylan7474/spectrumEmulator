@@ -12660,6 +12660,7 @@ int main(int argc, char *argv[]) {
             }
             tape_input_format = TAPE_FORMAT_TZX;
             tape_set_input_path(argv[++i]);
+            tape_autoload_requested = 1;
         } else if (strcmp(argv[i], "--tgz") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -12942,14 +12943,9 @@ int main(int argc, char *argv[]) {
         beeper_reset_audio_state(total_t_states, speaker_output_level);
     }
 
-    if (tape_autoload_requested &&
-        tape_input_enabled &&
-        snapshot_input_format == SNAPSHOT_FORMAT_NONE &&
-        spectrum_model == SPECTRUM_MODEL_48K) {
+    if (tape_autoload_requested && tape_input_enabled) {
         tape_autoload_begin(total_t_states);
         printf("Auto-load: typing LOAD \"\" and starting tape playback.\n");
-    } else if (tape_autoload_requested && tape_input_enabled) {
-        printf("Auto-load skipped (only available in 48K BASIC mode without snapshots).\n");
     }
 
     printf("Starting Z80 emulation...\n");

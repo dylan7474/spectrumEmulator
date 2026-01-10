@@ -174,7 +174,7 @@ one of the tape options when launching the emulator and the EAR input will be dr
 ./z80 --wav digitized.wav
 ```
 
-For instant tape boots, use `--tap` or `--tgz` on 48K BASIC images (the `--tgz` flag treats the file as a `.tzx` tape image stored with a `.tgz` extension). The emulator automatically types `LOAD ""`, starts the deck, and fast-forwards playback until the tape ends, so the program begins running without manual keypresses. If you launch with a snapshot or a non-48K model selected, auto-load is skipped and you can use the normal tape controls.
+For instant tape boots, use `--tap`, `--tzx`, or `--tgz` (the `--tgz` flag treats the file as a `.tzx` tape image stored with a `.tgz` extension). The emulator automatically types `LOAD ""`, starts the deck, and fast-forwards playback until the tape ends, so the program begins running without manual keypresses. For the slower, real-time deck experience, load tapes through the tape manager or type `LOAD ""` yourself.
 
 You can also skip the explicit flags and pass a tape image directly. The emulator
 infers `.tap`, `.tzx`, `.tgz`, and `.wav` formats from positional arguments, so running
