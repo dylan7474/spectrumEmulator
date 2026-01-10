@@ -170,11 +170,14 @@ one of the tape options when launching the emulator and the EAR input will be dr
 ```bash
 ./z80 --tap software.tap
 ./z80 --tzx demo.tzx
+./z80 --tgz demo.tgz
 ./z80 --wav digitized.wav
 ```
 
+For instant tape boots, use `--tap`, `--tzx`, or `--tgz` (the `--tgz` flag treats the file as a `.tzx` tape image stored with a `.tgz` extension). These flags now quickload CODE blocks directly into memory and jump to the entry address so programs start immediately without invoking the ROM loader. For the slower, real-time deck experience, load tapes through the tape manager or type `LOAD ""` yourself.
+
 You can also skip the explicit flags and pass a tape image directly. The emulator
-infers `.tap`, `.tzx`, and `.wav` formats from positional arguments, so running
+infers `.tap`, `.tzx`, `.tgz`, and `.wav` formats from positional arguments, so running
 `./z80 digitized.wav` loads the bundled ROM and cues the specified tape at
 startup.
 
@@ -182,7 +185,7 @@ If you supply only a filename (no path), the loader searches `~/.z80/software/` 
 
 Loaded tapes remain cued at the start. Press **F5** to begin playback when the Spectrum is ready to `LOAD`, use **F6** to pause/stop, and tap **F7** to rewind to the beginning at any time. Playback now resumes from the last head position instead of rewinding automatically, so multi-part programs can continue loading sequential blocks. When the tape reaches the end, press **F7** before hitting play again to restart from the top.
 
-Press **Tab** at any time to summon the tape manager popup. The centered overlay pauses Spectrum key routing and renders a deck-style control panel with the loaded tape, the active recorder destination, and a large digital counter. The illuminated play/stop/rewind/record buttons respond to clicks, while the shortcut strip along the bottom lists the **P**, **S**, **W**, and **R** bindings (hold **Shift** with **R** to append to an existing WAV). A second row highlights the Load, Browse, Eject, and Close actions and the same shortcut strip calls out their keyboard equivalents so the available gestures stay visible without duplicating labels. Press **L** to open the inline file prompt, type or paste a `.tap`, `.tzx`, or `.wav` path, then hit **Return** to mount it immediately; entering the name of a new file automatically creates an empty container in the chosen format so you can prepare blank tapes for recording without leaving the emulator. Hit **B** to enter the built-in file browser, navigate with the arrow keys, press **Return** to load the highlighted tape (shown with a filled highlight bar), and tap **Backspace** to climb to the parent directory. **Esc** cancels the prompt or browser and **Tab** closes the manager from any mode. The status strip updates after every command so you can confirm deck changes without leaving the overlay, and the text automatically scales down when needed so the panel always fits on-screen.
+Press **Tab** at any time to summon the tape manager popup. The centered overlay pauses Spectrum key routing and renders a deck-style control panel with the loaded tape, the active recorder destination, and a large digital counter. The illuminated play/stop/rewind/record buttons respond to clicks, while the shortcut strip along the bottom lists the **P**, **S**, **W**, and **R** bindings (hold **Shift** with **R** to append to an existing WAV). A second row highlights the Load, Browse, Eject, and Close actions and the same shortcut strip calls out their keyboard equivalents so the available gestures stay visible without duplicating labels. Press **L** to open the inline file prompt, type or paste a `.tap`, `.tzx`, `.tgz`, or `.wav` path, then hit **Return** to mount it immediately; entering the name of a new file automatically creates an empty container in the chosen format so you can prepare blank tapes for recording without leaving the emulator. Hit **B** to enter the built-in file browser, navigate with the arrow keys, press **Return** to load the highlighted tape (shown with a filled highlight bar), and tap **Backspace** to climb to the parent directory. **Esc** cancels the prompt or browser and **Tab** closes the manager from any mode. The status strip updates after every command so you can confirm deck changes without leaving the overlay, and the text automatically scales down when needed so the panel always fits on-screen.
 
 The ROM's own tape loader colour bursts are now reproduced in the emulator border. Pilot tones and data pulses fed to the virtual EAR input drive the same alternating blue/yellow stripes and colour flashes that appear on real hardware, making it easier to follow along with `LOAD` activity or spot when the loader is listening for headers. Because the rendering is tied to the ULA timing model, the border reacts immediately to manual `BREAK`/`STOP` commands and to pauses injected by custom loaders.
 
