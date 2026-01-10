@@ -640,6 +640,9 @@ static int tape_autoload_fast_forward = 0;
 static int tape_autoload_waiting = 0;
 static uint64_t tape_autoload_start_time = 0;
 static AutoKeySequence tape_autoload_sequence = {0};
+static int tape_quickload_requested = 0;
+static int tape_quickload_ready = 0;
+static uint16_t tape_quickload_entry = 0;
 
 static FILE* spectrum_log_file = NULL;
 
@@ -990,6 +993,7 @@ static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
 static void tape_autoload_begin(uint64_t start_t_state);
 static void tape_autoload_update(uint64_t current_t_state);
 static int tape_autoload_fast_forward_active(void);
+static int tape_quickload_image(const TapeImage* image, Z80* cpu, uint16_t* entry_out);
 static void tape_render_overlay(void);
 static int speaker_calculate_output_level(void);
 static void speaker_update_output(uint64_t t_state, int emit_event);
@@ -8659,6 +8663,78 @@ static int tape_autoload_fast_forward_active(void) {
             tape_autoload_pending_play || tape_playback.playing);
 }
 
+typedef struct {
+    uint8_t type;
+    uint16_t length;
+    uint16_t param1;
+    uint16_t param2;
+} TapeHeader;
+
+static int tape_parse_header_block(const TapeBlock* block, TapeHeader* header) {
+    if (!block || !header || block->length < 19 || !block->data) {
+        return 0;
+    }
+    if (block->data[0] != 0x00) {
+        return 0;
+    }
+    header->type = block->data[1];
+    header->length = (uint16_t)block->data[12] | ((uint16_t)block->data[13] << 8);
+    header->param1 = (uint16_t)block->data[14] | ((uint16_t)block->data[15] << 8);
+    header->param2 = (uint16_t)block->data[16] | ((uint16_t)block->data[17] << 8);
+    return 1;
+}
+
+static int tape_quickload_image(const TapeImage* image, Z80* cpu, uint16_t* entry_out) {
+    if (!image || !cpu || !entry_out) {
+        return 0;
+    }
+
+    int found_entry = 0;
+    uint16_t entry = 0;
+
+    for (size_t i = 0; i + 1 < image->count; ++i) {
+        TapeHeader header;
+        if (!tape_parse_header_block(&image->blocks[i], &header)) {
+            continue;
+        }
+        const TapeBlock* data_block = &image->blocks[i + 1];
+        if (!data_block->data || data_block->length < 2 || data_block->data[0] != 0xFF) {
+            continue;
+        }
+        uint32_t payload_length = data_block->length - 2u;
+        if (payload_length == 0) {
+            continue;
+        }
+        if (header.type != 3) {
+            continue;
+        }
+        uint16_t load_addr = header.param1;
+        if ((uint32_t)load_addr + payload_length > 0x10000u) {
+            continue;
+        }
+        memcpy(memory + load_addr, data_block->data + 1, payload_length);
+        if (!found_entry) {
+            entry = load_addr;
+            found_entry = 1;
+        }
+        i++;
+    }
+
+    if (!found_entry) {
+        return 0;
+    }
+
+    *entry_out = entry;
+    cpu->reg_PC = entry;
+    cpu->reg_SP = 0xFFFF;
+    cpu->iff1 = 0;
+    cpu->iff2 = 0;
+    cpu->interruptMode = 1;
+    cpu->halted = 0;
+    cpu->ei_delay = 0;
+    return 1;
+}
+
 static int tape_handle_control_key(const SDL_Event* event) {
     if (!event || (event->type != SDL_KEYDOWN && event->type != SDL_KEYUP)) {
         return 0;
@@ -12658,7 +12734,7 @@ int main(int argc, char *argv[]) {
             }
             tape_input_format = TAPE_FORMAT_TAP;
             tape_set_input_path(argv[++i]);
-            tape_autoload_requested = 1;
+            tape_quickload_requested = 1;
         } else if (strcmp(argv[i], "--tzx") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -12670,7 +12746,7 @@ int main(int argc, char *argv[]) {
             }
             tape_input_format = TAPE_FORMAT_TZX;
             tape_set_input_path(argv[++i]);
-            tape_autoload_requested = 1;
+            tape_quickload_requested = 1;
         } else if (strcmp(argv[i], "--tgz") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -12682,7 +12758,7 @@ int main(int argc, char *argv[]) {
             }
             tape_input_format = TAPE_FORMAT_TZX;
             tape_set_input_path(argv[++i]);
-            tape_autoload_requested = 1;
+            tape_quickload_requested = 1;
         } else if (strcmp(argv[i], "--wav") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -12907,6 +12983,20 @@ int main(int argc, char *argv[]) {
         tape_input_enabled = 0;
     }
 
+    tape_quickload_ready = 0;
+    tape_quickload_entry = 0;
+    if (tape_quickload_requested &&
+        tape_input_enabled &&
+        tape_input_format != TAPE_FORMAT_WAV &&
+        tape_playback.image.count > 0) {
+        if (tape_quickload_image(&tape_playback.image, &cpu, &tape_quickload_entry)) {
+            tape_quickload_ready = 1;
+            tape_input_enabled = 0;
+        } else {
+            fprintf(stderr, "Quickload failed to find a CODE block in '%s'\n", tape_input_path);
+        }
+    }
+
     speaker_output_level = speaker_calculate_output_level();
 
     if(!init_sdl()){tape_shutdown();cleanup_sdl();return 1;}
@@ -12925,6 +13015,17 @@ int main(int argc, char *argv[]) {
     cpu.halted = 0;
     cpu.ei_delay = 0;
     total_t_states = 0;
+
+    if (tape_quickload_ready) {
+        cpu.reg_PC = tape_quickload_entry;
+        cpu.reg_SP = 0xFFFF;
+        cpu.iff1 = 0;
+        cpu.iff2 = 0;
+        cpu.interruptMode = 1;
+        cpu.halted = 0;
+        cpu.ei_delay = 0;
+        printf("Quickloaded tape and jumping to 0x%04X\n", tape_quickload_entry);
+    }
 
     if (tape_input_enabled) {
         tape_reset_playback(&tape_playback);
@@ -12953,7 +13054,7 @@ int main(int argc, char *argv[]) {
         beeper_reset_audio_state(total_t_states, speaker_output_level);
     }
 
-    if (tape_autoload_requested && tape_input_enabled) {
+    if (!tape_quickload_ready && tape_autoload_requested && tape_input_enabled) {
         tape_autoload_begin(total_t_states);
         printf("Auto-load: typing LOAD \"\" and starting tape playback.\n");
     }
