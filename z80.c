@@ -381,6 +381,8 @@ static SpectrumMemoryPage spectrum_pages[4] = {
 #define VRAM_START 0x4000
 #define ATTR_START 0x5800
 #define T_STATES_PER_FRAME 69888 // 3.5MHz / 50Hz (Spectrum CPU speed)
+#define TAPE_AUTO_KEY_PRESS_TSTATES (T_STATES_PER_FRAME / 2)
+#define TAPE_AUTO_KEY_GAP_TSTATES (T_STATES_PER_FRAME / 4)
 #define BORDER_EVENT_CAPACITY 65536
 #define ULA_LINES_PER_FRAME 312
 #define ULA_T_STATES_PER_LINE 224
@@ -568,6 +570,26 @@ typedef struct {
     uint64_t last_transition_tstate;
 } TapePlaybackState;
 
+typedef struct {
+    int row1;
+    uint8_t mask1;
+    int row2;
+    uint8_t mask2;
+    uint64_t duration_tstates;
+} AutoKeyStep;
+
+typedef struct {
+    const AutoKeyStep* steps;
+    size_t count;
+    size_t index;
+    uint64_t step_start_tstate;
+    int active;
+    int row1;
+    uint8_t mask1;
+    int row2;
+    uint8_t mask2;
+} AutoKeySequence;
+
 typedef enum {
     TAPE_OUTPUT_NONE,
     TAPE_OUTPUT_TAP,
@@ -609,6 +631,12 @@ static TapePlaybackState tape_playback = {0};
 static TapeRecorder tape_recorder = {0};
 static int tape_ear_state = 1;
 static int tape_input_enabled = 0;
+static int tape_autoload_requested = 0;
+static int tape_autoload_active = 0;
+static int tape_autoload_pending_play = 0;
+static int tape_autoload_play_started = 0;
+static int tape_autoload_fast_forward = 0;
+static AutoKeySequence tape_autoload_sequence = {0};
 
 static FILE* spectrum_log_file = NULL;
 
@@ -956,6 +984,9 @@ static void tape_set_input_path(const char* path);
 static void tape_playback_accumulate_elapsed(TapePlaybackState* state, uint64_t stop_t_state);
 static uint64_t tape_playback_elapsed_tstates(const TapePlaybackState* state, uint64_t current_t_state);
 static uint64_t tape_recorder_elapsed_tstates(uint64_t current_t_state);
+static void tape_autoload_begin(uint64_t start_t_state);
+static void tape_autoload_update(uint64_t current_t_state);
+static int tape_autoload_fast_forward_active(void);
 static void tape_render_overlay(void);
 static int speaker_calculate_output_level(void);
 static void speaker_update_output(uint64_t t_state, int emit_event);
@@ -1013,6 +1044,73 @@ const uint32_t spectrum_bright_colors[8] = {0x000000FF,0x0000FFFF,0xFF0000FF,0xF
 
 // --- Keyboard State ---
 uint8_t keyboard_matrix[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+static const AutoKeyStep tape_autoload_steps[] = {
+    {6, 0x08u, -1, 0u, TAPE_AUTO_KEY_PRESS_TSTATES}, // J (LOAD)
+    {-1, 0u, -1, 0u, TAPE_AUTO_KEY_GAP_TSTATES},
+    {7, 0x02u, 5, 0x01u, TAPE_AUTO_KEY_PRESS_TSTATES}, // Symbol Shift + P (")
+    {-1, 0u, -1, 0u, TAPE_AUTO_KEY_GAP_TSTATES},
+    {7, 0x02u, 5, 0x01u, TAPE_AUTO_KEY_PRESS_TSTATES}, // Symbol Shift + P (")
+    {-1, 0u, -1, 0u, TAPE_AUTO_KEY_GAP_TSTATES},
+    {6, 0x01u, -1, 0u, TAPE_AUTO_KEY_PRESS_TSTATES}, // Enter
+    {-1, 0u, -1, 0u, TAPE_AUTO_KEY_GAP_TSTATES}
+};
+
+static void auto_key_sequence_release(AutoKeySequence* sequence) {
+    if (!sequence) {
+        return;
+    }
+    if (sequence->row1 >= 0) {
+        keyboard_matrix[sequence->row1] |= sequence->mask1;
+    }
+    if (sequence->row2 >= 0) {
+        keyboard_matrix[sequence->row2] |= sequence->mask2;
+    }
+    sequence->row1 = -1;
+    sequence->row2 = -1;
+}
+
+static void auto_key_sequence_apply(AutoKeySequence* sequence,
+                                    int row1,
+                                    uint8_t mask1,
+                                    int row2,
+                                    uint8_t mask2) {
+    if (!sequence) {
+        return;
+    }
+    auto_key_sequence_release(sequence);
+    sequence->row1 = row1;
+    sequence->mask1 = mask1;
+    sequence->row2 = row2;
+    sequence->mask2 = mask2;
+    if (row1 >= 0) {
+        keyboard_matrix[row1] &= (uint8_t)~mask1;
+    }
+    if (row2 >= 0) {
+        keyboard_matrix[row2] &= (uint8_t)~mask2;
+    }
+}
+
+static void auto_key_sequence_start(AutoKeySequence* sequence,
+                                    const AutoKeyStep* steps,
+                                    size_t count,
+                                    uint64_t start_t_state) {
+    if (!sequence || !steps || count == 0) {
+        return;
+    }
+    sequence->steps = steps;
+    sequence->count = count;
+    sequence->index = 0;
+    sequence->active = 1;
+    sequence->step_start_tstate = start_t_state;
+    sequence->row1 = -1;
+    sequence->row2 = -1;
+    auto_key_sequence_apply(sequence,
+                            steps[0].row1,
+                            steps[0].mask1,
+                            steps[0].row2,
+                            steps[0].mask2);
+}
 
 // --- ROM Handling ---
 static const char *default_rom_filename = "48.rom";
@@ -4398,6 +4496,9 @@ static TapeFormat tape_format_from_extension(const char* path) {
         return TAPE_FORMAT_TAP;
     }
     if (string_ends_with_case_insensitive(path, ".tzx")) {
+        return TAPE_FORMAT_TZX;
+    }
+    if (string_ends_with_case_insensitive(path, ".tgz")) {
         return TAPE_FORMAT_TZX;
     }
     if (string_ends_with_case_insensitive(path, ".wav")) {
@@ -8494,6 +8595,60 @@ static void tape_deck_record(uint64_t current_t_state, int append_mode) {
     }
 }
 
+static void tape_autoload_begin(uint64_t start_t_state) {
+    tape_autoload_active = 1;
+    tape_autoload_pending_play = 1;
+    tape_autoload_play_started = 0;
+    tape_autoload_fast_forward = 1;
+    auto_key_sequence_start(&tape_autoload_sequence,
+                            tape_autoload_steps,
+                            sizeof(tape_autoload_steps) / sizeof(tape_autoload_steps[0]),
+                            start_t_state);
+}
+
+static void tape_autoload_update(uint64_t current_t_state) {
+    if (!tape_autoload_active) {
+        return;
+    }
+
+    if (tape_autoload_sequence.active) {
+        const AutoKeyStep* step = &tape_autoload_sequence.steps[tape_autoload_sequence.index];
+        if (current_t_state - tape_autoload_sequence.step_start_tstate >= step->duration_tstates) {
+            tape_autoload_sequence.index++;
+            if (tape_autoload_sequence.index >= tape_autoload_sequence.count) {
+                auto_key_sequence_release(&tape_autoload_sequence);
+                tape_autoload_sequence.active = 0;
+            } else {
+                tape_autoload_sequence.step_start_tstate = current_t_state;
+                const AutoKeyStep* next = &tape_autoload_sequence.steps[tape_autoload_sequence.index];
+                auto_key_sequence_apply(&tape_autoload_sequence,
+                                        next->row1,
+                                        next->mask1,
+                                        next->row2,
+                                        next->mask2);
+            }
+        }
+    }
+
+    if (!tape_autoload_sequence.active && tape_autoload_pending_play) {
+        tape_deck_play(current_t_state);
+        tape_autoload_pending_play = 0;
+        tape_autoload_play_started = 1;
+    }
+
+    if (tape_autoload_play_started &&
+        !tape_playback.playing &&
+        tape_deck_status == TAPE_DECK_STATUS_STOP) {
+        tape_autoload_fast_forward = 0;
+        tape_autoload_active = 0;
+    }
+}
+
+static int tape_autoload_fast_forward_active(void) {
+    return tape_autoload_fast_forward &&
+           (tape_autoload_sequence.active || tape_autoload_pending_play || tape_playback.playing);
+}
+
 static int tape_handle_control_key(const SDL_Event* event) {
     if (!event || (event->type != SDL_KEYDOWN && event->type != SDL_KEYUP)) {
         return 0;
@@ -11867,7 +12022,7 @@ static void print_usage(const char* prog) {
             "[--contention <48k|128k|plus2a|plus3>] "
             "[--peripheral <none|if1|plus3>] "
             "[--ay-gain <multiplier>] [--ay-pan <left,center,right>] "
-            "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
+            "[--tap <tap_file> | --tzx <tzx_file> | --tgz <tzx_file> | --wav <wav_file>] "
             "[--snapshot <sna_or_z80>] "
             "[--save-tap <tap_file> | --save-wav <wav_file>] "
             "[--test-rom-dir <dir>] [--snapshot-test-dir <dir>] "
@@ -12493,6 +12648,7 @@ int main(int argc, char *argv[]) {
             }
             tape_input_format = TAPE_FORMAT_TAP;
             tape_set_input_path(argv[++i]);
+            tape_autoload_requested = 1;
         } else if (strcmp(argv[i], "--tzx") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -12504,6 +12660,18 @@ int main(int argc, char *argv[]) {
             }
             tape_input_format = TAPE_FORMAT_TZX;
             tape_set_input_path(argv[++i]);
+        } else if (strcmp(argv[i], "--tgz") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            if (tape_input_format != TAPE_FORMAT_NONE) {
+                fprintf(stderr, "Only one tape image may be specified\n");
+                return 1;
+            }
+            tape_input_format = TAPE_FORMAT_TZX;
+            tape_set_input_path(argv[++i]);
+            tape_autoload_requested = 1;
         } else if (strcmp(argv[i], "--wav") == 0) {
             if (i + 1 >= argc) {
                 print_usage(argv[0]);
@@ -12774,6 +12942,16 @@ int main(int argc, char *argv[]) {
         beeper_reset_audio_state(total_t_states, speaker_output_level);
     }
 
+    if (tape_autoload_requested &&
+        tape_input_enabled &&
+        snapshot_input_format == SNAPSHOT_FORMAT_NONE &&
+        spectrum_model == SPECTRUM_MODEL_48K) {
+        tape_autoload_begin(total_t_states);
+        printf("Auto-load: typing LOAD \"\" and starting tape playback.\n");
+    } else if (tape_autoload_requested && tape_input_enabled) {
+        printf("Auto-load skipped (only available in 48K BASIC mode without snapshots).\n");
+    }
+
     printf("Starting Z80 emulation...\n");
 
     int quit = 0;
@@ -12845,12 +13023,16 @@ int main(int argc, char *argv[]) {
             elapsed_seconds = 0.0;
         }
 
+        if (tape_autoload_fast_forward_active()) {
+            elapsed_seconds = 0.25;
+        }
+
         cycle_accumulator += elapsed_seconds * CPU_CLOCK_HZ;
         if (cycle_accumulator > CPU_CLOCK_HZ * 0.25) {
             cycle_accumulator = CPU_CLOCK_HZ * 0.25;
         }
 
-        if (audio_available && beeper_cycles_per_sample > 0.0) {
+        if (!tape_autoload_fast_forward_active() && audio_available && beeper_cycles_per_sample > 0.0) {
             double latency_samples = beeper_current_latency_samples();
             double threshold = beeper_latency_threshold();
             if (latency_samples >= threshold) {
@@ -12901,6 +13083,7 @@ int main(int argc, char *argv[]) {
             ula_process_port_events(total_t_states);
             tape_update(total_t_states);
             tape_recorder_update(total_t_states, 0);
+            tape_autoload_update(total_t_states);
 
             if (audio_available && latency_poll_threshold > 0) {
                 latency_poll_cycles += t_states;
@@ -12926,7 +13109,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (throttled_audio) {
+        if (throttled_audio && !tape_autoload_fast_forward_active()) {
             Uint32 delay_ms = beeper_recommended_throttle_delay(throttled_latency_samples);
             SDL_Delay(delay_ms);
             continue;
