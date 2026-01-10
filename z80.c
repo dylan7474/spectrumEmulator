@@ -383,6 +383,7 @@ static SpectrumMemoryPage spectrum_pages[4] = {
 #define T_STATES_PER_FRAME 69888 // 3.5MHz / 50Hz (Spectrum CPU speed)
 #define TAPE_AUTO_KEY_PRESS_TSTATES (T_STATES_PER_FRAME / 2)
 #define TAPE_AUTO_KEY_GAP_TSTATES (T_STATES_PER_FRAME / 4)
+#define TAPE_AUTOLOAD_START_DELAY_TSTATES (T_STATES_PER_FRAME * 50)
 #define BORDER_EVENT_CAPACITY 65536
 #define ULA_LINES_PER_FRAME 312
 #define ULA_T_STATES_PER_LINE 224
@@ -636,6 +637,8 @@ static int tape_autoload_active = 0;
 static int tape_autoload_pending_play = 0;
 static int tape_autoload_play_started = 0;
 static int tape_autoload_fast_forward = 0;
+static int tape_autoload_waiting = 0;
+static uint64_t tape_autoload_start_time = 0;
 static AutoKeySequence tape_autoload_sequence = {0};
 
 static FILE* spectrum_log_file = NULL;
@@ -8600,15 +8603,21 @@ static void tape_autoload_begin(uint64_t start_t_state) {
     tape_autoload_pending_play = 1;
     tape_autoload_play_started = 0;
     tape_autoload_fast_forward = 1;
-    auto_key_sequence_start(&tape_autoload_sequence,
-                            tape_autoload_steps,
-                            sizeof(tape_autoload_steps) / sizeof(tape_autoload_steps[0]),
-                            start_t_state);
+    tape_autoload_waiting = 1;
+    tape_autoload_start_time = start_t_state + TAPE_AUTOLOAD_START_DELAY_TSTATES;
 }
 
 static void tape_autoload_update(uint64_t current_t_state) {
     if (!tape_autoload_active) {
         return;
+    }
+
+    if (tape_autoload_waiting && current_t_state >= tape_autoload_start_time) {
+        tape_autoload_waiting = 0;
+        auto_key_sequence_start(&tape_autoload_sequence,
+                                tape_autoload_steps,
+                                sizeof(tape_autoload_steps) / sizeof(tape_autoload_steps[0]),
+                                current_t_state);
     }
 
     if (tape_autoload_sequence.active) {
@@ -8646,7 +8655,8 @@ static void tape_autoload_update(uint64_t current_t_state) {
 
 static int tape_autoload_fast_forward_active(void) {
     return tape_autoload_fast_forward &&
-           (tape_autoload_sequence.active || tape_autoload_pending_play || tape_playback.playing);
+           (tape_autoload_waiting || tape_autoload_sequence.active ||
+            tape_autoload_pending_play || tape_playback.playing);
 }
 
 static int tape_handle_control_key(const SDL_Event* event) {
